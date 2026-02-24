@@ -342,14 +342,15 @@ EDispatchResult process_PTP_packet(TClock_PTP* self, TUDPPacketBase* pUDPPacketB
                         ResetPTPLock(self, true);
                         ResetPTPMaster(self);
                         
-                        memcpy(&self->m_PTPMaster_Announce, &pPTPV2MsgAnnouncePacket->V2MsgAnnounce, sizeof(TV2MsgAnnounce));
-                        self->m_ui64PTPMaster_GMID = *(uint64_t*)pPTPV2MsgAnnouncePacket->V2MsgAnnounce.byGrandmasterClockIdentity;
                         self->m_ui64PTPMaster_ClockIdentity = ui64_CurrentClockIdentity;
                     }
                     
                     // Is elected PTPMaster?
                     if (ui64_CurrentClockIdentity == self->m_ui64PTPMaster_ClockIdentity)
-                    { // save announce time
+                    {   // update the GrandmasterClockIdentity
+                        memcpy(&self->m_PTPMaster_Announce, &pPTPV2MsgAnnouncePacket->V2MsgAnnounce, sizeof(TV2MsgAnnounce));
+                        self->m_ui64PTPMaster_GMID = *(uint64_t*)pPTPV2MsgAnnouncePacket->V2MsgAnnounce.byGrandmasterClockIdentity;
+                        // save announce time
                         self->m_ui64PTPMaster_AnnounceTime = ui64CurrentTime;
                         MTAL_DP("Updating announce time %llu\n", self->m_ui64PTPMaster_AnnounceTime);
                     }

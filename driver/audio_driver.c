@@ -1823,7 +1823,7 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
 static int mr_alsa_audio_pcm_close(struct snd_pcm_substream *substream)
 {
     struct mr_alsa_audio_chip *chip = snd_pcm_substream_chip(substream);
-    unsigned long flags;
+    //unsigned long flags;
 
     printk(KERN_DEBUG "entering mr_alsa_audio_pcm_close (substream name=%s #%d) ...\n", substream->name, substream->number);
     spin_lock_irq(&chip->lock);
