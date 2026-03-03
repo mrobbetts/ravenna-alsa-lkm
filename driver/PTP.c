@@ -349,6 +349,10 @@ EDispatchResult process_PTP_packet(TClock_PTP* self, TUDPPacketBase* pUDPPacketB
                     if (ui64_CurrentClockIdentity == self->m_ui64PTPMaster_ClockIdentity)
                     {   // update the GrandmasterClockIdentity
                         memcpy(&self->m_PTPMaster_Announce, &pPTPV2MsgAnnouncePacket->V2MsgAnnounce, sizeof(TV2MsgAnnounce));
+                        if (*(uint64_t*)pPTPV2MsgAnnouncePacket->V2MsgAnnounce.byGrandmasterClockIdentity != self->m_ui64PTPMaster_GMID)
+                        {
+                            printk("Updating PTP Master GMID to %llu\n", *(uint64_t*)pPTPV2MsgAnnouncePacket->V2MsgAnnounce.byGrandmasterClockIdentity);
+                        }
                         self->m_ui64PTPMaster_GMID = *(uint64_t*)pPTPV2MsgAnnouncePacket->V2MsgAnnounce.byGrandmasterClockIdentity;
                         // save announce time
                         self->m_ui64PTPMaster_AnnounceTime = ui64CurrentTime;
