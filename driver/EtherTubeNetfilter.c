@@ -160,9 +160,10 @@ int IsEtherTubeEnabled(TEtherTubeNetfilter* self)
 ////////////////////////////////////////////////////////////////////////
 // CEtherTubeNIC
 ////////////////////////////////////////////////////////////////////////
-int InitEtherTube(TEtherTubeNetfilter* self, struct TManager* pManager)
+int InitEtherTube(TEtherTubeNetfilter* self, struct TManager* pManager, unsigned char nic_id)
 {
     self->manager_ptr_ = pManager;
+    self->nic_id = nic_id;
     //self->nf_hook_fct_ = NULL;
     //self->nf_hook_struct_ = NULL;
     //strcpy(self->ifname_used_, "eth0");
@@ -242,77 +243,43 @@ void netfilter_hook_fct(TEtherTubeNetfilter* self, void* nf_hook_fct, void* nf_h
     self->nf_hook_struct_ = nf_hook_struct;
 }
 
-static int isprint(int c)
-{
-    return c >= ' ' && c <= '~';
-}
-
-static int isspace(int c)
-{
-    return c == ' ' || (unsigned)c-'\t' < 5;
-}
-
-
-// check if the network interface name contains some unexpected char
-static bool dev_valid_name(const char *name)
-{
-    if (*name == '\0')
-        return false;
-    if (strnlen(name, IFNAMSIZ) == IFNAMSIZ)
-        return false;
-    if (!strcmp(name, ".") || !strcmp(name, ".."))
-        return false;
-
-    while (*name) {
-        if (*name == '/' || *name == ':' || isspace(*name) || !isprint(*name))
-            return false;
-        name++;
-    }
-    return true;
-}
-
-//#include <linux/netfilter.h>
-////////////////////////////////////////////////////////////////////////
 int rx_packet(TEtherTubeNetfilter* self, void* packet, int packet_size, const char* ifname, int mac_header)
 {
+    int ret = 0;
+    spin_lock((spinlock_t*)self->netfilterLock_);
+    do
     {
-        int ret = 0;
-        spin_lock((spinlock_t*)self->netfilterLock_);
-        do
+        if (!self->etherTubeEnable_ || !self->started_)
         {
-            if (!self->etherTubeEnable_ || !self->started_)
-            {
-                //MTAL_DP_INFO("rx_packet case 1");
-                ret = 1;
-                break;
-            }
-        }
-        while (0);
-        spin_unlock((spinlock_t*)self->netfilterLock_);
-        if (ret == 1)
-        {
-            return 1;
-        }
-        // roonOS provides an empty string !
-	// Linux kernel can provide empty or corrupted interface name string !
-        if (dev_valid_name(ifname) && strcmp(ifname, self->ifname_used_) != 0)
-        {
-            //printk("2: %s, %s\n", ifname, self->ifname_used_);
-            return 1;
-        }
-        if (packet == NULL)
-        {
-            MTAL_DP_INFO("rx_packet case 3");
-            return 1;
-        }
-        if (packet_size <= 0)
-        {
-            MTAL_DP_INFO("rx_packet case 4");
-            return 1;
+            //MTAL_DP_INFO("rx_packet case 1");
+            ret = 1;
+            break;
         }
     }
+    while (0);
+    spin_unlock((spinlock_t*)self->netfilterLock_);
+    if (ret == 1)
+    {
+        return 1;
+    }
 
-    switch (DispatchPacket(self->manager_ptr_, packet, packet_size, mac_header))
+    if (ifname == NULL || strcmp(ifname, self->ifname_used_) != 0)
+    {
+        //printk("2: %s, %s\n", ifname, self->ifname_used_);
+        return 1;
+    }
+    if (packet == NULL)
+    {
+        MTAL_DP_INFO("rx_packet case 3");
+        return 1;
+    }
+    if (packet_size <= 0)
+    {
+        MTAL_DP_INFO("rx_packet case 4");
+        return 1;
+    }
+
+    switch (DispatchPacket(self->manager_ptr_, packet, packet_size, mac_header, self->nic_id))
     {
         case DR_RTP_PACKET_USED:
             return 0; //NF_DROP;

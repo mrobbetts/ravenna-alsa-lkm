@@ -135,9 +135,14 @@ int CW_socket_tx_packet(void* skb, unsigned int data_len, const char* iface)
 
     if (data_len == 0)
     {
-        dev_put(dev);
         return -10;
     }
+
+    if (dev == NULL)
+    {
+        dev_kfree_skb(skb_ptr);
+        return -11;
+    } 
 
     skb_ptr->pkt_type = PACKET_OUTGOING;
     //skb->ip_summed = CHECKSUM_NONE; // do not change anything ?
@@ -160,9 +165,7 @@ int CW_socket_tx_packet(void* skb, unsigned int data_len, const char* iface)
 #ifdef NO_TX
     dev_kfree_skb(skb_ptr);
 #else
-    //local_irq_enable();
     xmit_ret_code = dev_queue_xmit(skb_ptr);
-    //local_irq_disable();
 #endif
     if (xmit_ret_code < 0)
     {
