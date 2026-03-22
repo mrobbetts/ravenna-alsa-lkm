@@ -35,6 +35,7 @@
 
 #include "RTP_stream_info.h"
 
+#include "module_timer.h"
 #include "c_wrapper_lib.h"
 
 #if defined(DEBUG) || defined(_DEBUG)
@@ -50,7 +51,6 @@
 
 ///  Basic LUT of 1k sine for SR=48000, 16bit.
 static int sinebuf[48] = {
-
     0, 4276, 8480, 12539, 16383, 19947, 23169, 25995,
     28377, 30272, 31650, 32486, 32767, 32486, 31650, 30272,
     28377, 25995, 23169, 19947, 16383, 12539, 8480, 4276,
@@ -58,8 +58,8 @@ static int sinebuf[48] = {
     -28377, -30272, -31650, -32486, -32767, -32486, -31650, -30272,
     -28377, -25995, -23169, -19947, -16383, -12539, -8480, -4276
   };
-static int cosbuf[48] = {
 
+static int cosbuf[48] = {
     32767,32488,31651,30274,28378,25997,23170,19948,16384,12540,8481,4277,0,-4277,-8481,-12540,
     -16384,-19948,-23170,-25997,-28378,-30274,-31651,-32488,-32768,-32488,-31651,-30274,-28378,-25997,-23170,-19948,
     -16384,-12540,-8481,-4277,-0,4277,8481,12540,16384,19948,23170,25997,28378,30274,31651,32488
@@ -127,8 +127,17 @@ bool init(struct TManager* self, int* errorCode)
 {
     bool theAnswer = true;
     int err = 0;
+    int i = 0;
 
-    self->m_pStatusBuffer = NULL;
+    self->m_Is_NIC_Active[0] = true;
+    self->m_Is_NIC_Active[1] = false;
+    
+    self->m_Active_PTP_NIC_Idx = 0;
+    for (i = 0; i < _MAX_NICS; i++)
+    {
+        self->m_lastLockStatus[i] = PTPLS_UNLOCKED;
+    }    
+
     self->m_bIsStarted = false;
     self->m_bIORunning = false;
     self->m_pALSAChip = NULL;
@@ -157,31 +166,33 @@ bool init(struct TManager* self, int* errorCode)
     self->m_NumberOfOutputs = DEFAULT_NUMBEROFOUTPUTS;
     SetNumberOfOutputs(self, self->m_NumberOfOutputs);
 
-
-    AllocateStatusBuffer(self);
-
     init_alsa_callbacks(self);
     Init_C_Callbacks(self);
 
     // initialize the Ethernet Filter
-    if(!InitEtherTube(&self->m_EthernetFilter, self))
+    for (i = 0; i < _MAX_NICS; i++)
     {
-        MTAL_DP("CManager::init: self->m_EthernetFilter.Init() failed\n");
-        theAnswer = false;
-        err = -EINVAL;
-        goto Failure;
+        if (!InitEtherTube(&self->m_EthernetFilter[i], self, i))
+        {
+            MTAL_DP("CManager::init: self->m_EthernetFilter.Init() failed\n");
+            theAnswer = false;
+            err = -EINVAL;
+            goto Failure;
+        }
     }
 
-    // TODO ALSA PTP Status buffer
-    if(!init_ptp(&self->m_PTP, &self->m_EthernetFilter, &self->m_c_audio_streamer_clock_PTP_callback))
+    for (i = 0; i < _MAX_NICS; i++)
     {
-        DebugMsg("CManager::init: self->m_PTP.Init() failed");
-        theAnswer = false;
-        err = -EINVAL;
-        goto Failure;
+        if (!init_ptp(&self->m_PTP[i], &self->m_EthernetFilter[i], &self->m_c_audio_streamer_clock_PTP_callback))
+        {
+            DebugMsg("CManager::init: self->m_PTP.Init() failed");
+            theAnswer = false;
+            err = -EINVAL;
+            goto Failure;
+        }
     }
 
-    if(!init_(&self->m_RTP_streams_manager, Get_C_Callbacks(self), &self->m_EthernetFilter))
+    if (!init_(&self->m_RTP_streams_manager, Get_C_Callbacks(self), self->m_EthernetFilter))
     {
         MTAL_DP("CManager::init: self->m_RTP_streams_manager.init() failed\n");
         theAnswer = false;
@@ -189,19 +200,18 @@ bool init(struct TManager* self, int* errorCode)
         goto Failure;
     }
     err = mr_alsa_audio_card_init(self, &self->m_alsa_callbacks);
-    if(err != 0)
+    if (err != 0)
     {
         MTAL_DP("CManager::init: mr_alsa_audio_card_init() failed\n");
         theAnswer = false;
         goto Failure;
     }
 
-    if(errorCode != nullptr)
+    if (errorCode != nullptr)
         *errorCode = 0;
     return theAnswer;
-Failure:
 
-    FreeStatusBuffer(self);
+Failure:
     MTAL_DP("CManager::init failed\n");
     if(errorCode != nullptr)
         *errorCode = err;
@@ -211,35 +221,49 @@ Failure:
 //////////////////////////////////////////////////////////////////////////////////
 void destroy(struct TManager* self)
 {
-    if(!Stop(&self->m_EthernetFilter))
-    {
-        MTAL_DP("CManager::destroy : self->m_EthernetFilter.Stop() failed\n");
-    }
-    else
+    int i = 0;
+    for (i = 0; i < _MAX_NICS; i++)
     {
         MTAL_DP("CManager::destroy : self->m_EthernetFilter.Stop() succeeded\n");
+        if (!Stop(&self->m_EthernetFilter[i]))
+        {
+            MTAL_DP("CManager::destroy : self->m_EthernetFilter.Stop() failed\n");
+        }
+        else
+        {
+            MTAL_DP("CManager::destroy : self->m_EthernetFilter.Stop() succeeded\n");
+        }
     }
     stop(self);
 
     mr_alsa_audio_card_exit();
     destroy_(&self->m_RTP_streams_manager);
-    destroy_ptp(&self->m_PTP);
-    DestroyEtherTube(&self->m_EthernetFilter);
-
-    FreeStatusBuffer(self);
+    for (i = 0; i < _MAX_NICS; i++)
+    {
+        destroy_ptp(&self->m_PTP[i]);
+    }
+    for (i = 0; i < _MAX_NICS; i++)
+    {
+        DestroyEtherTube(&self->m_EthernetFilter[i]);
+    }
 }
 
 //////////////////////////////////////////////////////////////////////////////////
 bool start(struct TManager* self)
 {
-    StartAudioFrameTICTimer(&self->m_PTP, get_frame_size(self), (IsDSDRate(self->m_SampleRate)? 352800 : self->m_SampleRate));
-
-    /*f10b if(!IsEtherTubeStarted(&self->m_EthernetFilter)) // this was double define in ethertube
+    int i = 0;
+    for (i = 0; i < _MAX_NICS; i++)
     {
-        MTAL_DP("CManager::start() failed: self->m_EthernetFilter is not started\n");
-        return false;
-    }*/
-    EnableEtherTube(&self->m_EthernetFilter, 1);
+        if (self->m_Is_NIC_Active[i])
+        {
+            StartAudioFrameTICTimer(&self->m_PTP[i], get_frame_size(self), (IsDSDRate(self->m_SampleRate) ? 352800 : self->m_SampleRate));
+        }
+    }
+    start_clock_timer();
+    for (i = 0; i < _MAX_NICS; i++)
+    {
+        EnableEtherTube(&self->m_EthernetFilter[i], 1);
+    }
     self->m_bIsStarted = true;
 
     MTAL_DP("CManager::start()\n");
@@ -251,13 +275,24 @@ bool start(struct TManager* self)
 bool stop(struct TManager* self)
 {
     MTAL_DP("entering CManager::stop..\n");
-    if(self->m_bIORunning) {
+    if(self->m_bIORunning) 
+    {
         stopIO(self, false);
         stopIO(self, true);
     }
-    EnableEtherTube(&self->m_EthernetFilter, 0);
 
-    StopAudioFrameTICTimer(&self->m_PTP);
+    int i;
+    for (i = 0; i < _MAX_NICS; i++)
+    {
+        EnableEtherTube(&self->m_EthernetFilter[i], 0);
+    }
+
+    stop_clock_timer();
+    
+    for (i = 0; i < _MAX_NICS; i++)
+    {
+        StopAudioFrameTICTimer(&self->m_PTP[i]);
+    }
 
     self->m_bIsStarted = false;
     MTAL_DP("leaving CManager::stop..\n");
@@ -362,34 +397,44 @@ void UpdateFrameSize(struct TManager* self)
 
 //////////////////////////////////////////////////////////////////////////////////
 // the caller must call stop before calling
-bool SetInterfaceName(struct TManager* self, const char* cInterfaceName)
+bool SetInterfaceName(struct TManager* self, const char* cInterfaceName, const int iEthFilterIndex)
 {
-    if(!Stop(&self->m_EthernetFilter))
+    if (iEthFilterIndex > _MAX_NICS)
     {
-        MTAL_DP("MergingRAVENNAAudioDriver::SetInterfaceName: self->m_EthernetFilter.Stop() failed\n");
+        MTAL_DP("SetInterfaceName: Ethernet filter index out of range\n");
+        return false;
+    }
+
+    if(!Stop(&self->m_EthernetFilter[iEthFilterIndex]))
+    {
+        MTAL_DP("SetInterfaceName: self->m_EthernetFilter[%d].Stop() failed\n", iEthFilterIndex);
         return false;
     }
 
     //MTAL_DP("SetInterfaceName(%s)\n", cInterfaceName);
     strncpy(self->m_cInterfaceName, cInterfaceName, MAX_INTERFACE_NAME - 1);
+    self->m_cInterfaceName[MAX_INTERFACE_NAME - 1] = '\0';
     if(strlen(self->m_cInterfaceName) != strlen(cInterfaceName))
     {
-        MTAL_DP("MergingRAVENNAAudioDriver::SetInterfaceName: Interface name too long\n");
+        MTAL_DP("SetInterfaceName: Interface name too long\n");
         return false;
     }
 
-
-    if(!Start(&self->m_EthernetFilter, self->m_cInterfaceName))
+    if(!Start(&self->m_EthernetFilter[iEthFilterIndex], self->m_cInterfaceName))
     {
-        MTAL_DP("CManager::SetInterfaceName: self->m_EthernetFilter.Attach() failed\n");
+        MTAL_DP("SetInterfaceName: self->m_EthernetFilter[%d].Attach() failed\n", iEthFilterIndex);
         return false;
     }
+
+    self->m_Is_NIC_Active[iEthFilterIndex] = true;
+
     return true;
 }
 
 //////////////////////////////////////////////////////////////////////////////////
 bool SetSamplingRate(struct TManager* self, uint32_t samplingRate)
 {
+    int i;
     uint64_t nbloop = 0;
     //MTAL_DP("CManager::SetSamplingRate from %u to %u\n", self->m_SampleRate, samplingRate);
 
@@ -409,7 +454,14 @@ bool SetSamplingRate(struct TManager* self, uint32_t samplingRate)
 
     if(self->m_bIsStarted)
     {
-        StartAudioFrameTICTimer(&self->m_PTP, get_frame_size(self), (IsDSDRate(self->m_SampleRate)? 352800 : self->m_SampleRate));
+        for (i = 0; i < _MAX_NICS; i++)
+        {
+            if (self->m_Is_NIC_Active[i])
+            {
+                StartAudioFrameTICTimer(&self->m_PTP[i], get_frame_size(self), (IsDSDRate(self->m_SampleRate) ? 352800 : self->m_SampleRate));
+            }
+        }
+        start_clock_timer();
         do
         {
             CW_msleep_interruptible(1);
@@ -419,7 +471,7 @@ bool SetSamplingRate(struct TManager* self, uint32_t samplingRate)
                 return false;
             }
         }
-        while(GetLockStatus(&self->m_PTP) != PTPLS_LOCKED);
+        while (GetLockStatus(&self->m_PTP[0]) != PTPLS_LOCKED || GetLockStatus(&self->m_PTP[1]) != PTPLS_LOCKED);
         //MTAL_DP("CManager::SetSamplingRate(%u) Completed\n", samplingRate);
     }
 
@@ -429,6 +481,7 @@ bool SetSamplingRate(struct TManager* self, uint32_t samplingRate)
 //////////////////////////////////////////////////////////////////////////////////
 bool SetDSDSamplingRate(struct TManager* self, uint32_t samplingRate)
 {
+    int i = 0;
     uint64_t nbloop = 0;
     MTAL_DP("CManager::SetDSDSamplingRate(%u)\n", samplingRate);
 
@@ -448,7 +501,14 @@ bool SetDSDSamplingRate(struct TManager* self, uint32_t samplingRate)
 
     if(self->m_bIsStarted)
     {
-        StartAudioFrameTICTimer(&self->m_PTP, get_frame_size(self), (IsDSDRate(self->m_SampleRate)? 352800 : self->m_SampleRate));
+        for (i = 0; i < _MAX_NICS; i++)
+        {
+            if (self->m_Is_NIC_Active[i])
+            {
+                StartAudioFrameTICTimer(&self->m_PTP[i], get_frame_size(self), (IsDSDRate(self->m_SampleRate) ? 352800 : self->m_SampleRate));
+            }
+        }
+        start_clock_timer();
         do
         {
             CW_msleep_interruptible(1);
@@ -458,7 +518,7 @@ bool SetDSDSamplingRate(struct TManager* self, uint32_t samplingRate)
                 return false;
             }
         }
-        while(GetLockStatus(&self->m_PTP) != PTPLS_LOCKED);
+        while (GetLockStatus(&self->m_PTP[0]) != PTPLS_LOCKED || GetLockStatus(&self->m_PTP[1]) != PTPLS_LOCKED);
         //MTAL_DP("\n>>> CManager::SetSamplingRate completed () (self->m_PTP.GetLockStatus() == PTPLS_LOCKED)\n\n");
     }
     return true;
@@ -528,9 +588,47 @@ bool SetNumberOfOutputs(struct TManager* self, uint32_t NumberOfChannels)
 }
 
 //////////////////////////////////////////////////////////////////////////////////
-TClock_PTP* GetPTP(struct TManager* self)
+TClock_PTP* GetPTP(struct TManager* self, unsigned short ptp_idx)
 {
-    return &self->m_PTP;
+    if (ptp_idx < _MAX_NICS)
+    {
+        return &self->m_PTP[ptp_idx];
+    }
+    return NULL;
+}
+
+//////////////////////////////////////////////////////////////////////////////////
+void Select_PTP_NIC(struct TManager* self)
+{
+    int i = 0;
+    for (i = 0; i < _MAX_NICS; i++)
+    {
+        EPTPLockStatus lockStatus = GetLockStatus(&self->m_PTP[i]);
+        if (self->m_lastLockStatus[i] != lockStatus)
+        {
+            printk("PTP lock [%d] status changed from %d to %d\n", i, self->m_lastLockStatus[i], lockStatus);
+            self->m_lastLockStatus[i] = lockStatus;
+        }
+    }
+
+    if (self->m_lastLockStatus[0] == PTPLS_LOCKED && GetPTPPriority(&self->m_PTP[0]) <= GetPTPPriority(&self->m_PTP[1]))
+    {
+        self->m_Active_PTP_NIC_Idx = 0;
+    }
+    else if (self->m_lastLockStatus[1] == PTPLS_LOCKED)
+    {
+        self->m_Active_PTP_NIC_Idx = 1;
+    }
+    else
+    {
+        self->m_Active_PTP_NIC_Idx = 0;
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////////////
+unsigned short GetSelected_PTP_NIC(struct TManager* self)
+{
+    return self->m_Active_PTP_NIC_Idx;
 }
 
 //////////////////////////////////////////////////////////////////////////////////
@@ -548,19 +646,30 @@ bool IsIOStarted(struct TManager* self)
 //////////////////////////////////////////////////////////////////////////////////
 int EtherTubeRxPacket(struct TManager* self, void* packet, int packet_size, const char* ifname, int mac_header)
 {
-    return rx_packet(&self->m_EthernetFilter, packet, packet_size, ifname, mac_header);
+    int i = 0;
+    int ret = 1;
+    for (i = 0; i < _MAX_NICS; i++)
+    {
+        ret &= rx_packet(&self->m_EthernetFilter[i], packet, packet_size, ifname, mac_header);
+    }
+    return ret;
 }
 
 //////////////////////////////////////////////////////////////////////////////////
 void EtherTubeHookFct(struct TManager* self, void* hook_fct, void* hook_struct)
 {
-    netfilter_hook_fct(&self->m_EthernetFilter, hook_fct, hook_struct);
+    int i = 0;
+    for (i = 0; i < _MAX_NICS; i++)
+    {
+        netfilter_hook_fct(&self->m_EthernetFilter[i], hook_fct, hook_struct);
+    }
 }
 
 //////////////////////////////////////////////////////////////////////////////////
 // Messaging with userland (use netlink)
 void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
 {
+    int i = 0;
     uint32_t ravenna_rate = IsDSDRate(self->m_SampleRate)? 352800 : self->m_SampleRate;
     uint32_t ravenna_audiomode = GetAudioModeFromRate(self->m_SampleRate);
 
@@ -821,8 +930,7 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             break;
         case MT_ALSA_Msg_GetNumberOfInputs:
         {
-            MTAL_DP_INFO("Get Nb Inputs. return %u\n", self->m_NumberOfInputs);
-
+            //MTAL_DP_INFO("Get Nb Inputs. return %u\n", self->m_NumberOfInputs);
             msg_reply.errCode = 0;
             msg_reply.dataSize = sizeof(self->m_NumberOfInputs);
             msg_reply.data = &self->m_NumberOfInputs;
@@ -830,8 +938,7 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
         }
         case MT_ALSA_Msg_GetNumberOfOutputs:
         {
-            MTAL_DP_INFO("Get Nb Outputs. return %u\n", self->m_NumberOfOutputs);
-
+            //MTAL_DP_INFO("Get Nb Outputs. return %u\n", self->m_NumberOfOutputs);
             msg_reply.errCode = 0;
             msg_reply.dataSize = sizeof(self->m_NumberOfOutputs);
             msg_reply.data = &self->m_NumberOfOutputs;
@@ -846,12 +953,39 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             }
             else
             {
-                char* ifname_ptr = (char*)msg_rcv->data;
-                if (!SetInterfaceName(self, ifname_ptr))
-                    msg_reply.errCode = -401;
-                else
-                    msg_reply.errCode = 0;
+                int ifindex = 0;
+                char* ifnames_ptr = (char*)msg_rcv->data;
+                char* start = ifnames_ptr;
+                char* end;
 
+                printk("Set interface name: %s\n", ifnames_ptr);
+
+                // Reset here and re-enabled in SetInterfaceName
+                for (i = 0; i < _MAX_NICS; i++)
+                {
+                    self->m_Is_NIC_Active[i] = false;
+                }
+
+                while ((end = strchr(start, ',')) != NULL) 
+                {
+                    *end = '\0';
+                    printk(KERN_INFO "Set interface name [%d] %s\n", ifindex, start);
+                    if (!SetInterfaceName(self, start, ifindex))
+                        msg_reply.errCode = -401;
+                    else
+                        msg_reply.errCode = 0;
+                    start = end + 1;
+                    ifindex += 1;
+                }
+
+                if (*start != '\0')
+                {
+                    printk(KERN_INFO "Set interface name [%d] %s\n", ifindex, start);
+                    if (!SetInterfaceName(self, start, ifindex))
+                        msg_reply.errCode = -401;
+                    else
+                        msg_reply.errCode = 0;
+                }
             }
             break;
         }
@@ -911,7 +1045,10 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             else
             {
                 TPTPConfig* ptpConfig = (TPTPConfig*)msg_rcv->data;
-                SetPTPConfig(&self->m_PTP, ptpConfig);
+                for (i = 0; i < _MAX_NICS; i++)
+                {
+                    SetPTPConfig(&self->m_PTP[i], ptpConfig);
+                }
                 msg_reply.errCode = 0;
             }
             break;
@@ -921,7 +1058,7 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             //MTAL_DP_INFO("Get PTP Config\n");
 
             TPTPConfig ptpConfig;
-            GetPTPConfig(&self->m_PTP, &ptpConfig);
+            GetPTPConfig(&self->m_PTP[self->m_Active_PTP_NIC_Idx], &ptpConfig);
 
             msg_reply.errCode = 0;
             msg_reply.dataSize = sizeof(TPTPConfig);
@@ -935,7 +1072,7 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             //MTAL_DP_INFO("Get PTP Status\n");
 
             TPTPStatus ptpStatus;
-            GetPTPStatus(&self->m_PTP, &ptpStatus);
+             GetPTPStatus(&self->m_PTP[self->m_Active_PTP_NIC_Idx], &ptpStatus);
 
             msg_reply.errCode = 0;
             msg_reply.dataSize = sizeof(TPTPStatus);
@@ -1028,44 +1165,6 @@ bool GetHALToTICDelta(struct TManager* self, THALToTICDelta* pHALToTICDelta)
     return false;
 }
 
-//////////////////////////////////////////////////////////////////////////////////
-int AllocateStatusBuffer(struct TManager* self)
-{
-    int theAnswer = 0;
-
-    //  The status buffer holds the zero time stamp when IO is running
-    //TODO: self->m_pStatusBuffer = IOBufferMemoryDescriptor::withOptions(kIOMemoryKernelUserShared, sizeof(MergingRAVENNAAudioDriverStatus));
-    self->m_pStatusBuffer = (MergingRAVENNAAudioDriverStatus*)malloc(sizeof(MergingRAVENNAAudioDriverStatus));     // TODO (temporary)
-
-    //FailIfNULL(self->m_pStatusBuffer, theAnswer = kIOReturnNoMemory, Failure, "MergingRAVENNAAudioDriver::allocateBuffers: failed to allocate the status buffer");
-    //bzero(self->m_pStatusBuffer->getBytesNoCopy(), self->m_pStatusBuffer->getCapacity());
-    if(self->m_pStatusBuffer == nullptr)
-    {
-        theAnswer = -1;
-        MTAL_DP("CManager::AllocateBuffers: allocating self->m_pStatusBuffer failed\n");
-        goto Failure;
-    }
-    memset(self->m_pStatusBuffer, 0, sizeof(MergingRAVENNAAudioDriverStatus));
-
-
-    return 0;
-
-Failure:
-    FreeStatusBuffer(self);
-
-    return theAnswer;
-}
-
-//////////////////////////////////////////////////////////////////////////////////
-void FreeStatusBuffer(struct TManager* self)
-{
-    if(self->m_pStatusBuffer != nullptr)
-    {
-        free(self->m_pStatusBuffer);
-        //self->m_pStatusBuffer->release();
-        self->m_pStatusBuffer = nullptr;
-    }
-}
 
 //////////////////////////////////////////////////////////////////////////////////
 void MuteInputBuffer(struct TManager* self)
@@ -1132,18 +1231,6 @@ uint32_t GetMaxTICFrameSize(struct TManager* self)
 }
 
 //////////////////////////////////////////////////////////////////////////////////
-void* GetStatusBuffer(struct TManager* self)
-{
-    return (void*)self->m_pStatusBuffer;
-}
-
-//////////////////////////////////////////////////////////////////////////////////
-void LockStatusBuffer(struct TManager* self) {}
-
-//////////////////////////////////////////////////////////////////////////////////
-void UnLockStatusBuffer(struct TManager* self) {}
-
-//////////////////////////////////////////////////////////////////////////////////
 uint32_t GetIPAddress(void* user)
 {
     return 0; // TODO
@@ -1153,7 +1240,7 @@ uint32_t GetIPAddress(void* user)
 // CEtherTubeAdviseSink
 //////////////////////////////////////////////////////////////////////////////////
 //////////////////////////////////////////////////////////////////////////////////
-EDispatchResult DispatchPacket(struct TManager* self, void* pBuffer, uint32_t packetsize, int mac_header)
+EDispatchResult DispatchPacket(struct TManager* self, void* pBuffer, uint32_t packetsize, int mac_header, unsigned char nicId)
 {
     EDispatchResult nDispatchResult = DR_PACKET_NOT_USED;
     TUDPPacketBase* pUDPPacketBase = (TUDPPacketBase*)pBuffer;
@@ -1174,10 +1261,16 @@ EDispatchResult DispatchPacket(struct TManager* self, void* pBuffer, uint32_t pa
     //MTAL_DumpUDPHeader(&pUDPPacketBase->UDPHeader);
     //MTAL_DP("packetsize %u\n", packetsize);
 
-    nDispatchResult = process_PTP_packet(&self->m_PTP, pUDPPacketBase, packetsize);
-    if(nDispatchResult == DR_PACKET_NOT_USED)
+    if (nicId < _MAX_NICS)
     {
-        nDispatchResult = process_UDP_packet(&self->m_RTP_streams_manager, pUDPPacketBase, packetsize);
+        if (self->m_Is_NIC_Active[nicId])
+        {
+            nDispatchResult = process_PTP_packet(&self->m_PTP[nicId], pUDPPacketBase, packetsize);
+            if (nDispatchResult == DR_PACKET_NOT_USED)
+            {
+                nDispatchResult = process_UDP_packet(&self->m_RTP_streams_manager, nicId, pUDPPacketBase, packetsize);
+            }
+        }
     }
     return nDispatchResult;
 }
@@ -1186,19 +1279,19 @@ EDispatchResult DispatchPacket(struct TManager* self, void* pBuffer, uint32_t pa
 uint64_t get_global_SAC(void* user)
 {
     struct TManager* self = (struct TManager*)user;
-    return get_ptp_global_SAC(&self->m_PTP);
+    return get_ptp_global_SAC(&self->m_PTP[self->m_Active_PTP_NIC_Idx]);
 }
 //////////////////////////////////////////////////////////////////////////////////
 uint64_t get_global_time(void* user)
 {
     struct TManager* self = (struct TManager*)user;
-    return get_ptp_global_time(&self->m_PTP);
+    return get_ptp_global_time(&self->m_PTP[self->m_Active_PTP_NIC_Idx]);
 }
 //////////////////////////////////////////////////////////////////////////////////
 void get_global_times(void* user, uint64_t* pui64GlobalSAC, uint64_t* pui64GlobalTime, uint64_t* pui64GlobalPerformanceCounter)
 {
     struct TManager* self = (struct TManager*)user;
-    return get_ptp_global_times(&self->m_PTP, pui64GlobalSAC, pui64GlobalTime, pui64GlobalPerformanceCounter);
+    return get_ptp_global_times(&self->m_PTP[self->m_Active_PTP_NIC_Idx], pui64GlobalSAC, pui64GlobalTime, pui64GlobalPerformanceCounter);
 } // return the time when the audio frame TIC occured
 
 //////////////////////////////////////////////////////////////////////////////////
@@ -1349,7 +1442,6 @@ uint32_t get_live_out_jitter_buffer_offset(void* user, const uint64_t ui64Curren
         return offset;
     #endif // MT_TONE_TEST
 }
-
 //////////////////////////////////////////////////////////////////////////////////
 int update_live_in_audio_data_format(void* user, uint32_t ulChannelId, char const * pszCodec)
 {
@@ -1375,21 +1467,13 @@ unsigned char get_live_out_mute_pattern(void* user, uint32_t ulChannelId)
 //////////////////////////////////////////////////////////////////////////////////
 // Caudio_streamer_clock_PTP_callback
 //////////////////////////////////////////////////////////////////////////////////
-static EPTPLockStatus prevLockStatus;
-//////////////////////////////////////////////////////////////////////////////////
 void AudioFrameTIC(void* user)
 {
     struct TManager* self = (struct TManager*)user;
-    EPTPLockStatus lockStatus = GetLockStatus(&self->m_PTP);
-    if (prevLockStatus != lockStatus)
-    {
-        MTAL_DP("PTP lock status changed from %d to %d\n", prevLockStatus, lockStatus);
-        prevLockStatus = lockStatus;
-    }
 
     prepare_buffer_lives(&self->m_RTP_streams_manager);
     
-    if (self->m_bIORunning && lockStatus == PTPLS_LOCKED)
+    if (self->m_bIORunning && self->m_lastLockStatus[self->m_Active_PTP_NIC_Idx] == PTPLS_LOCKED)
     {
         #ifdef MTTRANSPARENCY_CHECK
         {
@@ -1580,7 +1664,7 @@ int set_sample_rate(void* user, uint32_t rate)
                     return false;
                 }
             }
-            while(GetLockStatus(GetPTP(self)) != PTPLS_LOCKED);
+            while (GetLockStatus(&self->m_PTP[0]) != PTPLS_LOCKED || GetLockStatus(&self->m_PTP[1]) != PTPLS_LOCKED);
             MTAL_DP("CManager::set_sample_rate completed\n");
         }
         return 0;

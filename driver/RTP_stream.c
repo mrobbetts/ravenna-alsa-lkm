@@ -75,7 +75,7 @@ int rtp_stream_init(TRTP_stream* pRTP_stream, TEtherTubeNetfilter* pEth_netfilte
 {
 	pRTP_stream->m_pEth_netfilter = pEth_netfilter;
 	memcpy(&pRTP_stream->m_RTP_stream_info, pRTP_stream_info, sizeof(TRTP_stream_info));
-	dump(&pRTP_stream->m_RTP_stream_info);
+	//dump(&pRTP_stream->m_RTP_stream_info);
 
 	// Optimization: prepare RTP out packet in advance
 	if (pRTP_stream->m_RTP_stream_info.m_bSource)
@@ -158,7 +158,7 @@ int rtp_stream_init(TRTP_stream* pRTP_stream, TEtherTubeNetfilter* pEth_netfilte
 				snprintf(cCNAME, sizeof(cCNAME), "%d.%d.%d.%d", ui32SrcIP >> 24, (ui32SrcIP >> 16)  & 0xFF, (ui32SrcIP >> 8)  & 0xFF, ui32SrcIP & 0xFF);
 			#endif
 
-			uiItemSize = sizeof(TRTCP_SourceDescriptionItem);
+			uiItemSize = sizeof(TRTCP_SourceDescriptionItem) - 1 + (unsigned int)strlen(cCNAME); //  -1: because TRTCP_SourceDescriptionChunk already contains one byte for data
 			uiEndItemSize = 1;
 			uiPadding = (uiItemSize + uiEndItemSize) & 0x3;
 

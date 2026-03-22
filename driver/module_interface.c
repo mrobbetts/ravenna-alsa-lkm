@@ -59,17 +59,14 @@
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Merging Technologies <alsa@merging.com>");
 MODULE_DESCRIPTION("Merging Technologies RAVENNA ALSA driver"); // see modinfo
-MODULE_VERSION("bondagit-1.18");
+MODULE_VERSION("bondagit-2.0");
 //MODULE_SUPPORTED_DEVICE("{{ALSA,Merging RAVENNA}}");
 
 
 static struct nf_hook_ops nf_ho; // netfilter struct holding set of netfilter hook function options
 static int hooked = 0;
 
-
-/** @brief function to be called by the netfilter hook
- */
-static unsigned int nf_hook_func(unsigned int hooknum, struct sk_buff *skb, const struct net_device *in, const struct net_device *out, int (*okfn)(struct sk_buff *))
+static unsigned int nf_hook_func(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
 {
     int err = 0, rc = 0;
     struct iphdr *ip_header = NULL;
@@ -96,9 +93,6 @@ static unsigned int nf_hook_func(unsigned int hooknum, struct sk_buff *skb, cons
         //printk(KERN_INFO "Loopback address detected\n");
         //return NF_ACCEPT;
     }
-    
-
-    ///////// DEBUG stuff is available into revision prior to 32700
 
     if (skb_is_nonlinear(skb))
     {
@@ -111,12 +105,16 @@ static unsigned int nf_hook_func(unsigned int hooknum, struct sk_buff *skb, cons
             return NF_ACCEPT;
         }
     }
-    //printk("ifname = %s\n", in->name);
+    const char* dev_name = "";
+    if (state != NULL && state->in != NULL)
+    {
+        dev_name = state->in->name;
+    }    
     if (skb_mac_header(skb) == skb_network_header(skb)) {
-        rc = nf_rx_packet(skb_network_header(skb) - ETH_HLEN, skb->len + ETH_HLEN, in->name, 0);
+        rc = nf_rx_packet(skb_network_header(skb) - ETH_HLEN, skb->len + ETH_HLEN, dev_name, 0);
     }
     else {
-        rc = nf_rx_packet(skb_mac_header(skb), skb->len + ETH_HLEN, in->name, 1);
+        rc = nf_rx_packet(skb_mac_header(skb), skb->len + ETH_HLEN, dev_name, 1);
     }
 
     switch (rc)

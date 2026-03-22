@@ -49,8 +49,10 @@ typedef struct
 typedef struct
 {
 	EPTPLockStatus nPTPLockStatus;
-	uint64_t	ui64GMID;
-	int32_t		i32Jitter;
+	uint64_t        ui64GMID[2];
+	int32_t         i32GMIDStats[2];                // 0 link down, 1 link up and locked, 2 link up not locked(i.e. lock the other one)
+	int32_t         i32NetworkJitter;
+	int32_t         i32ClockJitter;
 } TPTPStatus;
 
 typedef struct
@@ -76,8 +78,9 @@ typedef struct
 	uint32_t	ui32TICMaxDelta;
 } TTICStats;
 
-#define TIMER_LATENCY_MAX       1600 // [us]
-#define NB_TIMER_LATENCY_RANGES 16
+#define TIMER_LATENCY_MAX       5500//1600 // [us]
+#define NB_TIMER_LATENCY_RANGES 55 //16
+
 typedef struct
 {
     uint8_t     ui8NumberOfTimerLatencies;
