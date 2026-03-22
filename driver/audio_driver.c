@@ -731,7 +731,7 @@ static int mr_alsa_audio_pcm_interrupt(void *rawchip, int direction)
             if (chip->playback_deinterleave_fn) {
                 chip->playback_deinterleave_fn(
                     chip->playback_buffer,
-                    chip->current_dsd ? MR_ALSA_RINGBUFFER_NB_FRAMES : ring_buffer_size,
+                    MR_ALSA_RINGBUFFER_NB_FRAMES,
                     chip->playback_buffer_pos,
                     chip->dma_playback_buffer + (uint32_t)atomic_read(&chip->dma_playback_offset),
                     runtime->channels,
