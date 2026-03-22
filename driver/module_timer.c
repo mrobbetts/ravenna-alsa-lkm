@@ -82,7 +82,7 @@ static void audio_work_fn(struct kthread_work *work)
      * We honor this but cap iterations to prevent unbounded spinning.
      */
     do {
-        t_clock_timer(&next_wakeup);
+        t_clock_timer(&next_wakeup, now);
         get_clock_time(&now);
     } while (!atomic_read(&stop_) && now >= next_wakeup &&
              ++iterations < MAX_CATCHUP_ITERATIONS);

@@ -1596,7 +1596,7 @@ static int mr_alsa_audio_pcm_hw_params( struct snd_pcm_substream *substream,
     unsigned int nbCh = params_channels(params);
     unsigned int periodSize = params_period_size(params);
     unsigned int nbPeriods = params_periods(params);
-    unsigned int bufferSize = params_buffer_size(params);
+    //unsigned int bufferSize = params_buffer_size(params);
     unsigned int bufferBytes = params_buffer_bytes(params);
     uint32_t dsd_rate = mr_alsa_audio_get_dsd_sample_rate(format, rate);
     uint32_t dsd_mode = mr_alsa_audio_get_dsd_mode(dsd_rate);
