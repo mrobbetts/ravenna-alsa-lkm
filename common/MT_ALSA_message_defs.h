@@ -32,17 +32,42 @@
 #ifndef MT_ALSA_MESSAGE_DEFINES_INCLUDED
 #define MT_ALSA_MESSAGE_DEFINES_INCLUDED
 
+#ifdef __KERNEL__
+#include <linux/types.h>
+#else
+#include <stdint.h>
+#endif
+
 #define NETLINK_U2K_ID 31
 #define NETLINK_K2U_ID 29
 
 #define MAX_PAYLOAD 1024
 
+/*
+ * Multi-PCM payload convention (multi-rate project, Stage 1):
+ *
+ * The driver supports N ALSA PCM devices (`hw:RAVENNA,0..N-1`). For messages
+ * that act on a specific PCM, the payload is prefixed with `int32_t pcm_id`
+ * followed by the legacy payload. PCM 0 always exists (created at module
+ * load). Additional PCMs are created on demand via MT_ALSA_Msg_AddPCM.
+ *
+ * Per-PCM messages (payload begins with int32_t pcm_id):
+ *   MT_ALSA_Msg_Reset, MT_ALSA_Msg_SetNumberOfInputs,
+ *   MT_ALSA_Msg_SetNumberOfOutputs, MT_ALSA_Msg_GetNumberOfInputs,
+ *   MT_ALSA_Msg_GetNumberOfOutputs, MT_ALSA_Msg_SetPlayoutDelay,
+ *   MT_ALSA_Msg_SetCaptureDelay, MT_ALSA_Msg_Add_RTPStream.
+ *
+ * Manager-wide messages (no pcm_id prefix): everything else, including
+ * Start/Stop, SetSampleRate (Stage 1: shared rate), PTP/NIC config,
+ * Remove_RTPStream and GetRTPStreamStatus (handle is globally unique),
+ * and master volume/switch (Stage 1: shared, registered on PCM 0).
+ */
 enum MT_ALSA_msg_id
 {
 
     MT_ALSA_Msg_Start,                    //    U2K No arguments
     MT_ALSA_Msg_Stop,                     //    U2K No arguments
-    MT_ALSA_Msg_Reset,                    //    U2K No arguments
+    MT_ALSA_Msg_Reset,                    //    U2K One input: int32_t pcm_id
     MT_ALSA_Msg_StartIO,                  //    U2K No arguments
     MT_ALSA_Msg_StopIO,                   //    U2K No arguments
     MT_ALSA_Msg_SetSampleRate,            //    U2K K2U One input: the new sample rate as a 32 bit integer
@@ -51,12 +76,12 @@ enum MT_ALSA_msg_id
     MT_ALSA_Msg_SetDSDAudioMode,          //    U2K One input: the new DSD audio mode as a 32 bit integer
     MT_ALSA_Msg_SetTICFrameSizeAt1FS,     //    U2K One input: the new 1 Fs TIC Frame size as a 64 bit integer
     MT_ALSA_Msg_SetMaxTICFrameSize,       //    U2K One input: the new Max TIC Frame size as a 64 bit integer
-    MT_ALSA_Msg_SetNumberOfInputs,        //    U2K One input: the new number of inputs as a 32 bit integer
-    MT_ALSA_Msg_SetNumberOfOutputs,       //    U2K One input: the new number of outputs as a 32 bit integer
-    MT_ALSA_Msg_GetNumberOfInputs,        //    U2K One input: the number of inputs as a 32 bit integer
-    MT_ALSA_Msg_GetNumberOfOutputs,
+    MT_ALSA_Msg_SetNumberOfInputs,        //    U2K Inputs: int32_t pcm_id, uint32_t number of inputs
+    MT_ALSA_Msg_SetNumberOfOutputs,       //    U2K Inputs: int32_t pcm_id, uint32_t number of outputs
+    MT_ALSA_Msg_GetNumberOfInputs,        //    U2K Input: int32_t pcm_id. Output: uint32_t number of inputs
+    MT_ALSA_Msg_GetNumberOfOutputs,       //    U2K Input: int32_t pcm_id. Output: uint32_t number of outputs
     MT_ALSA_Msg_SetInterfaceName,         //    U2K One input: Struct_SetInterfaceName
-    MT_ALSA_Msg_Add_RTPStream,            //    U2K One input: RTPStreamInfo, one output: hHandle
+    MT_ALSA_Msg_Add_RTPStream,            //    U2K Inputs: int32_t pcm_id, RTPStreamInfo. Output: hHandle
     MT_ALSA_Msg_Remove_RTPStream,         //    U2K One input: hHandle
     MT_ALSA_Msg_Update_RTPStream_Name,    //    U2K One input: CRTP_stream_update_name
     MT_ALSA_Msg_GetPTPInfo,               //    U2K One output: TPTPInfo (obsolete)
@@ -67,12 +92,28 @@ enum MT_ALSA_msg_id
     MT_ALSA_Msg_SetMasterOutputSwitch,    //    U2K K2U NADAC only : one input: int32_t value (0 or 1)
     MT_ALSA_Msg_GetMasterOutputVolume,    //    K2U NADAC only : one output: int32_t value (-99 to 0)
     MT_ALSA_Msg_GetMasterOutputSwitch,    //    K2U NADAC only : one output: int32_t value (0 or 1)
-    MT_ALSA_Msg_SetPlayoutDelay,          //    U2K one input: the delay in sample as a 32 bit signed integer
-    MT_ALSA_Msg_SetCaptureDelay,          //    U2K one input: the delay in sample as a 32 bit signed integer
+    MT_ALSA_Msg_SetPlayoutDelay,          //    U2K Inputs: int32_t pcm_id, int32_t delay in samples
+    MT_ALSA_Msg_SetCaptureDelay,          //    U2K Inputs: int32_t pcm_id, int32_t delay in samples
     MT_ALSA_Msg_GetRTPStreamStatus,       //    U2K One input: hHandle, one output: the RTP stream status struct
     MT_ALSA_Msg_SetPTPConfig,             //    U2K One input: TPTPConfig
     MT_ALSA_Msg_GetPTPConfig,             //    U2K One output: TPTPConfig
-    MT_ALSA_Msg_GetPTPStatus              //    U2K One output: TPTPStatus
+    MT_ALSA_Msg_GetPTPStatus,             //    U2K One output: TPTPStatus
+    /* multi-rate Stage 1 additions; appended to preserve wire-protocol values */
+    MT_ALSA_Msg_AddPCM,                   //    U2K Input: struct MT_ALSA_AddPCM_args. Creates hw:RAVENNA,pcm_id
+    MT_ALSA_Msg_RemovePCM                 //    U2K Input: int32_t pcm_id (refuses pcm_id == 0)
+};
+
+/*
+ * Argument struct for MT_ALSA_Msg_AddPCM.
+ * Sample rate is included for forward compatibility with Stage 2 (per-PCM
+ * rates); in Stage 1 the driver requires it to equal the manager-wide rate.
+ */
+struct MT_ALSA_AddPCM_args
+{
+    int32_t  pcm_id;
+    uint32_t sample_rate;
+    uint32_t num_inputs;
+    uint32_t num_outputs;
 };
 
 struct MT_ALSA_msg

@@ -53,6 +53,14 @@
 
 #define MAX_INTERFACE_NAME 64
 
+/*
+ * Multi-PCM, Stage 1 (multi-rate project):
+ * PCM 0 is created at module load. Additional PCMs are added on demand via
+ * MT_ALSA_Msg_AddPCM. All PCMs share PTP, NICs, sample rate, and the single
+ * tick scheduler. MAX_PCMS bounds the per-card device index range.
+ */
+#define MAX_PCMS 8
+
 #ifndef nullptr
     #define nullptr NULL
 #endif // nullptr
@@ -102,7 +110,8 @@ struct TManager
 
 // ALSA <> Manager communication
 
-    void* m_pALSAChip;                              /// pointer to ALSA chip struct (struct mr_alsa_audio_chip)
+    void* m_apALSAChip[MAX_PCMS];                   /// per-PCM ALSA chip pointers (struct mr_alsa_audio_chip*); slot 0 is the default PCM created at probe
+    uint32_t m_uPCMCount;                           /// number of valid entries in m_apALSAChip
     const struct ravenna_mgr_ops *m_alsa_driver_frontend;   /// Manager to ALSA driver (e.g. buffers access and lock)
     struct alsa_ops m_alsa_callbacks;                /// ALSA driver to Manager (e.g. audio setup at runtime)
 };
@@ -187,6 +196,13 @@ rtp_audio_stream_ops* Get_C_Callbacks(struct TManager* self);
 
 
 int attach_alsa_driver(void* user, const struct ravenna_mgr_ops *ops, void *alsa_chip_pointer);
+void detach_alsa_driver(struct TManager* self, void *alsa_chip_pointer);
+/*
+ * Returns m_apALSAChip[pcm_id], or NULL if pcm_id is out of range or that
+ * slot is empty. Stage 1 transitional helper: most code paths still operate
+ * on the default chip (id 0). Tasks 5-7 add per-PCM dispatch.
+ */
+void* get_chip_by_pcm_id(struct TManager* self, int32_t pcm_id);
 void init_alsa_callbacks(struct TManager* self);
 int get_input_jitter_buffer_offset(void* user, uint32_t *offset);
 int get_output_jitter_buffer_offset(void* user, uint32_t *offset);
@@ -202,8 +218,8 @@ int get_nb_inputs(void* user, uint32_t *nb_Channels);
 int get_nb_outputs(void* user, uint32_t *nb_Channels);
 int get_playout_delay(void* user, snd_pcm_sframes_t *delay_in_sample);
 int get_capture_delay(void* user, snd_pcm_sframes_t *delay_in_sample);
-int start_interrupts(void* user, bool is_playback);
-int stop_interrupts(void* user, bool is_playback);
+int start_interrupts(void* user, void* alsa_chip_pointer, bool is_playback);
+int stop_interrupts(void* user, void* alsa_chip_pointer, bool is_playback);
 int notify_master_volume_change(void* user, int direction, int32_t value);
 int notify_master_switch_change(void* user, int direction, int32_t value);
 int get_master_volume_value(void* user, int direction, int32_t* value);
