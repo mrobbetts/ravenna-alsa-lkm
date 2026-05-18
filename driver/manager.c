@@ -140,7 +140,8 @@ bool init(struct TManager* self, int* errorCode)
 
     self->m_bIsStarted = false;
     self->m_bIORunning = false;
-    self->m_pALSAChip = NULL;
+    memset(self->m_apALSAChip, 0, sizeof(self->m_apALSAChip));
+    self->m_uPCMCount = 0;
     self->m_alsa_driver_frontend = NULL;
     self->m_bIsPlaybackIO = false;
     self->m_bIsRecordingIO = false;
@@ -300,6 +301,36 @@ bool stop(struct TManager* self)
 }
 
 //////////////////////////////////////////////////////////////////////////////////
+/*
+ * Stage 1 multi-PCM: the global m_bIsPlaybackIO/m_bIsRecordingIO flags now
+ * mean "at least one chip is doing playback/capture IO right now". They are
+ * recomputed from the per-chip flags (set by start_interrupts/stop_interrupts
+ * before startIO/stopIO run) instead of being toggled unconditionally — so a
+ * stopIO call from chip 0 cannot stop the world while chip 1 is still active.
+ */
+static void recompute_global_io_flags(struct TManager* self)
+{
+    bool any_play = false;
+    bool any_cap  = false;
+    uint32_t i;
+    if (self->m_alsa_driver_frontend)
+    {
+        for (i = 0; i < self->m_uPCMCount; ++i)
+        {
+            void *chip = self->m_apALSAChip[i];
+            if (!chip)
+                continue;
+            if (self->m_alsa_driver_frontend->get_io_state(chip, true))
+                any_play = true;
+            if (self->m_alsa_driver_frontend->get_io_state(chip, false))
+                any_cap = true;
+        }
+    }
+    self->m_bIsPlaybackIO = any_play;
+    self->m_bIsRecordingIO = any_cap;
+    self->m_bIORunning = any_play || any_cap;
+}
+
 bool startIO(struct TManager* self, bool is_playback)
 {
     if(!self->m_bIsStarted)
@@ -310,12 +341,10 @@ bool startIO(struct TManager* self, bool is_playback)
     if (!is_playback) {
         printk(KERN_DEBUG "starting capture I/O\n");
         MuteInputBuffer(self);
-        self->m_bIsRecordingIO = true;
     }
     else {
         printk(KERN_DEBUG "starting playback I/O\n");
         MuteOutputBuffer(self);
-        self->m_bIsPlaybackIO = true;
     }
 
     #if defined(MT_TONE_TEST)
@@ -325,7 +354,7 @@ bool startIO(struct TManager* self, bool is_playback)
     #endif // MT_TONE_TEST
 
     // NAD-351: must be done after mute
-    self->m_bIORunning = true;
+    recompute_global_io_flags(self);
 
     return true;
 }
@@ -335,22 +364,18 @@ bool stopIO(struct TManager* self, bool is_playback)
 {
     MTAL_DP("MergingRAVENNAAudioDriver::stopIO\n");
 
-    if (is_playback && !self->m_bIsPlaybackIO)
-        return true;
-    if (!is_playback && !self->m_bIsRecordingIO)
-        return true;
-
     if (!is_playback) {
         printk(KERN_DEBUG "stopping capture I/O\n");
+        /* MuteInputBuffer touches chip 0's buffer. With multiple capturing
+         * PCMs we'd want per-chip mute; defer to Task 7 when buffer routing
+         * becomes per-PCM. Stage 1 keeps the existing behaviour. */
         MuteInputBuffer(self);
-        self->m_bIsRecordingIO = false;
     } else {
         printk(KERN_DEBUG "stopping playback I/O\n");
         MuteOutputBuffer(self);
-        self->m_bIsPlaybackIO = false;
     }
 
-    self->m_bIORunning = self->m_bIsRecordingIO || self->m_bIsPlaybackIO;
+    recompute_global_io_flags(self);
 
     return true;
 }
@@ -1091,8 +1116,8 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             {
                 int32_t* value_ptr = (int32_t*)msg_rcv->data;
                 ///TODO
-                if(self->m_pALSAChip && value_ptr != nullptr)
-                    self->m_alsa_driver_frontend->notify_master_volume_change(self->m_pALSAChip, 0, *value_ptr);
+                if(self->m_apALSAChip[0] && value_ptr != nullptr)
+                    self->m_alsa_driver_frontend->notify_master_volume_change(self->m_apALSAChip[0], 0, *value_ptr);
 
                 msg_reply.errCode = 0;
             }
@@ -1107,8 +1132,8 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             {
                 int32_t* value_ptr = (int32_t*)msg_rcv->data;
                 ///TODO
-                if(self->m_pALSAChip && value_ptr != nullptr)
-                    self->m_alsa_driver_frontend->notify_master_switch_change(self->m_pALSAChip, 0, *value_ptr);
+                if(self->m_apALSAChip[0] && value_ptr != nullptr)
+                    self->m_alsa_driver_frontend->notify_master_switch_change(self->m_apALSAChip[0], 0, *value_ptr);
 
                 msg_reply.errCode = 0;
             }
@@ -1170,52 +1195,52 @@ bool GetHALToTICDelta(struct TManager* self, THALToTICDelta* pHALToTICDelta)
 void MuteInputBuffer(struct TManager* self)
 {
     int32_t* inputBuffer = nullptr;
-    uint32_t bufferLength = self->m_alsa_driver_frontend->get_capture_buffer_size_in_frames(self->m_pALSAChip);
+    uint32_t bufferLength = self->m_alsa_driver_frontend->get_capture_buffer_size_in_frames(self->m_apALSAChip[0]);
     if(bufferLength == 0)
     {
         MTAL_DP("CManager::start() failed: ALSA capture buffer size is 0\n");
         return;
     }
 
-    self->m_alsa_driver_frontend->lock_capture_buffer(self->m_pALSAChip);
-    inputBuffer = (int32_t*)(self->m_alsa_driver_frontend->get_capture_buffer(self->m_pALSAChip));
+    self->m_alsa_driver_frontend->lock_capture_buffer(self->m_apALSAChip[0]);
+    inputBuffer = (int32_t*)(self->m_alsa_driver_frontend->get_capture_buffer(self->m_apALSAChip[0]));
     if(inputBuffer == nullptr)
     {
         MTAL_DP("CManager::start() failed: No ALSA capture buffer available\n");
-        self->m_alsa_driver_frontend->unlock_capture_buffer(self->m_pALSAChip);
+        self->m_alsa_driver_frontend->unlock_capture_buffer(self->m_apALSAChip[0]);
         return;
     }
 
     //MTAL_DP("Input Buffer muted with 0x%x\n", get_live_in_mute_pattern(0));
     memset(inputBuffer, get_live_in_mute_pattern(self, 0), sizeof(int32_t) * bufferLength * self->m_NumberOfInputs);
 
-    self->m_alsa_driver_frontend->unlock_capture_buffer(self->m_pALSAChip);
+    self->m_alsa_driver_frontend->unlock_capture_buffer(self->m_apALSAChip[0]);
 }
 
 //////////////////////////////////////////////////////////////////////////////////
 void MuteOutputBuffer(struct TManager* self)
 {
     int32_t* outputBuffer = nullptr;
-    uint32_t bufferLength = self->m_alsa_driver_frontend->get_playback_buffer_size_in_frames(self->m_pALSAChip);
+    uint32_t bufferLength = self->m_alsa_driver_frontend->get_playback_buffer_size_in_frames(self->m_apALSAChip[0]);
     if(bufferLength == 0)
     {
         MTAL_DP("CManager::start() failed: ALSA playback buffer size is 0\n");
         return;
     }
 
-    self->m_alsa_driver_frontend->lock_playback_buffer(self->m_pALSAChip);
-    outputBuffer = (int32_t*)(self->m_alsa_driver_frontend->get_playback_buffer(self->m_pALSAChip));
+    self->m_alsa_driver_frontend->lock_playback_buffer(self->m_apALSAChip[0]);
+    outputBuffer = (int32_t*)(self->m_alsa_driver_frontend->get_playback_buffer(self->m_apALSAChip[0]));
     if(outputBuffer == nullptr)
     {
         MTAL_DP("CManager::start() failed: No ALSA playback buffer available\n");
-        self->m_alsa_driver_frontend->unlock_playback_buffer(self->m_pALSAChip);
+        self->m_alsa_driver_frontend->unlock_playback_buffer(self->m_apALSAChip[0]);
         return;
     }
 
     //MTAL_DP("Output Buffer muted with 0x%x\n", get_live_out_mute_pattern(self, 0));
     memset(outputBuffer, get_live_out_mute_pattern(self, 0), sizeof(int32_t) * bufferLength * self->m_NumberOfOutputs);
 
-    self->m_alsa_driver_frontend->unlock_playback_buffer(self->m_pALSAChip);
+    self->m_alsa_driver_frontend->unlock_playback_buffer(self->m_apALSAChip[0]);
 }
 
 //////////////////////////////////////////////////////////////////////////////////
@@ -1349,7 +1374,7 @@ void* get_live_in_jitter_buffer(void* user, uint32_t ulChannelId)
     unsigned char* inputBuffer = nullptr;
     uint32_t bufferLength = RINGBUFFERSIZE;
 
-    inputBuffer = (unsigned char*)(self->m_alsa_driver_frontend->get_capture_buffer(self->m_pALSAChip));
+    inputBuffer = (unsigned char*)(self->m_alsa_driver_frontend->get_capture_buffer(self->m_apALSAChip[0]));
     if(inputBuffer == nullptr || ulChannelId >= self->m_NumberOfInputs)
     {
         MTAL_DP_ERR("CManager::get_live_in_jitter_buffer() failed: retrieving channel #%u buffer jitter buffer \n", ulChannelId + 1);
@@ -1368,7 +1393,7 @@ void* get_live_out_jitter_buffer(void* user, uint32_t ulChannelId)
     unsigned char* outputBuffer = nullptr;
     uint32_t bufferLength = RINGBUFFERSIZE;
 
-    outputBuffer = (unsigned char*)(self->m_alsa_driver_frontend->get_playback_buffer(self->m_pALSAChip));
+    outputBuffer = (unsigned char*)(self->m_alsa_driver_frontend->get_playback_buffer(self->m_apALSAChip[0]));
     if(outputBuffer == nullptr || ulChannelId >= self->m_NumberOfOutputs)
     {
         MTAL_DP_ERR("CManager::get_live_out_jitter_buffer() failed: retrieving channel #%u buffer jitter buffer \n", ulChannelId + 1);
@@ -1383,14 +1408,14 @@ void* get_live_out_jitter_buffer(void* user, uint32_t ulChannelId)
 uint32_t get_live_in_jitter_buffer_length(void* user)
 {
     struct TManager* self = (struct TManager*)user;
-    return self->m_alsa_driver_frontend->get_capture_buffer_size_in_frames(self->m_pALSAChip);
+    return self->m_alsa_driver_frontend->get_capture_buffer_size_in_frames(self->m_apALSAChip[0]);
 }
 
 //////////////////////////////////////////////////////////////////////////////////
 uint32_t get_live_out_jitter_buffer_length(void* user)
 {
     struct TManager* self = (struct TManager*)user;
-    return self->m_alsa_driver_frontend->get_playback_buffer_size_in_frames(self->m_pALSAChip);
+    return self->m_alsa_driver_frontend->get_playback_buffer_size_in_frames(self->m_apALSAChip[0]);
 }
 
 //////////////////////////////////////////////////////////////////////////////////
@@ -1401,7 +1426,7 @@ uint32_t get_live_in_jitter_buffer_offset(void* user, const uint64_t ui64Current
     #if defined(MT_TONE_TEST) || defined (MT_RAMP_TEST) || defined (MTLOOPBACK) || defined (MTTRANSPARENCY_CHECK)
         return (uint32_t)CW_ll_modulo(ui64CurrentSAC, get_live_in_jitter_buffer_length(self));
     #else
-        uint32_t live_in_jitter_buffer_length = self->m_alsa_driver_frontend->get_capture_buffer_size_in_frames(self->m_pALSAChip);
+        uint32_t live_in_jitter_buffer_length = self->m_alsa_driver_frontend->get_capture_buffer_size_in_frames(self->m_apALSAChip[0]);
         return (uint32_t)CW_ll_modulo(ui64CurrentSAC, live_in_jitter_buffer_length);
     #endif
 }
@@ -1421,7 +1446,7 @@ uint32_t get_live_out_jitter_buffer_offset(void* user, const uint64_t ui64Curren
     #if defined(MT_TONE_TEST) || defined (MT_RAMP_TEST) || defined (MTLOOPBACK) || defined (MTTRANSPARENCY_CHECK)
         return (uint32_t)CW_ll_modulo(ui64CurrentSAC, get_live_out_jitter_buffer_length(self));
     #else
-        uint32_t offset = self->m_alsa_driver_frontend->get_playback_buffer_offset(self->m_pALSAChip);
+        uint32_t offset = self->m_alsa_driver_frontend->get_playback_buffer_offset(self->m_apALSAChip[0]);
         const uint32_t sacOffset = (uint32_t)(get_global_SAC(self) - get_frame_size(self) - ui64CurrentSAC);
 
         if(ui64CurrentSAC > get_global_SAC(self))
@@ -1576,12 +1601,19 @@ void AudioFrameTIC(void* user)
         #else
             /// write live outputs
             frame_process_begin(&self->m_RTP_streams_manager);
-            if(self->m_pALSAChip && self->m_alsa_driver_frontend)
+            if (self->m_alsa_driver_frontend)
             {
-                if (self->m_bIsRecordingIO)
-                  self->m_alsa_driver_frontend->pcm_interrupt(self->m_pALSAChip, 1);
-                if (self->m_bIsPlaybackIO)
-                  self->m_alsa_driver_frontend->pcm_interrupt(self->m_pALSAChip, 0);
+                uint32_t i;
+                for (i = 0; i < self->m_uPCMCount; ++i)
+                {
+                    void *chip = self->m_apALSAChip[i];
+                    if (!chip)
+                        continue;
+                    if (self->m_alsa_driver_frontend->get_io_state(chip, false))
+                        self->m_alsa_driver_frontend->pcm_interrupt(chip, 1);
+                    if (self->m_alsa_driver_frontend->get_io_state(chip, true))
+                        self->m_alsa_driver_frontend->pcm_interrupt(chip, 0);
+                }
             }
             frame_process_end(&self->m_RTP_streams_manager);
         #endif
@@ -1623,13 +1655,48 @@ rtp_audio_stream_ops* Get_C_Callbacks(struct TManager* self)
 int attach_alsa_driver(void* user, const struct ravenna_mgr_ops *ops, void *alsa_chip_pointer)
 {
     struct TManager* self = (struct TManager*)user;
-    if(ops && alsa_chip_pointer)
+    uint32_t i;
+    if (!ops || !alsa_chip_pointer)
+        return -EINVAL;
+    /* Reject duplicate attaches of the same chip. */
+    for (i = 0; i < self->m_uPCMCount; ++i)
     {
-        self->m_pALSAChip = alsa_chip_pointer;
-        self->m_alsa_driver_frontend = ops;
-        return 0;
+        if (self->m_apALSAChip[i] == alsa_chip_pointer)
+            return -EEXIST;
     }
-    return -EINVAL;
+    if (self->m_uPCMCount >= MAX_PCMS)
+    {
+        MTAL_DP("attach_alsa_driver: PCM table full (MAX_PCMS=%d)\n", MAX_PCMS);
+        return -ENOSPC;
+    }
+    self->m_apALSAChip[self->m_uPCMCount++] = alsa_chip_pointer;
+    /* Frontend ops are identical across chips; set once on first attach. */
+    if (!self->m_alsa_driver_frontend)
+        self->m_alsa_driver_frontend = ops;
+    return 0;
+}
+
+void detach_alsa_driver(struct TManager* self, void *alsa_chip_pointer)
+{
+    uint32_t i, j;
+    if (!alsa_chip_pointer)
+        return;
+    for (i = 0; i < self->m_uPCMCount; ++i)
+    {
+        if (self->m_apALSAChip[i] != alsa_chip_pointer)
+            continue;
+        for (j = i + 1; j < self->m_uPCMCount; ++j)
+            self->m_apALSAChip[j - 1] = self->m_apALSAChip[j];
+        self->m_apALSAChip[--self->m_uPCMCount] = NULL;
+        return;
+    }
+}
+
+void* get_chip_by_pcm_id(struct TManager* self, int32_t pcm_id)
+{
+    if (pcm_id < 0 || (uint32_t)pcm_id >= self->m_uPCMCount)
+        return NULL;
+    return self->m_apALSAChip[pcm_id];
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1792,22 +1859,26 @@ int get_interrupts_frame_size(void* user, uint32_t *framesize)
     return -EINVAL;
 }
 
-int start_interrupts(void* user, bool is_playback)
+int start_interrupts(void* user, void* alsa_chip_pointer, bool is_playback)
 {
     struct TManager* self = (struct TManager*)user;
 
     MTAL_DP("entering CManager::start_interrupts..\n");
+    if (alsa_chip_pointer && self->m_alsa_driver_frontend)
+        self->m_alsa_driver_frontend->set_io_state(alsa_chip_pointer, is_playback, true);
     if(startIO(self, is_playback)) {
         return 0;
     }
     return -1;
 }
 
-int stop_interrupts(void* user, bool is_playback)
+int stop_interrupts(void* user, void* alsa_chip_pointer, bool is_playback)
 {
     struct TManager* self = (struct TManager*)user;
 
 	MTAL_DP("entering CManager::stop_interrupts..\n");
+    if (alsa_chip_pointer && self->m_alsa_driver_frontend)
+        self->m_alsa_driver_frontend->set_io_state(alsa_chip_pointer, is_playback, false);
     if (stopIO(self, is_playback)) {
         return 0;
     }
