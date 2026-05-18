@@ -737,9 +737,21 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
         }
         case MT_ALSA_Msg_Reset:
         {
+            /* Payload (Stage 1+): int32_t pcm_id. Streams aren't yet tagged
+             * by pcm_id (Task 7), so we still remove all of them; once tagged,
+             * this becomes a per-PCM reset. */
             MTAL_DP("CManager::OnNewMessage MT_ALSA_Msg_Reset..\n");
-            remove_all_RTP_streams(&self->m_RTP_streams_manager);
-            msg_reply.errCode = 0;
+            if (msg_rcv->dataSize != sizeof(int32_t))
+            {
+                MTAL_DP_ERR("MT_ALSA_Msg_Reset invalid data size (got %d, expected %zu)\n",
+                            msg_rcv->dataSize, sizeof(int32_t));
+                msg_reply.errCode = -315;
+            }
+            else
+            {
+                remove_all_RTP_streams(&self->m_RTP_streams_manager);
+                msg_reply.errCode = 0;
+            }
             break;
         }
         case MT_ALSA_Msg_Start:
@@ -922,32 +934,38 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
         }
 
         case MT_ALSA_Msg_SetNumberOfInputs:
-            if (msg_rcv->dataSize != sizeof(uint32_t))
+            /* Payload (Stage 1+): {int32_t pcm_id, uint32_t count}. Channel
+             * count is still applied manager-wide in Stage 1 (all PCMs share
+             * the same count); pcm_id is parsed for protocol-compat with the
+             * future per-PCM split in Stage 2. */
+            if (msg_rcv->dataSize != sizeof(int32_t) + sizeof(uint32_t))
             {
                 MTAL_DP_ERR("Set Nb Inputs invalid data size\n");
                 msg_reply.errCode = -315;
             }
             else
             {
-                uint32_t* nbch_ptr = (uint32_t*)msg_rcv->data;
-                MTAL_DP_INFO("Set Nb Inputs to %u\n", *nbch_ptr);
-                if (!SetNumberOfInputs(self, *nbch_ptr))
+                int32_t pcm_id = *(int32_t*)msg_rcv->data;
+                uint32_t nbch = *(uint32_t*)((char*)msg_rcv->data + sizeof(int32_t));
+                MTAL_DP_INFO("Set Nb Inputs pcm_id=%d to %u\n", pcm_id, nbch);
+                if (!SetNumberOfInputs(self, nbch))
                     msg_reply.errCode = -401;
                 else
                     msg_reply.errCode = 0;
             }
             break;
         case MT_ALSA_Msg_SetNumberOfOutputs:
-            if (msg_rcv->dataSize != sizeof(uint32_t))
+            if (msg_rcv->dataSize != sizeof(int32_t) + sizeof(uint32_t))
             {
                 MTAL_DP_ERR("Set Nb Outputs invalid data size\n");
                 msg_reply.errCode = -315;
             }
             else
             {
-                uint32_t* nbch_ptr = (uint32_t*)msg_rcv->data;
-                MTAL_DP_INFO("Set Nb Outputs to %u\n", *nbch_ptr);
-                if (!SetNumberOfOutputs(self, *nbch_ptr))
+                int32_t pcm_id = *(int32_t*)msg_rcv->data;
+                uint32_t nbch = *(uint32_t*)((char*)msg_rcv->data + sizeof(int32_t));
+                MTAL_DP_INFO("Set Nb Outputs pcm_id=%d to %u\n", pcm_id, nbch);
+                if (!SetNumberOfOutputs(self, nbch))
                     msg_reply.errCode = -401;
                 else
                     msg_reply.errCode = 0;
@@ -955,18 +973,33 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             break;
         case MT_ALSA_Msg_GetNumberOfInputs:
         {
-            //MTAL_DP_INFO("Get Nb Inputs. return %u\n", self->m_NumberOfInputs);
-            msg_reply.errCode = 0;
-            msg_reply.dataSize = sizeof(self->m_NumberOfInputs);
-            msg_reply.data = &self->m_NumberOfInputs;
+            /* Payload: int32_t pcm_id. Reply unchanged (uint32_t count). */
+            if (msg_rcv->dataSize != sizeof(int32_t))
+            {
+                MTAL_DP_ERR("Get Nb Inputs invalid data size\n");
+                msg_reply.errCode = -315;
+            }
+            else
+            {
+                msg_reply.errCode = 0;
+                msg_reply.dataSize = sizeof(self->m_NumberOfInputs);
+                msg_reply.data = &self->m_NumberOfInputs;
+            }
             break;
         }
         case MT_ALSA_Msg_GetNumberOfOutputs:
         {
-            //MTAL_DP_INFO("Get Nb Outputs. return %u\n", self->m_NumberOfOutputs);
-            msg_reply.errCode = 0;
-            msg_reply.dataSize = sizeof(self->m_NumberOfOutputs);
-            msg_reply.data = &self->m_NumberOfOutputs;
+            if (msg_rcv->dataSize != sizeof(int32_t))
+            {
+                MTAL_DP_ERR("Get Nb Outputs invalid data size\n");
+                msg_reply.errCode = -315;
+            }
+            else
+            {
+                msg_reply.errCode = 0;
+                msg_reply.dataSize = sizeof(self->m_NumberOfOutputs);
+                msg_reply.data = &self->m_NumberOfOutputs;
+            }
             break;
         }
         case MT_ALSA_Msg_SetInterfaceName:
@@ -1016,7 +1049,11 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
         }
         case MT_ALSA_Msg_Add_RTPStream:
         {
-            if (msg_rcv->dataSize != sizeof(TRTP_stream_info))
+            /* Payload (Stage 1+): {int32_t pcm_id, TRTP_stream_info}.
+             * pcm_id is parsed here; routing the stream's buffer access to
+             * the right chip is Task 7 (TRTP_stream_info gains m_uiPCMId,
+             * and get_live_{in,out}_jitter_buffer reads from that chip). */
+            if (msg_rcv->dataSize != sizeof(int32_t) + sizeof(TRTP_stream_info))
             {
                 MTAL_DP_ERR("Add RTP stream invalid data size\n");
                 msg_reply.errCode = -315;
@@ -1024,8 +1061,11 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             else
             {
                 uint64_t stream_handle;
-                TRTP_stream_info* rtp_stream_info_ptr = (TRTP_stream_info*)msg_rcv->data;
-                MTAL_DP_INFO("CHANNEL ###### = %d\n", rtp_stream_info_ptr->m_byNbOfChannels);
+                int32_t pcm_id = *(int32_t*)msg_rcv->data;
+                TRTP_stream_info* rtp_stream_info_ptr =
+                    (TRTP_stream_info*)((char*)msg_rcv->data + sizeof(int32_t));
+                MTAL_DP_INFO("Add RTP stream pcm_id=%d, channels=%d\n",
+                             pcm_id, rtp_stream_info_ptr->m_byNbOfChannels);
                 if (add_RTP_stream_(&self->m_RTP_streams_manager, rtp_stream_info_ptr, &stream_handle))
                 {
                     MTAL_DP_INFO("self->m_RTP_streams_manager stream_handle = %llu\n", stream_handle);
@@ -1139,31 +1179,72 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             }
             break;
         case MT_ALSA_Msg_SetPlayoutDelay:
-            if (msg_rcv->dataSize != sizeof(int32_t))
+            /* Payload (Stage 1+): {int32_t pcm_id, int32_t delay_in_samples}.
+             * Delay still applies manager-wide in Stage 1; per-PCM split
+             * lands when m_nPlayoutDelay moves onto the chip in Task 7. */
+            if (msg_rcv->dataSize != sizeof(int32_t) * 2)
             {
                 MTAL_DP_ERR("MT_ALSA_Msg_SetPlayoutDelay invalid data size\n");
                 msg_reply.errCode = -315;
             }
             else
             {
-                int32_t* value_ptr = (int32_t*)msg_rcv->data;
-                self->m_nPlayoutDelay = *value_ptr;
-                MTAL_DP_INFO("MT_ALSA_Msg_SetPlayoutDelay set to %d\n", self->m_nPlayoutDelay);
+                int32_t pcm_id = *(int32_t*)msg_rcv->data;
+                int32_t delay  = *(int32_t*)((char*)msg_rcv->data + sizeof(int32_t));
+                self->m_nPlayoutDelay = delay;
+                MTAL_DP_INFO("MT_ALSA_Msg_SetPlayoutDelay pcm_id=%d set to %d\n",
+                             pcm_id, self->m_nPlayoutDelay);
                 msg_reply.errCode = 0;
             }
             break;
         case MT_ALSA_Msg_SetCaptureDelay:
-            if (msg_rcv->dataSize != sizeof(int32_t))
+            if (msg_rcv->dataSize != sizeof(int32_t) * 2)
             {
                 MTAL_DP_ERR("MT_ALSA_Msg_SetCaptureDelay invalid data size\n");
                 msg_reply.errCode = -315;
             }
             else
             {
-                int32_t* value_ptr = (int32_t*)msg_rcv->data;
-                self->m_nCaptureDelay = *value_ptr;
+                int32_t pcm_id = *(int32_t*)msg_rcv->data;
+                int32_t delay  = *(int32_t*)((char*)msg_rcv->data + sizeof(int32_t));
+                self->m_nCaptureDelay = delay;
+                MTAL_DP_INFO("MT_ALSA_Msg_SetCaptureDelay pcm_id=%d set to %d\n",
+                             pcm_id, self->m_nCaptureDelay);
                 msg_reply.errCode = 0;
             }
+            break;
+        case MT_ALSA_Msg_AddPCM:
+            if (msg_rcv->dataSize != sizeof(struct MT_ALSA_AddPCM_args))
+            {
+                MTAL_DP_ERR("MT_ALSA_Msg_AddPCM invalid data size (got %d, expected %zu)\n",
+                            msg_rcv->dataSize, sizeof(struct MT_ALSA_AddPCM_args));
+                msg_reply.errCode = -315;
+            }
+            else
+            {
+                struct MT_ALSA_AddPCM_args* args = (struct MT_ALSA_AddPCM_args*)msg_rcv->data;
+                MTAL_DP_INFO("MT_ALSA_Msg_AddPCM pcm_id=%d rate=%u in=%u out=%u\n",
+                             args->pcm_id, args->sample_rate,
+                             args->num_inputs, args->num_outputs);
+                /* Stage 1: shared rate. Refuse mismatched per-PCM rates so
+                 * the daemon learns about the Stage 2 dependency early. */
+                if (args->sample_rate != 0 && args->sample_rate != self->m_SampleRate)
+                {
+                    MTAL_DP_ERR("MT_ALSA_Msg_AddPCM rate %u != manager rate %u (Stage 1: shared rate only)\n",
+                                args->sample_rate, self->m_SampleRate);
+                    msg_reply.errCode = -EINVAL;
+                }
+                else
+                {
+                    int err = mr_alsa_audio_add_pcm(args->pcm_id);
+                    msg_reply.errCode = err;
+                }
+            }
+            break;
+        case MT_ALSA_Msg_RemovePCM:
+            /* Stage 3 will wire this up via REST. Stage 1 declines. */
+            MTAL_DP_ERR("MT_ALSA_Msg_RemovePCM not supported in Stage 1\n");
+            msg_reply.errCode = -ENOSYS;
             break;
         default:
             msg_reply.errCode = -314;
