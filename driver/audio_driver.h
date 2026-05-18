@@ -90,6 +90,13 @@ struct alsa_ops
 /// Put ALSA driver functions which needs to be used by CPP code here:
 extern int mr_alsa_audio_card_init(void* ravennaPeer, struct alsa_ops *callbacks);
 extern void mr_alsa_audio_card_exit(void);
+/* Stage 1 multi-PCM: create an additional PCM (hw:RAVENNA,pcm_id) on the
+ * card created at probe. pcm_id must be in [1, MAX_PCMS-1]; 0 is the
+ * default PCM created at probe. Returns 0 on success or a negative errno.
+ * The new chip auto-attaches into the manager via the existing
+ * register_alsa_driver callback (manager's attach_alsa_driver appends).
+ */
+extern int mr_alsa_audio_add_pcm(int pcm_id);
 
 #if	defined(__cplusplus)
 }
