@@ -55,6 +55,9 @@ struct ravenna_mgr_ops
     uint32_t (*get_playback_buffer_offset)(void *mr_alsa_audio_chip);/// returns current offset (channel independent) in samples for Ravenna Ring Buffer
     int (*notify_master_volume_change)(void* mr_alsa_audio_chip, int direction, int32_t value); /// direction: 0 for playback, 1 for capture. value: from -99 to 0
     int (*notify_master_switch_change)(void* mr_alsa_audio_chip, int direction, int32_t value); /// direction: 0 for playback, 1 for capture. value: 0 for mute, 1 for enable
+    /* multi-rate Stage 1: per-chip IO state accessors, used by the manager's tick loop */
+    void (*set_io_state)(void *mr_alsa_audio_chip, bool is_playback, bool running);
+    bool (*get_io_state)(void *mr_alsa_audio_chip, bool is_playback);
 };
 
 /// Put functions to be called by ALSA driver (C ALSA to CPP Ravenna wrapper/owner object)
@@ -75,8 +78,8 @@ struct alsa_ops
     int (*get_playout_delay)(void* ravenna_peer, snd_pcm_sframes_t *delay_in_sample);
     int (*get_capture_delay)(void* ravenna_peer, snd_pcm_sframes_t *delay_in_sample);
     int (*set_jitter_buffer_depth)(void* ravenna_peer, uint32_t depth_in_frames); /// must not sleep (called under spinlock)
-    int (*start_interrupts)(void* ravenna_peer, bool is_playback); /// starts IO
-    int (*stop_interrupts)(void* ravenna_peer, bool is_playback); /// stops IO
+    int (*start_interrupts)(void* ravenna_peer, void *mr_alsa_audio_chip, bool is_playback); /// starts IO on the given chip
+    int (*stop_interrupts)(void* ravenna_peer, void *mr_alsa_audio_chip, bool is_playback); /// stops IO on the given chip
 
     int (*notify_master_volume_change)(void* ravenna_peer, int direction, int32_t value); /// direction: 0 for playback, 1 for capture. value: from -99 to 0
     int (*notify_master_switch_change)(void* ravenna_peer, int direction, int32_t value); /// direction: 0 for playback, 1 for capture. value: 0 for mute, 1 for enable
