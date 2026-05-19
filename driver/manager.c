@@ -1485,6 +1485,49 @@ void* get_live_out_jitter_buffer(void* user, uint32_t ulChannelId)
 }
 
 //////////////////////////////////////////////////////////////////////////////////
+// Stage 1 multi-PCM: resolve the right chip's playback/capture buffer for a
+// stream tagged with pcm_id (from TRTP_stream_info::m_uiPCMId). Called once
+// per channel at stream Init time; the resulting pointer is then cached on
+// the stream (m_pvLives{In,Out}CircularBuffer[us]). pcm_id is validated; out
+// of range or unattached PCMs return NULL.
+void* get_live_buffer_for_pcm(void* user, uint32_t pcm_id, uint32_t ulChannelId, int is_capture)
+{
+    struct TManager* self = (struct TManager*)user;
+    unsigned char* buf = nullptr;
+    uint32_t bufferLength = RINGBUFFERSIZE;
+    void* chip = NULL;
+    uint32_t nb_channels;
+
+    if (pcm_id >= self->m_uPCMCount)
+    {
+        MTAL_DP_ERR("get_live_buffer_for_pcm: pcm_id %u out of range (count=%u)\n",
+                    pcm_id, self->m_uPCMCount);
+        return NULL;
+    }
+    chip = self->m_apALSAChip[pcm_id];
+    if (!chip || !self->m_alsa_driver_frontend)
+        return NULL;
+
+    /* Stage 1: per-PCM channel counts not yet stored; reuse manager-wide. */
+    nb_channels = is_capture ? self->m_NumberOfInputs : self->m_NumberOfOutputs;
+    if (ulChannelId >= nb_channels)
+    {
+        MTAL_DP_ERR("get_live_buffer_for_pcm: ch %u >= nb %u (pcm_id=%u, %s)\n",
+                    ulChannelId, nb_channels, pcm_id,
+                    is_capture ? "capture" : "playback");
+        return NULL;
+    }
+
+    buf = (unsigned char*)(is_capture
+        ? self->m_alsa_driver_frontend->get_capture_buffer(chip)
+        : self->m_alsa_driver_frontend->get_playback_buffer(chip));
+    if (!buf)
+        return NULL;
+    buf += ulChannelId * bufferLength * get_audio_engine_sample_bytelength(self);
+    return buf;
+}
+
+//////////////////////////////////////////////////////////////////////////////////
 uint32_t get_live_in_jitter_buffer_length(void* user)
 {
     struct TManager* self = (struct TManager*)user;
@@ -1719,6 +1762,7 @@ void Init_C_Callbacks(struct TManager* self)
     self->m_c_callbacks.update_live_in_audio_data_format = &update_live_in_audio_data_format;
     self->m_c_callbacks.get_live_in_mute_pattern = &get_live_in_mute_pattern;
     self->m_c_callbacks.get_live_out_mute_pattern = &get_live_out_mute_pattern;
+    self->m_c_callbacks.get_live_buffer_for_pcm = &get_live_buffer_for_pcm;
     //m_c_dispatch_callbacks.user = this;
     //m_c_dispatch_callbacks.DispatchPacket = &DispatchPacket;
     self->m_c_audio_streamer_clock_PTP_callback.user = self;

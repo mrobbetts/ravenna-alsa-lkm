@@ -117,16 +117,16 @@ int Create(TRTP_audio_stream* self, TRTP_stream_info* pRTP_stream_info, rtp_audi
 		for(us = 0; us < pRTP_stream_info->m_byNbOfChannels; us++)
 		{
 			ulChannelId = get_routing(pRTP_stream_info, us);
-			if(!pManager->get_live_out_jitter_buffer(pManager->user, ulChannelId))
+			/* Stage 1 multi-PCM: route to the PCM this stream is bound to. */
+			void *buf = pManager->get_live_buffer_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId, ulChannelId, 0 /*playback*/);
+			if(!buf)
 			{
-				MTAL_DP("CRTP_audio_stream::Init: get_live_out_jitter_buffer(%u) not available.\n", ulChannelId);
+				MTAL_DP("CRTP_audio_stream::Init: get_live_buffer_for_pcm(pcm=%u, ch=%u, playback) not available.\n",
+				        pRTP_stream_info->m_uiPCMId, ulChannelId);
 				self->m_pvLivesOutCircularBuffer[us] = NULL;
 				return 0;
 			}
-			else
-			{
-				self->m_pvLivesOutCircularBuffer[us] = pManager->get_live_out_jitter_buffer(pManager->user, ulChannelId);
-			}
+			self->m_pvLivesOutCircularBuffer[us] = buf;
 		}
 
 		switch(nSampleFormat)
@@ -251,15 +251,18 @@ int Create(TRTP_audio_stream* self, TRTP_stream_info* pRTP_stream_info, rtp_audi
 			{ // unused channel
 				self->m_pvLivesInCircularBuffer[us] = NULL;
 			}
-			else if(!pManager->get_live_in_jitter_buffer(pManager->user, ulChannelId))
-			{
-				MTAL_DP("CRTP_audio_stream::Init: get_live_in_jitter_buffer(%u) not available.\n", ulChannelId);
-				self->m_pvLivesInCircularBuffer[us] = NULL;
-				return 0;
-			}
 			else
 			{
-				self->m_pvLivesInCircularBuffer[us] = pManager->get_live_in_jitter_buffer(pManager->user, ulChannelId);
+				/* Stage 1 multi-PCM: route to the PCM this stream is bound to. */
+				void *buf = pManager->get_live_buffer_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId, ulChannelId, 1 /*capture*/);
+				if(!buf)
+				{
+					MTAL_DP("CRTP_audio_stream::Init: get_live_buffer_for_pcm(pcm=%u, ch=%u, capture) not available.\n",
+					        pRTP_stream_info->m_uiPCMId, ulChannelId);
+					self->m_pvLivesInCircularBuffer[us] = NULL;
+					return 0;
+				}
+				self->m_pvLivesInCircularBuffer[us] = buf;
 			}
 		}
 
