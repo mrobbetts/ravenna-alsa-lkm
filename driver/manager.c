@@ -313,7 +313,11 @@ static void recompute_global_io_flags(struct TManager* self)
     bool any_play = false;
     bool any_cap  = false;
     uint32_t i, count;
-    if (self->m_alsa_driver_frontend)
+    /* Acquire-load the frontend pointer first so the function-pointer
+     * struct is fully visible before we dereference it through the chips
+     * loop. Pairs with smp_store_release in attach_alsa_driver. */
+    const struct ravenna_mgr_ops *frontend = smp_load_acquire(&self->m_alsa_driver_frontend);
+    if (frontend)
     {
         count = smp_load_acquire(&self->m_uPCMCount);
         for (i = 0; i < count; ++i)
@@ -321,9 +325,9 @@ static void recompute_global_io_flags(struct TManager* self)
             void *chip = smp_load_acquire(&self->m_apALSAChip[i]);
             if (!chip)
                 continue;
-            if (self->m_alsa_driver_frontend->get_io_state(chip, true))
+            if (frontend->get_io_state(chip, true))
                 any_play = true;
-            if (self->m_alsa_driver_frontend->get_io_state(chip, false))
+            if (frontend->get_io_state(chip, false))
                 any_cap = true;
         }
     }
@@ -367,9 +371,12 @@ bool stopIO(struct TManager* self, bool is_playback)
 
     if (!is_playback) {
         printk(KERN_DEBUG "stopping capture I/O\n");
-        /* MuteInputBuffer touches chip 0's buffer. With multiple capturing
-         * PCMs we'd want per-chip mute; defer to Task 7 when buffer routing
-         * becomes per-PCM. Stage 1 keeps the existing behaviour. */
+        /* Stage 1 caveat: MuteInputBuffer/MuteOutputBuffer mute chip 0's
+         * buffer only. With multiple capturing PCMs the per-chip buffers
+         * for chips 1..N-1 don't get muted on a stopIO; benign because
+         * the trigger STOP path on each chip will also halt that chip's
+         * RTP source consumption. True per-chip mute requires per-PCM
+         * channel counts in kernel storage (Stage 2). */
         MuteInputBuffer(self);
     } else {
         printk(KERN_DEBUG "stopping playback I/O\n");
@@ -737,9 +744,11 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
         }
         case MT_ALSA_Msg_Reset:
         {
-            /* Payload (Stage 1+): int32_t pcm_id. Streams aren't yet tagged
-             * by pcm_id (Task 7), so we still remove all of them; once tagged,
-             * this becomes a per-PCM reset. */
+            /* Payload (Stage 1+): int32_t pcm_id. Streams ARE tagged with
+             * m_uiPCMId now (see RTP_stream_info.h), but the kernel-side
+             * stream container doesn't yet have a per-pcm_id iteration
+             * helper, so this handler still wipes all streams regardless
+             * of pcm_id. Per-pcm_id reset is a Stage 2/3 follow-up. */
             MTAL_DP("CManager::OnNewMessage MT_ALSA_Msg_Reset..\n");
             if (msg_rcv->dataSize != sizeof(int32_t))
             {
@@ -948,7 +957,18 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
                 int32_t pcm_id = *(int32_t*)msg_rcv->data;
                 uint32_t nbch = *(uint32_t*)((char*)msg_rcv->data + sizeof(int32_t));
                 MTAL_DP_INFO("Set Nb Inputs pcm_id=%d to %u\n", pcm_id, nbch);
-                if (!SetNumberOfInputs(self, nbch))
+                /* Stage 1: refuse non-zero pcm_id so the per-PCM split
+                 * gap is visible at the wire level. Today we apply the
+                 * value manager-wide; a daemon trying to set per-PCM
+                 * channel counts will see -EINVAL and know it's hit the
+                 * Stage 2 boundary, instead of silently getting all
+                 * chips re-counted whenever the last writer wins. */
+                if (pcm_id != 0)
+                {
+                    MTAL_DP_ERR("Set Nb Inputs: per-pcm_id (%d) not supported in Stage 1\n", pcm_id);
+                    msg_reply.errCode = -EINVAL;
+                }
+                else if (!SetNumberOfInputs(self, nbch))
                     msg_reply.errCode = -401;
                 else
                     msg_reply.errCode = 0;
@@ -965,7 +985,12 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
                 int32_t pcm_id = *(int32_t*)msg_rcv->data;
                 uint32_t nbch = *(uint32_t*)((char*)msg_rcv->data + sizeof(int32_t));
                 MTAL_DP_INFO("Set Nb Outputs pcm_id=%d to %u\n", pcm_id, nbch);
-                if (!SetNumberOfOutputs(self, nbch))
+                if (pcm_id != 0)
+                {
+                    MTAL_DP_ERR("Set Nb Outputs: per-pcm_id (%d) not supported in Stage 1\n", pcm_id);
+                    msg_reply.errCode = -EINVAL;
+                }
+                else if (!SetNumberOfOutputs(self, nbch))
                     msg_reply.errCode = -401;
                 else
                     msg_reply.errCode = 0;
@@ -1180,8 +1205,11 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             break;
         case MT_ALSA_Msg_SetPlayoutDelay:
             /* Payload (Stage 1+): {int32_t pcm_id, int32_t delay_in_samples}.
-             * Delay still applies manager-wide in Stage 1; per-PCM split
-             * lands when m_nPlayoutDelay moves onto the chip in Task 7. */
+             * Stage 1 stores delay manager-wide and refuses non-zero
+             * pcm_id, so the per-PCM gap is visible to the daemon (which
+             * already restricts itself to pcm_id=0 in init). Per-PCM
+             * delay storage lands in Stage 2 when m_nPlayoutDelay moves
+             * onto the chip. */
             if (msg_rcv->dataSize != sizeof(int32_t) * 2)
             {
                 MTAL_DP_ERR("MT_ALSA_Msg_SetPlayoutDelay invalid data size\n");
@@ -1191,10 +1219,18 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             {
                 int32_t pcm_id = *(int32_t*)msg_rcv->data;
                 int32_t delay  = *(int32_t*)((char*)msg_rcv->data + sizeof(int32_t));
-                self->m_nPlayoutDelay = delay;
-                MTAL_DP_INFO("MT_ALSA_Msg_SetPlayoutDelay pcm_id=%d set to %d\n",
-                             pcm_id, self->m_nPlayoutDelay);
-                msg_reply.errCode = 0;
+                if (pcm_id != 0)
+                {
+                    MTAL_DP_ERR("MT_ALSA_Msg_SetPlayoutDelay: per-pcm_id (%d) not supported in Stage 1\n", pcm_id);
+                    msg_reply.errCode = -EINVAL;
+                }
+                else
+                {
+                    self->m_nPlayoutDelay = delay;
+                    MTAL_DP_INFO("MT_ALSA_Msg_SetPlayoutDelay pcm_id=0 set to %d\n",
+                                 self->m_nPlayoutDelay);
+                    msg_reply.errCode = 0;
+                }
             }
             break;
         case MT_ALSA_Msg_SetCaptureDelay:
@@ -1207,10 +1243,18 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             {
                 int32_t pcm_id = *(int32_t*)msg_rcv->data;
                 int32_t delay  = *(int32_t*)((char*)msg_rcv->data + sizeof(int32_t));
-                self->m_nCaptureDelay = delay;
-                MTAL_DP_INFO("MT_ALSA_Msg_SetCaptureDelay pcm_id=%d set to %d\n",
-                             pcm_id, self->m_nCaptureDelay);
-                msg_reply.errCode = 0;
+                if (pcm_id != 0)
+                {
+                    MTAL_DP_ERR("MT_ALSA_Msg_SetCaptureDelay: per-pcm_id (%d) not supported in Stage 1\n", pcm_id);
+                    msg_reply.errCode = -EINVAL;
+                }
+                else
+                {
+                    self->m_nCaptureDelay = delay;
+                    MTAL_DP_INFO("MT_ALSA_Msg_SetCaptureDelay pcm_id=0 set to %d\n",
+                                 self->m_nCaptureDelay);
+                    msg_reply.errCode = 0;
+                }
             }
             break;
         case MT_ALSA_Msg_AddPCM:
@@ -1498,6 +1542,7 @@ void* get_live_buffer_for_pcm(void* user, uint32_t pcm_id, uint32_t ulChannelId,
     uint32_t bufferLength = RINGBUFFERSIZE;
     void* chip = NULL;
     uint32_t nb_channels;
+    const struct ravenna_mgr_ops *frontend;
 
     if (pcm_id >= self->m_uPCMCount)
     {
@@ -1505,9 +1550,11 @@ void* get_live_buffer_for_pcm(void* user, uint32_t pcm_id, uint32_t ulChannelId,
                     pcm_id, self->m_uPCMCount);
         return NULL;
     }
-    /* Acquire-load pairs with smp_store_release in attach_alsa_driver. */
+    /* Acquire-load frontend and chip slot, pairing with smp_store_release
+     * in attach_alsa_driver. */
+    frontend = smp_load_acquire(&self->m_alsa_driver_frontend);
     chip = smp_load_acquire(&self->m_apALSAChip[pcm_id]);
-    if (!chip || !self->m_alsa_driver_frontend)
+    if (!chip || !frontend)
         return NULL;
 
     /* Stage 1: per-PCM channel counts not yet stored; reuse manager-wide. */
@@ -1521,8 +1568,8 @@ void* get_live_buffer_for_pcm(void* user, uint32_t pcm_id, uint32_t ulChannelId,
     }
 
     buf = (unsigned char*)(is_capture
-        ? self->m_alsa_driver_frontend->get_capture_buffer(chip)
-        : self->m_alsa_driver_frontend->get_playback_buffer(chip));
+        ? frontend->get_capture_buffer(chip)
+        : frontend->get_playback_buffer(chip));
     if (!buf)
         return NULL;
     buf += ulChannelId * bufferLength * get_audio_engine_sample_bytelength(self);
@@ -1726,23 +1773,27 @@ void AudioFrameTIC(void* user)
         #else
             /// write live outputs
             frame_process_begin(&self->m_RTP_streams_manager);
-            if (self->m_alsa_driver_frontend)
             {
-                /* Acquire-load the count and each slot so we pair with
-                 * smp_store_release in attach/detach_alsa_driver. The
-                 * loop body is in softirq context; we must not see a
-                 * non-NULL chip whose internal fields aren't published. */
-                uint32_t count = smp_load_acquire(&self->m_uPCMCount);
-                uint32_t i;
-                for (i = 0; i < count; ++i)
+                /* Acquire-load frontend and count, then each slot, so we
+                 * pair with smp_store_release in attach_alsa_driver and
+                 * detach_alsa_driver. The loop body runs in softirq
+                 * context; we must not see a non-NULL chip pointer or a
+                 * non-NULL frontend whose contents aren't published. */
+                const struct ravenna_mgr_ops *frontend = smp_load_acquire(&self->m_alsa_driver_frontend);
+                if (frontend)
                 {
-                    void *chip = smp_load_acquire(&self->m_apALSAChip[i]);
-                    if (!chip)
-                        continue;
-                    if (self->m_alsa_driver_frontend->get_io_state(chip, false))
-                        self->m_alsa_driver_frontend->pcm_interrupt(chip, 1);
-                    if (self->m_alsa_driver_frontend->get_io_state(chip, true))
-                        self->m_alsa_driver_frontend->pcm_interrupt(chip, 0);
+                    uint32_t count = smp_load_acquire(&self->m_uPCMCount);
+                    uint32_t i;
+                    for (i = 0; i < count; ++i)
+                    {
+                        void *chip = smp_load_acquire(&self->m_apALSAChip[i]);
+                        if (!chip)
+                            continue;
+                        if (frontend->get_io_state(chip, false))
+                            frontend->pcm_interrupt(chip, 1);
+                        if (frontend->get_io_state(chip, true))
+                            frontend->pcm_interrupt(chip, 0);
+                    }
                 }
             }
             frame_process_end(&self->m_RTP_streams_manager);
@@ -1816,10 +1867,12 @@ int attach_alsa_driver(void* user, const struct ravenna_mgr_ops *ops, void *alsa
         return -EEXIST;
     }
     /* Frontend ops are identical across chips; set once on first attach.
-     * Plain stores are fine here because the count bump below has release
-     * semantics and the reader pairs with READ_ONCE on the slot. */
-    if (!self->m_alsa_driver_frontend)
-        self->m_alsa_driver_frontend = ops;
+     * Use release ordering so a concurrent reader (typically the hrtimer
+     * AudioFrameTIC, which also acquire-loads the chip slot below) sees
+     * a non-NULL frontend pointer with all the function pointers in the
+     * struct visible. */
+    if (!READ_ONCE(self->m_alsa_driver_frontend))
+        smp_store_release(&self->m_alsa_driver_frontend, ops);
     /* Publish the slot with release semantics so the hrtimer reader sees
      * the chip pointer only after the chip itself is fully constructed. */
     smp_store_release(&self->m_apALSAChip[pcm_id], alsa_chip_pointer);
@@ -1829,10 +1882,11 @@ int attach_alsa_driver(void* user, const struct ravenna_mgr_ops *ops, void *alsa
     return 0;
 }
 
-void detach_alsa_driver(struct TManager* self, void *alsa_chip_pointer)
+void detach_alsa_driver(void* user, void *alsa_chip_pointer)
 {
+    struct TManager* self = (struct TManager*)user;
     uint32_t i;
-    if (!alsa_chip_pointer)
+    if (!self || !alsa_chip_pointer)
         return;
     for (i = 0; i < self->m_uPCMCount; ++i)
     {
@@ -2182,6 +2236,7 @@ enum eAudioMode GetAudioModeFromRate(uint32_t sample_rate)
 void init_alsa_callbacks(struct TManager* self)
 {
     self->m_alsa_callbacks.register_alsa_driver = &attach_alsa_driver;
+    self->m_alsa_callbacks.unregister_alsa_driver = &detach_alsa_driver;
     self->m_alsa_callbacks.get_input_jitter_buffer_offset = &get_input_jitter_buffer_offset;
     self->m_alsa_callbacks.get_output_jitter_buffer_offset = &get_output_jitter_buffer_offset;
     self->m_alsa_callbacks.get_min_interrupts_frame_size = &get_min_interrupts_frame_size;
