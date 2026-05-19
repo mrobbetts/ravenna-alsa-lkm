@@ -859,10 +859,16 @@ static void mr_alsa_audio_set_io_state(void *mr_alsa_audio_chip, bool is_playbac
     struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip *)mr_alsa_audio_chip;
     if (!chip)
         return;
+    /* Writers: start/stop_interrupts paths (trigger callback, prepare,
+     * hw_params, hw_free). Readers: AudioFrameTIC in hrtimer softirq, and
+     * recompute_global_io_flags from any trigger context. The bools are
+     * word-sized so torn-write is impossible on supported arches, but
+     * WRITE_ONCE / READ_ONCE keeps KCSAN quiet and documents that this
+     * is concurrent state. */
     if (is_playback)
-        chip->playback_io = running;
+        WRITE_ONCE(chip->playback_io, running);
     else
-        chip->capture_io = running;
+        WRITE_ONCE(chip->capture_io, running);
 }
 
 static bool mr_alsa_audio_get_io_state(void *mr_alsa_audio_chip, bool is_playback)
@@ -870,7 +876,7 @@ static bool mr_alsa_audio_get_io_state(void *mr_alsa_audio_chip, bool is_playbac
     struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip *)mr_alsa_audio_chip;
     if (!chip)
         return false;
-    return is_playback ? chip->playback_io : chip->capture_io;
+    return is_playback ? READ_ONCE(chip->playback_io) : READ_ONCE(chip->capture_io);
 }
 
 static struct ravenna_mgr_ops g_ravenna_manager_ops = {
@@ -2659,6 +2665,14 @@ int mr_alsa_audio_add_pcm(int pcm_id)
     {
         printk(KERN_ERR "mr_alsa_audio_add_pcm: chip_create(pcm_id=%d) failed: %d\n",
                pcm_id, err);
+        /* mr_alsa_audio_chip_create may have already called register_alsa_driver
+         * (= manager's attach_alsa_driver) before the failing step, which stored
+         * the chip in m_apALSAChip[pcm_id]. Clear that slot now — otherwise the
+         * manager would hold a pointer into memory we're about to free or stash
+         * for later free, and any retry of AddPCM on this id would hit attach's
+         * "already attached" guard. unregister is a no-op if attach didn't run. */
+        if (g_mr_alsa_audio_ops && g_mr_alsa_audio_ops->unregister_alsa_driver)
+            g_mr_alsa_audio_ops->unregister_alsa_driver(g_ravenna_peer, chip);
         /* If snd_pcm_new succeeded, the PCM is on card->devices and
          * references chip via private_data; we must NOT kfree chip here.
          * Stash it in g_extra_chips so card_free reclaims it later. We
