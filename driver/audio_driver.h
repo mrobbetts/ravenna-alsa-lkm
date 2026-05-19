@@ -67,6 +67,11 @@ struct alsa_ops
      * snd_pcm_new device argument). Manager indexes its chip array by
      * pcm_id directly, so out-of-order group ids work. */
     int (*register_alsa_driver)(void* ravenna_peer, const struct ravenna_mgr_ops *ops, void *alsa_chip_pointer, int pcm_id);/// to be called at driver init to allow communication between driver and Ravenna context
+    /* multi-rate Stage 1: clear the manager's chip-array slot for this
+     * chip. Called from mr_alsa_audio_add_pcm's failure path so a failed
+     * AddPCM doesn't poison the slot with a soon-to-be-freed chip
+     * pointer. Stage 3 will also call this from a future RemovePCM path. */
+    void (*unregister_alsa_driver)(void* ravenna_peer, void *alsa_chip_pointer);
     int (*get_input_jitter_buffer_offset)(void* ravenna_peer, uint32_t *offset);
     int (*get_output_jitter_buffer_offset)(void* ravenna_peer, uint32_t *offset);
     int (*get_min_interrupts_frame_size)(void* ravenna_peer, uint32_t *framesize); /// returns min Ravenna Frame Size in samples (channel independent)
