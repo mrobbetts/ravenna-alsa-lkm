@@ -1918,9 +1918,9 @@ static struct snd_pcm_ops mr_alsa_audio_pcm_capture_ops = {
 
 /* prototypes */
 static int mr_alsa_audio_create_alsa_devices(struct snd_card *card,
-                     struct mr_alsa_audio_chip *chip);
+                     struct mr_alsa_audio_chip *chip, int device_idx);
 static int mr_alsa_audio_create_pcm(struct snd_card *card,
-                struct mr_alsa_audio_chip *chip);
+                struct mr_alsa_audio_chip *chip, int device_idx);
 
 //static int hdspm_set_toggle_setting(struct hdspm *hdspm, u32 regmask, int out);
 static int mr_alsa_audio_set_defaults(struct mr_alsa_audio_chip *chip);
@@ -2021,6 +2021,23 @@ static void mr_alsa_audio_free_preallocate_memory(struct mr_alsa_audio_chip *chi
 
 
 //////////////////////////////////////////////////////////////////////////
+/*
+ * Stage 1 multi-PCM:
+ *  - device_idx == 0 runs in probe(), BEFORE snd_card_register. The ALSA
+ *    core's snd_card_register → snd_device_register_all walk will register
+ *    this PCM, so we must NOT call snd_device_register ourselves here.
+ *  - device_idx > 0 runs from MT_ALSA_Msg_AddPCM in netlink-RX context,
+ *    AFTER snd_card_register has completed. The PCM is added to
+ *    card->devices in SNDRV_DEV_BUILD state by snd_pcm_new but has no
+ *    /dev/snd/pcmCxDy{p,c} chardev until snd_device_register runs it
+ *    through dev_register → snd_register_device. We call it explicitly
+ *    here, following the i2sbus_attach_codec / snd_emu8000_pcm_new
+ *    in-tree precedent.
+ *  Ordering follows i2sbus: ops → chmap → snd_device_register → managed
+ *  buffer. private_data is set before ops so any open() racing the chmap
+ *  add sees a populated chip pointer. set_managed_buffer_all is post-
+ *  register because the substream then exists in its final form.
+ */
 static int mr_alsa_audio_create_pcm(struct snd_card *card,
                                     struct mr_alsa_audio_chip *chip,
                                     int device_idx)
@@ -2052,6 +2069,26 @@ static int mr_alsa_audio_create_pcm(struct snd_card *card,
         printk(KERN_ERR "mr_alsa_audio_preallocate_memory failed...\n");
         return err;
     }
+
+    /* Post-register dynamic add: trigger snd_pcm_dev_register so the
+     * chardev nodes appear. For device_idx == 0 the card-wide register
+     * sweep in snd_card_register handles this. */
+    if (device_idx > 0)
+    {
+        err = snd_device_register(card, pcm);
+        if (err < 0)
+        {
+            printk(KERN_ERR "mr_alsa_audio_create_pcm: snd_device_register(pcm_id=%d) failed: %d\n",
+                   device_idx, err);
+            /* Leave the PCM on card->devices; snd_card_free at module
+             * unload will free it via snd_pcm_dev_free. Don't kfree the
+             * chip from our caller either — the PCM still references it
+             * via private_data. The caller (mr_alsa_audio_add_pcm) handles
+             * the slot-tracking implications. */
+            return err;
+        }
+    }
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
     snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC, NULL, 0, 0);
 #endif
@@ -2121,8 +2158,8 @@ static int mr_alsa_audio_create_alsa_devices(   struct snd_card *card,
     {
         uint32_t minPTPFrameSize, idx;
 
-        printk(KERN_INFO "Register ALSA driver into Ravenna Peer...\n");
-        chip->mr_alsa_audio_ops->register_alsa_driver(chip->ravenna_peer, &g_ravenna_manager_ops, (void*)chip);
+        printk(KERN_INFO "Register ALSA driver into Ravenna Peer for pcm_id=%d...\n", device_idx);
+        chip->mr_alsa_audio_ops->register_alsa_driver(chip->ravenna_peer, &g_ravenna_manager_ops, (void*)chip, device_idx);
         chip->mr_alsa_audio_ops->get_nb_inputs(chip->ravenna_peer, &chip->current_nbinputs);
         chip->mr_alsa_audio_ops->get_nb_outputs(chip->ravenna_peer, &chip->current_nboutputs);
 
@@ -2176,11 +2213,22 @@ static int mr_alsa_audio_chip_free(struct mr_alsa_audio_chip* chip)
     return 0;
 }
 
+/*
+ * card->private_free callback. Runs from snd_card_do_free, AFTER
+ * snd_device_free_all has run and freed every snd_pcm on the card via
+ * snd_pcm_dev_free. Implication: at this point chip->pcm is a dangling
+ * pointer for every chip (PCM 0's chip == card->private_data and every
+ * extra chip alike). Don't dereference chip->pcm here, and don't add any
+ * helper that does. Today mr_alsa_audio_chip_free only frees buffer
+ * memory (mr_alsa_audio_free_preallocate_memory), so we're safe — but
+ * any future field tracked off chip->pcm would UAF here.
+ */
 static void mr_alsa_audio_card_free(struct snd_card *card)
 {
     struct mr_alsa_audio_chip *chip = card->private_data;
     int i;
-    /* Free extra chips first (their substreams reference card-owned PCMs). */
+    /* Free extra chips first (their substreams have already been torn
+     * down by snd_device_free_all; we just reclaim our buffer + struct). */
     for (i = 0; i < g_extra_chip_count; ++i)
     {
         if (!g_extra_chips[i])
@@ -2273,8 +2321,22 @@ _err:
 
 /* Public entry point: create an additional PCM on the registered card.
  * Called from manager.c when MT_ALSA_Msg_AddPCM is received from the daemon.
- * The new chip is kzalloc'd, attached to a fresh snd_pcm at index pcm_id,
- * and registered with the manager (which appends it to m_apALSAChip[]).
+ * The new chip is kzalloc'd, snd_pcm_new'd + snd_device_register'd onto
+ * the live card, and self-registers into the manager's m_apALSAChip[]
+ * array via the register_alsa_driver callback inside chip_create.
+ *
+ * Concurrency: this runs in netlink-RX context, concurrent with userspace
+ * potentially opening *other* PCMs on the same card. The ALSA core takes
+ * register_mutex internally for the snd_device_register path, and the
+ * manager's chip-array publish uses smp_store_release/smp_load_acquire to
+ * pair with the hrtimer's softirq-context reads.
+ *
+ * Failure handling: once snd_pcm_new succeeds, the PCM is on card->devices
+ * with private_data pointing at our chip. We MUST keep the chip alive
+ * until snd_card_free runs, even on subsequent failure, otherwise the
+ * core's snd_device_free_all would dereference a freed chip. So we record
+ * the chip into g_extra_chips before checking the error and let cleanup
+ * happen at module unload via mr_alsa_audio_card_free.
  */
 int mr_alsa_audio_add_pcm(int pcm_id)
 {
@@ -2308,15 +2370,20 @@ int mr_alsa_audio_add_pcm(int pcm_id)
     {
         printk(KERN_ERR "mr_alsa_audio_add_pcm: chip_create(pcm_id=%d) failed: %d\n",
                pcm_id, err);
-        mr_alsa_audio_chip_free(chip);
-        kfree(chip);
+        /* If snd_pcm_new succeeded, the PCM is on card->devices and
+         * references chip via private_data; we must NOT kfree chip here.
+         * Stash it in g_extra_chips so card_free reclaims it later. We
+         * can't easily tell whether snd_pcm_new succeeded from out here,
+         * so adopt the safe rule: any non-NULL chip after chip_create
+         * lives until card_free. */
+        g_extra_chips[slot] = chip;
+        if (slot >= g_extra_chip_count)
+            g_extra_chip_count = slot + 1;
         return err;
     }
     g_extra_chips[slot] = chip;
     if (slot >= g_extra_chip_count)
         g_extra_chip_count = slot + 1;
-    /* snd_pcm_new on an already-registered card creates the device nodes
-     * immediately (pcmC{n}D{pcm_id}{p,c}), no extra register call needed. */
     dev_info(&g_device->dev, "mr_alsa_audio_add_pcm: created hw:%s,%d\n",
              g_card->id, pcm_id);
     return 0;

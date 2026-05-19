@@ -312,12 +312,13 @@ static void recompute_global_io_flags(struct TManager* self)
 {
     bool any_play = false;
     bool any_cap  = false;
-    uint32_t i;
+    uint32_t i, count;
     if (self->m_alsa_driver_frontend)
     {
-        for (i = 0; i < self->m_uPCMCount; ++i)
+        count = smp_load_acquire(&self->m_uPCMCount);
+        for (i = 0; i < count; ++i)
         {
-            void *chip = self->m_apALSAChip[i];
+            void *chip = smp_load_acquire(&self->m_apALSAChip[i]);
             if (!chip)
                 continue;
             if (self->m_alsa_driver_frontend->get_io_state(chip, true))
@@ -1505,7 +1506,8 @@ void* get_live_buffer_for_pcm(void* user, uint32_t pcm_id, uint32_t ulChannelId,
                     pcm_id, self->m_uPCMCount);
         return NULL;
     }
-    chip = self->m_apALSAChip[pcm_id];
+    /* Acquire-load pairs with smp_store_release in attach_alsa_driver. */
+    chip = smp_load_acquire(&self->m_apALSAChip[pcm_id]);
     if (!chip || !self->m_alsa_driver_frontend)
         return NULL;
 
@@ -1727,10 +1729,15 @@ void AudioFrameTIC(void* user)
             frame_process_begin(&self->m_RTP_streams_manager);
             if (self->m_alsa_driver_frontend)
             {
+                /* Acquire-load the count and each slot so we pair with
+                 * smp_store_release in attach/detach_alsa_driver. The
+                 * loop body is in softirq context; we must not see a
+                 * non-NULL chip whose internal fields aren't published. */
+                uint32_t count = smp_load_acquire(&self->m_uPCMCount);
                 uint32_t i;
-                for (i = 0; i < self->m_uPCMCount; ++i)
+                for (i = 0; i < count; ++i)
                 {
-                    void *chip = self->m_apALSAChip[i];
+                    void *chip = smp_load_acquire(&self->m_apALSAChip[i]);
                     if (!chip)
                         continue;
                     if (self->m_alsa_driver_frontend->get_io_state(chip, false))
@@ -1777,51 +1784,79 @@ rtp_audio_stream_ops* Get_C_Callbacks(struct TManager* self)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 // ALSA <> Ravenna Manager communication
-int attach_alsa_driver(void* user, const struct ravenna_mgr_ops *ops, void *alsa_chip_pointer)
+/*
+ * Stage 1 multi-PCM: chips are indexed in m_apALSAChip[] by their pcm_id
+ * (matches the snd_pcm_new device argument). m_uPCMCount is the high-water
+ * mark — the TIC loop iterates [0, m_uPCMCount) and skips NULL slots, so
+ * sparse layouts (e.g. ids 1 and 3 without id 2) work correctly. Earlier
+ * code indexed by insertion order which broke when ids arrived out of
+ * order.
+ *
+ * Publish ordering: the hrtimer TIC reads these from softirq context
+ * concurrent with this netlink-context add path. The chip slot is
+ * written with smp_store_release() so a reader using READ_ONCE() sees a
+ * fully-initialised chip (its fields published by the
+ * mr_alsa_audio_chip_create path that ran before this call) before the
+ * slot pointer becomes visible.
+ */
+int attach_alsa_driver(void* user, const struct ravenna_mgr_ops *ops, void *alsa_chip_pointer, int pcm_id)
 {
     struct TManager* self = (struct TManager*)user;
-    uint32_t i;
+    uint32_t new_count;
     if (!ops || !alsa_chip_pointer)
         return -EINVAL;
-    /* Reject duplicate attaches of the same chip. */
-    for (i = 0; i < self->m_uPCMCount; ++i)
+    if (pcm_id < 0 || pcm_id >= MAX_PCMS)
     {
-        if (self->m_apALSAChip[i] == alsa_chip_pointer)
-            return -EEXIST;
+        MTAL_DP("attach_alsa_driver: pcm_id %d out of range [0..%d)\n", pcm_id, MAX_PCMS);
+        return -EINVAL;
     }
-    if (self->m_uPCMCount >= MAX_PCMS)
+    /* Refuse re-attach of the same slot or duplicate chip pointer. */
+    if (self->m_apALSAChip[pcm_id])
     {
-        MTAL_DP("attach_alsa_driver: PCM table full (MAX_PCMS=%d)\n", MAX_PCMS);
-        return -ENOSPC;
+        MTAL_DP("attach_alsa_driver: pcm_id %d already attached\n", pcm_id);
+        return -EEXIST;
     }
-    self->m_apALSAChip[self->m_uPCMCount++] = alsa_chip_pointer;
-    /* Frontend ops are identical across chips; set once on first attach. */
+    /* Frontend ops are identical across chips; set once on first attach.
+     * Plain stores are fine here because the count bump below has release
+     * semantics and the reader pairs with READ_ONCE on the slot. */
     if (!self->m_alsa_driver_frontend)
         self->m_alsa_driver_frontend = ops;
+    /* Publish the slot with release semantics so the hrtimer reader sees
+     * the chip pointer only after the chip itself is fully constructed. */
+    smp_store_release(&self->m_apALSAChip[pcm_id], alsa_chip_pointer);
+    new_count = (uint32_t)pcm_id + 1;
+    if (new_count > self->m_uPCMCount)
+        smp_store_release(&self->m_uPCMCount, new_count);
     return 0;
 }
 
 void detach_alsa_driver(struct TManager* self, void *alsa_chip_pointer)
 {
-    uint32_t i, j;
+    uint32_t i;
     if (!alsa_chip_pointer)
         return;
     for (i = 0; i < self->m_uPCMCount; ++i)
     {
         if (self->m_apALSAChip[i] != alsa_chip_pointer)
             continue;
-        for (j = i + 1; j < self->m_uPCMCount; ++j)
-            self->m_apALSAChip[j - 1] = self->m_apALSAChip[j];
-        self->m_apALSAChip[--self->m_uPCMCount] = NULL;
+        /* Clear with release so any concurrent reader sees NULL atomically
+         * (no half-cleared pointer). Don't shrink m_uPCMCount: the slot is
+         * skipped by the NULL check, and not shrinking avoids a TOCTOU
+         * window where the reader's bound check passes against a stale
+         * count but the slot has just been cleared. */
+        smp_store_release(&self->m_apALSAChip[i], NULL);
         return;
     }
 }
 
 void* get_chip_by_pcm_id(struct TManager* self, int32_t pcm_id)
 {
-    if (pcm_id < 0 || (uint32_t)pcm_id >= self->m_uPCMCount)
+    void* chip;
+    if (pcm_id < 0 || pcm_id >= MAX_PCMS)
         return NULL;
-    return self->m_apALSAChip[pcm_id];
+    /* Read paired with smp_store_release in attach_alsa_driver. */
+    chip = smp_load_acquire(&self->m_apALSAChip[pcm_id]);
+    return chip;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////

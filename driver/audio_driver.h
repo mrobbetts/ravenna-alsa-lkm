@@ -63,7 +63,10 @@ struct ravenna_mgr_ops
 /// Put functions to be called by ALSA driver (C ALSA to CPP Ravenna wrapper/owner object)
 struct alsa_ops
 {
-    int (*register_alsa_driver)(void* ravenna_peer, const struct ravenna_mgr_ops *ops, void *alsa_chip_pointer);/// to be called at driver init to allow communication between driver and Ravenna context
+    /* multi-rate Stage 1: pcm_id is the per-card device index (matches the
+     * snd_pcm_new device argument). Manager indexes its chip array by
+     * pcm_id directly, so out-of-order group ids work. */
+    int (*register_alsa_driver)(void* ravenna_peer, const struct ravenna_mgr_ops *ops, void *alsa_chip_pointer, int pcm_id);/// to be called at driver init to allow communication between driver and Ravenna context
     int (*get_input_jitter_buffer_offset)(void* ravenna_peer, uint32_t *offset);
     int (*get_output_jitter_buffer_offset)(void* ravenna_peer, uint32_t *offset);
     int (*get_min_interrupts_frame_size)(void* ravenna_peer, uint32_t *framesize); /// returns min Ravenna Frame Size in samples (channel independent)
@@ -93,7 +96,8 @@ extern void mr_alsa_audio_card_exit(void);
  * card created at probe. pcm_id must be in [1, MAX_PCMS-1]; 0 is the
  * default PCM created at probe. Returns 0 on success or a negative errno.
  * The new chip auto-attaches into the manager via the existing
- * register_alsa_driver callback (manager's attach_alsa_driver appends).
+ * register_alsa_driver callback (manager's attach_alsa_driver stores it
+ * at m_apALSAChip[pcm_id] indexed by id, not insertion order).
  */
 extern int mr_alsa_audio_add_pcm(int pcm_id);
 
