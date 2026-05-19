@@ -197,7 +197,7 @@ rtp_audio_stream_ops* Get_C_Callbacks(struct TManager* self);
 //dispatch_packet_ops* Get_C_Dispatch_Callbacks() {return &m_c_dispatch_callbacks;}
 
 
-int attach_alsa_driver(void* user, const struct ravenna_mgr_ops *ops, void *alsa_chip_pointer);
+int attach_alsa_driver(void* user, const struct ravenna_mgr_ops *ops, void *alsa_chip_pointer, int pcm_id);
 void detach_alsa_driver(struct TManager* self, void *alsa_chip_pointer);
 /*
  * Returns m_apALSAChip[pcm_id], or NULL if pcm_id is out of range or that
