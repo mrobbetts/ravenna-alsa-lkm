@@ -104,6 +104,13 @@ typedef struct
 	bool			m_bIsPrimaryPort;	//ST2022-7
 
 	uint32_t		m_aui32Routing[MAX_CHANNELS_BY_RTP_STREAM]; //[StreamChannelId] = PhysicalChannelId; ~0 means not used
+
+	/* multi-rate Stage 1: which PCM (hw:RAVENNA,m_uiPCMId) this stream
+	 * binds to. m_aui32Routing channel indices then index into that PCM's
+	 * playback/capture buffer. Default 0 keeps legacy behaviour. Appended
+	 * to the struct tail so the existing m_ui32CRTP_stream_info_sizeof
+	 * version check detects mismatched daemon/kernel sizes. */
+	uint32_t		m_uiPCMId;
 } TRTP_stream_info;
 
 typedef struct {
@@ -287,6 +294,9 @@ public:
 
 	void SetIsPrimaryPort(bool bIsPrimaryPort) { m_bIsPrimaryPort = bIsPrimaryPort; }
 	bool IsPrimaryPort() const { return m_bIsPrimaryPort; }
+
+	void SetPCMId(uint32_t uiPCMId) { m_uiPCMId = uiPCMId; }
+	uint32_t GetPCMId() const { return m_uiPCMId; }
 
 	bool SetRouting(uint32_t ui32StreamChannelId, uint32_t ui32PhysicalChannelId) {
 		return set_routing((TRTP_stream_info*)this, ui32StreamChannelId, ui32PhysicalChannelId) ? true : false;

@@ -181,6 +181,8 @@ void get_audio_engine_sample_format(void* user, enum EAudioEngineSampleFormat* p
 char get_audio_engine_sample_bytelength(void* user);
 void* get_live_in_jitter_buffer(void* user, uint32_t ulChannelId);	// Note: buffer type is retrieved through get_audio_engine_sample_format
 void* get_live_out_jitter_buffer(void* user, uint32_t ulChannelId);	// Note: buffer type is retrieved through get_audio_engine_sample_format
+/* Stage 1 multi-PCM: per-PCM variant for stream Init buffer cache. */
+void* get_live_buffer_for_pcm(void* user, uint32_t pcm_id, uint32_t ulChannelId, int is_capture);
 uint32_t get_live_in_jitter_buffer_length(void* user);
 uint32_t get_live_out_jitter_buffer_length(void* user);
 uint32_t get_live_in_jitter_buffer_offset(void* user, const uint64_t ui64CurrentSAC);

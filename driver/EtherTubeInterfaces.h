@@ -93,6 +93,13 @@ typedef struct
 
 	unsigned char (*get_live_in_mute_pattern)(void* self, uint32_t ulChannelId);
 	unsigned char (*get_live_out_mute_pattern)(void* self, uint32_t ulChannelId);
+
+	/* multi-rate Stage 1: per-PCM buffer accessor used at stream Init
+	 * time to cache the right chip's buffer pointer on the stream. The
+	 * length/offset/mute_pattern callbacks above remain manager-wide
+	 * because in Stage 1 every PCM shares the sample rate and buffer
+	 * size, so those values are identical across chips. */
+	void* (*get_live_buffer_for_pcm)(void* self, uint32_t pcm_id, uint32_t ulChannelId, int is_capture);
 } rtp_audio_stream_ops;
 
 /// Put functions to be called by PTP ato Manager
