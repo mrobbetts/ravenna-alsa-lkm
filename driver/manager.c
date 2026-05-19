@@ -32,6 +32,7 @@
 #include "manager.h"
 #include "EtherTubeNetfilter.h"
 #include <linux/errno.h>
+#include <linux/compiler.h>  /* READ_ONCE / WRITE_ONCE / smp_*_acquire/release */
 
 #include "RTP_stream_info.h"
 
