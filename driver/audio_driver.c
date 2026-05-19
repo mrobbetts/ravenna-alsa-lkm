@@ -38,6 +38,7 @@
 #include <linux/printk.h>
 #include <linux/module.h>
 #include <linux/vmalloc.h>
+#include <linux/compiler.h>  /* READ_ONCE / WRITE_ONCE */
 
 #include <sound/core.h>
 #include <sound/control.h>
@@ -2402,7 +2403,6 @@ int mr_alsa_audio_add_pcm(int pcm_id)
              g_card->id, pcm_id);
     return 0;
 }
-EXPORT_SYMBOL(mr_alsa_audio_add_pcm);
 
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
