@@ -393,7 +393,12 @@ int Create(TRTP_audio_stream* self, TRTP_stream_info* pRTP_stream_info, rtp_audi
 
 			if(self->m_pvLivesInCircularBuffer[us])
 			{	// mute
-				memset(self->m_pvLivesInCircularBuffer[us], pManager->get_live_in_mute_pattern(pManager->user, us), pManager->get_live_in_jitter_buffer_length(pManager->user) * self->m_usAudioEngineSampleWordLength);
+				/* Multi-rate Stage 2: route mute pattern + buffer length
+				 * through the stream's pcm_id so chips at different
+				 * rates / sizes get correct values. */
+				memset(self->m_pvLivesInCircularBuffer[us],
+					pManager->get_live_in_mute_pattern_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId, us),
+					pManager->get_live_in_jitter_buffer_length_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId) * self->m_usAudioEngineSampleWordLength);
 			}
 		}
 	}
@@ -429,7 +434,10 @@ int Destroy(TRTP_audio_stream* self)
 
 			if(self->m_pvLivesInCircularBuffer[us])
 			{	// mute
-				memset(self->m_pvLivesInCircularBuffer[us], self->m_pManager->get_live_in_mute_pattern(self->m_pManager->user, us), self->m_pManager->get_live_in_jitter_buffer_length(self->m_pManager->user) * self->m_usAudioEngineSampleWordLength);
+				/* Multi-rate Stage 2: per-PCM variants. */
+				memset(self->m_pvLivesInCircularBuffer[us],
+					self->m_pManager->get_live_in_mute_pattern_for_pcm(self->m_pManager->user, pRTP_stream_info->m_uiPCMId, us),
+					self->m_pManager->get_live_in_jitter_buffer_length_for_pcm(self->m_pManager->user, pRTP_stream_info->m_uiPCMId) * self->m_usAudioEngineSampleWordLength);
 			}
 		}
 	}
@@ -723,10 +731,12 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 
 	if (bCopyRTPAudioToLivesIn)
 	{
-		ui32Offset = pManager->get_live_in_jitter_buffer_offset(pManager->user, ui64RTPSAC); // [smpl]
+		/* Multi-rate Stage 2: offset + length come from the stream's
+		 * owning chip (its own rate / ring buffer). */
+		ui32Offset = pManager->get_live_in_jitter_buffer_offset_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId, ui64RTPSAC); // [smpl]
 
 
-		ui32Len1 = min(pManager->get_live_in_jitter_buffer_length(pManager->user) - ui32Offset, ui32NbOfSamplesInThisPacket);
+		ui32Len1 = min(pManager->get_live_in_jitter_buffer_length_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId) - ui32Offset, ui32NbOfSamplesInThisPacket);
 		ui32Len2 = ui32NbOfSamplesInThisPacket - ui32Len1;
 
 		MTAL_RtTraceEvent(RTTRACEEVENT_RTP_IN, (PVOID)(RT_TRACE_EVENT_SIGNAL_STOP), 0);
@@ -773,10 +783,11 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 
 		//MTAL_DP("ui32RTPSAC %u  perfcounter %llu\n", ui32RTPSAC, MTAL_LK_GetCounterTime());
 		// ui32UsedSAC is the first frame SAC when this packet will be used
-		ui64UsedSAC = (ui64RTPSAC - (CW_ll_modulo(ui64RTPSAC, pManager->get_frame_size(pManager->user))));
+		/* Multi-rate Stage 2: frame_size is per-PCM. */
+		ui64UsedSAC = (ui64RTPSAC - (CW_ll_modulo(ui64RTPSAC, pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId))));
 
 		i64DeltaSAC =  ui64UsedSAC - ui64GlobalSAC;
-		//MTAL_DP("i64DeltaSAC %llu playout delay %u, frame size: %u\n", i64DeltaSAC, pRTP_stream_info->m_ui32PlayOutDelay, pManager->get_frame_size(pManager->user));
+		//MTAL_DP("i64DeltaSAC %llu playout delay %u, frame size: %u\n", i64DeltaSAC, pRTP_stream_info->m_ui32PlayOutDelay, pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId));
 		if(i64DeltaSAC < 0)
 		{
 			i64DeltaSAC += 0x7FFFFFFFFFFFFFFF;
@@ -842,11 +853,12 @@ int SendRTPAudioPackets(TRTP_audio_stream* self)
 	// Send all lives out to the interface
 	// We packet all LivesOut in several RTP packet if needed.
 	// Note: One RTP packet must contain an integer number of samples for ALL LivesOut.
-	ui32NbOfSampleRemaining = pManager->get_frame_size(pManager->user);
+	/* Multi-rate Stage 2: frame_size + buffer offset are per-PCM. */
+	ui32NbOfSampleRemaining = pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId);
 
 	// Ravenna protocol: we must put in the RTP's time stamp the SAC when the audio was produced
-	ui64CurrentSAC = pManager->get_global_SAC(pManager->user) - pManager->get_frame_size(pManager->user);
-	ui32Offset = pManager->get_live_out_jitter_buffer_offset(pManager->user, ui64CurrentSAC); // [smpl]
+	ui64CurrentSAC = pManager->get_global_SAC(pManager->user) - pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId);
+	ui32Offset = pManager->get_live_out_jitter_buffer_offset_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId, ui64CurrentSAC); // [smpl]
 
 
 
@@ -880,8 +892,9 @@ int SendRTPAudioPackets(TRTP_audio_stream* self)
 
 
 		ui32Offset += ui32NbOfSamplesInThisPacket;
-		if (ui32Offset >= pManager->get_live_out_jitter_buffer_length(pManager->user))
-			ui32Offset -= pManager->get_live_out_jitter_buffer_length(pManager->user);
+		/* Multi-rate Stage 2: per-PCM ring length. */
+		if (ui32Offset >= pManager->get_live_out_jitter_buffer_length_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId))
+			ui32Offset -= pManager->get_live_out_jitter_buffer_length_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId);
 
 	}
 
@@ -938,7 +951,8 @@ int SendRTPAudioPacket(TRTP_audio_stream* self, const uint64_t ui64CurrentSAC, c
 	ui32PacketSize = sizeof(TRTPPacketBase) + ui32NbOfSamplesInThisPacket * (GetNbOfLivesOut(self) * pRTP_stream_info->m_byWordLength);
 
 
-	ui32Len1 = min(pManager->get_live_out_jitter_buffer_length(pManager->user) - ui32Offset, ui32NbOfSamplesInThisPacket);
+	/* Multi-rate Stage 2: per-PCM ring length. */
+	ui32Len1 = min(pManager->get_live_out_jitter_buffer_length_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId) - ui32Offset, ui32NbOfSamplesInThisPacket);
 	ui32Len2 = ui32NbOfSamplesInThisPacket - ui32Len1;
 	//MTAL_DP("\n @@ SendRTPAudioPackets: outputBuffer = %p (ui32Len1 = %u, ui32Len2 = %u) \n", (unsigned char*)self->m_pvLivesOutCircularBuffer[0] + ui32Offset * 3, ui32Len1, ui32Len2);
 	//MTAL_DP("OutputSAC = %llu Offset = %d, Len1 = %d Len2 = %d\n", ui64OutputSAC, ui32Offset, ui32Len1, ui32Len2);
@@ -1021,7 +1035,9 @@ int IsLivesInMustBeMuted(TRTP_audio_stream* self)
 {
 	// check if the audio for the current (i.e. at GlobalSAC()) frame was filled.
 	//return 0;
-	return (signed)(self->m_tRTPStream.m_ui64LastAudioSampleReceivedSAC - self->m_pManager->get_global_SAC(self->m_pManager->user)) < (signed)self->m_pManager->get_frame_size(self->m_pManager->user);
+	/* Multi-rate Stage 2: frame_size is per-PCM. */
+	TRTP_stream_info* pRTP_stream_info = &self->m_tRTPStream.m_RTP_stream_info;
+	return (signed)(self->m_tRTPStream.m_ui64LastAudioSampleReceivedSAC - self->m_pManager->get_global_SAC(self->m_pManager->user)) < (signed)self->m_pManager->get_frame_size_for_pcm(self->m_pManager->user, pRTP_stream_info->m_uiPCMId);
 }
 
 //////////////////////////////////////////////////////////////
@@ -1063,9 +1079,10 @@ void PrepareBufferLives(TRTP_audio_stream* self)
 					uint32_t ui32Offset;
 					MTAL_RtTraceEvent(RTTRACEEVENT_SINK_LIVE_MUTED + pEth_netfilter->nic_id, (PVOID)(RT_TRACE_EVENT_OCCURENCE), 0);
 
-					ui32Offset = pManager->get_live_in_jitter_buffer_offset(pManager->user, pManager->get_global_SAC(pManager->user));
+					/* Multi-rate Stage 2: per-PCM offset/length/frame_size. */
+					ui32Offset = pManager->get_live_in_jitter_buffer_offset_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId, pManager->get_global_SAC(pManager->user));
 
-					if (self->m_ulLivesInDMCounter < pManager->get_live_in_jitter_buffer_length(pManager->user) / pManager->get_frame_size(pManager->user))
+					if (self->m_ulLivesInDMCounter < pManager->get_live_in_jitter_buffer_length_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId) / pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId))
 					{
 						unsigned short us;
 						if (self->m_ulLivesInDMCounter == 0)
@@ -1079,9 +1096,10 @@ void PrepareBufferLives(TRTP_audio_stream* self)
 						{
 							if (self->m_pvLivesInCircularBuffer[us])
 							{	// mute
-								//MTAL_DP("self->m_pvLivesInCircularBuffer[%u] = 0x%x, ui32Offset = %u size = %u, self->m_usAudioEngineSampleWordLength = %u\n", us, self->m_pvLivesInCircularBuffer[us], ui32Offset, pManager->get_frame_size(pManager->user), self->m_usAudioEngineSampleWordLength);
-								//MTAL_DP("[0x%x -> 0x%x]\n", (uint8_t*)self->m_pvLivesInCircularBuffer[us] + ui32Offset * self->m_usAudioEngineSampleWordLength, (uint8_t*)self->m_pvLivesInCircularBuffer[us] + ui32Offset + pManager->get_frame_size(pManager->user) * self->m_usAudioEngineSampleWordLength - 1);
-								memset((uint8_t*)self->m_pvLivesInCircularBuffer[us] + ui32Offset * self->m_usAudioEngineSampleWordLength, pManager->get_live_in_mute_pattern(pManager->user, us), pManager->get_frame_size(pManager->user) * self->m_usAudioEngineSampleWordLength);
+								/* Multi-rate Stage 2: per-PCM mute pattern + frame size. */
+								memset((uint8_t*)self->m_pvLivesInCircularBuffer[us] + ui32Offset * self->m_usAudioEngineSampleWordLength,
+									pManager->get_live_in_mute_pattern_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId, us),
+									pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId) * self->m_usAudioEngineSampleWordLength);
 								//for(uint32_t ulSample = ui32Offset; ulSample < ui32Offset + pManager->get_frame_size(pManager->user); ulSample++)
 								//{
 								//	((float*)self->m_pvLivesInCircularBuffer[us])[ulSample] = -1.0f;

@@ -58,6 +58,25 @@ struct ravenna_mgr_ops
     /* multi-rate Stage 1: per-chip IO state accessors, used by the manager's tick loop */
     void (*set_io_state)(void *mr_alsa_audio_chip, bool is_playback, bool running);
     bool (*get_io_state)(void *mr_alsa_audio_chip, bool is_playback);
+    /*
+     * Multi-rate Stage 2: per-chip sample-rate + frame-size storage.
+     * Each chip carries its own (rate, frame_size) configured at AddPCM
+     * time and visible to the manager's tick path (via the
+     * *_for_pcm callbacks) without going through the manager-wide
+     * m_SampleRate / m_ui32FrameSize.
+     *
+     * Writes happen in netlink context (AddPCM, SetSamplingRate); reads
+     * happen in softirq context (TIC tick, RTP stream hot paths). The
+     * implementation uses smp_store_release on writes and smp_load_acquire
+     * on reads so a reader never sees a torn pair (rate from one
+     * generation paired with frame_size from another).
+     *
+     * frame_size is the (rate * nFS scaled) value; the manager owns the
+     * rate->frame_size derivation and passes both fields atomically.
+     */
+    void (*set_pcm_sample_rate)(void *mr_alsa_audio_chip, uint32_t rate, uint32_t frame_size);
+    uint32_t (*get_pcm_sample_rate)(void *mr_alsa_audio_chip);
+    uint32_t (*get_pcm_frame_size)(void *mr_alsa_audio_chip);
 };
 
 /// Put functions to be called by ALSA driver (C ALSA to CPP Ravenna wrapper/owner object)
@@ -98,14 +117,23 @@ struct alsa_ops
 /// Put ALSA driver functions which needs to be used by CPP code here:
 extern int mr_alsa_audio_card_init(void* ravennaPeer, struct alsa_ops *callbacks);
 extern void mr_alsa_audio_card_exit(void);
-/* Stage 1 multi-PCM: create an additional PCM (hw:RAVENNA,pcm_id) on the
- * card created at probe. pcm_id must be in [1, MAX_PCMS-1]; 0 is the
- * default PCM created at probe. Returns 0 on success or a negative errno.
- * The new chip auto-attaches into the manager via the existing
- * register_alsa_driver callback (manager's attach_alsa_driver stores it
- * at m_apALSAChip[pcm_id] indexed by id, not insertion order).
+/* Multi-PCM: create an additional PCM (hw:RAVENNA,pcm_id) on the card
+ * created at probe. pcm_id must be in [1, MAX_PCMS-1]; 0 is the default
+ * PCM created at probe.
+ *
+ * sample_rate is the per-chip rate (Stage 2). Pass a non-zero value from
+ * the supported rate set to lock this chip at that rate; pass 0 to
+ * inherit the manager-wide rate. The chip's pcm_sample_rate /
+ * pcm_frame_size are published with smp_store_release before
+ * register_alsa_driver runs, so the moment the manager's chip slot
+ * becomes visible to tick-path readers, the chip's rate is too.
+ *
+ * Returns 0 on success or a negative errno. The new chip auto-attaches
+ * into the manager via the existing register_alsa_driver callback
+ * (manager's attach_alsa_driver stores it at m_apALSAChip[pcm_id]
+ * indexed by id, not insertion order).
  */
-extern int mr_alsa_audio_add_pcm(int pcm_id);
+extern int mr_alsa_audio_add_pcm(int pcm_id, uint32_t sample_rate);
 
 #if	defined(__cplusplus)
 }

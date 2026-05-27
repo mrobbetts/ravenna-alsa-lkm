@@ -161,6 +161,27 @@ bool GetHALToTICDelta(struct TManager* self, THALToTICDelta* pHALToTICDelta);
 
 void UpdateFrameSize(struct TManager* self);
 
+/*
+ * Multi-rate Stage 2: derive frame_size (samples per TIC tick) from a
+ * sample rate. Pure function — no manager state needed beyond the
+ * TICFrameSizeAt1FS / MaxTICFrameSize constants the caller passes in.
+ *
+ * Extracted from UpdateFrameSize so per-chip rate code paths can call it
+ * without going through manager-wide state. UpdateFrameSize itself stays
+ * (operating on manager-wide m_SampleRate / m_ui32FrameSize) as the
+ * transitional reader for legacy chip-0-only code paths.
+ */
+uint32_t compute_frame_size_for_rate(uint32_t sample_rate, uint64_t tic_frame_size_at_1fs, uint32_t max_frame_size);
+
+/*
+ * Multi-rate Stage 2: validate a sample rate against the supported PCM
+ * set (44.1/48k families through 8FS). DSD raw rates (2822400 etc.) are
+ * deliberately NOT accepted via AddPCM — DSD streaming uses the
+ * MT_ALSA_Msg_SetDSDSampleRate path on the manager-wide rate, and per-PCM
+ * DSD is out of scope for Stage 2.
+ */
+bool is_valid_pcm_rate(uint32_t sample_rate);
+
 void MuteInputBuffer(struct TManager* self);
 void MuteOutputBuffer(struct TManager* self);
 
@@ -196,6 +217,29 @@ uint32_t get_live_out_jitter_buffer_offset(void* user, const uint64_t ui64Curren
 int update_live_in_audio_data_format(void* user, uint32_t /*ulChannelId*/, char const * /*pszCodec*/);
 unsigned char get_live_in_mute_pattern(void* user, uint32_t ulChannelId);
 unsigned char get_live_out_mute_pattern(void* user, uint32_t /*ulChannelId*/);
+
+/*
+ * Multi-rate Stage 2: per-PCM tick-path callbacks. Each RTP stream
+ * carries a pcm_id (TRTP_stream_info::m_uiPCMId, Stage 1) and queries
+ * these variants on the hot path so frame size / buffer length / mute
+ * pattern route to the owning chip's per-PCM state.
+ *
+ * All variants do an acquire-load on the chip slot via the manager's
+ * m_apALSAChip[] array. If pcm_id is out of range or the slot is empty
+ * they return a safe zero/no-op value (length=0, offset=0, pattern=0).
+ *
+ * For chips at the same sample rate these return identical values to
+ * the manager-wide callbacks above; they diverge when chips run at
+ * different rates (different frame_size per tick, different buffer
+ * lengths if Stage 4 grows per-chip ring-buffer sizing).
+ */
+uint32_t get_frame_size_for_pcm(void* user, uint32_t pcm_id);
+uint32_t get_live_in_jitter_buffer_length_for_pcm(void* user, uint32_t pcm_id);
+uint32_t get_live_out_jitter_buffer_length_for_pcm(void* user, uint32_t pcm_id);
+uint32_t get_live_in_jitter_buffer_offset_for_pcm(void* user, uint32_t pcm_id, const uint64_t ui64CurrentSAC);
+uint32_t get_live_out_jitter_buffer_offset_for_pcm(void* user, uint32_t pcm_id, const uint64_t ui64CurrentSAC);
+unsigned char get_live_in_mute_pattern_for_pcm(void* user, uint32_t pcm_id, uint32_t ulChannelId);
+unsigned char get_live_out_mute_pattern_for_pcm(void* user, uint32_t pcm_id, uint32_t ulChannelId);
 
 
 void Init_C_Callbacks(struct TManager* self);
