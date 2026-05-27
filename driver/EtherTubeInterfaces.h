@@ -95,11 +95,33 @@ typedef struct
 	unsigned char (*get_live_out_mute_pattern)(void* self, uint32_t ulChannelId);
 
 	/* multi-rate Stage 1: per-PCM buffer accessor used at stream Init
-	 * time to cache the right chip's buffer pointer on the stream. The
-	 * length/offset/mute_pattern callbacks above remain manager-wide
-	 * because in Stage 1 every PCM shares the sample rate and buffer
-	 * size, so those values are identical across chips. */
+	 * time to cache the right chip's buffer pointer on the stream. */
 	void* (*get_live_buffer_for_pcm)(void* self, uint32_t pcm_id, uint32_t ulChannelId, int is_capture);
+
+	/*
+	 * Multi-rate Stage 2: per-PCM tick-path variants. Each RTP stream is
+	 * tagged with TRTP_stream_info::m_uiPCMId (Stage 1) and queries these
+	 * variants on the hot path so frame size / buffer length / mute pattern
+	 * route to the owning chip's per-PCM state.
+	 *
+	 * For chips at the same sample rate these return the same values as
+	 * the manager-wide callbacks above; for chips at different rates the
+	 * per-PCM variants diverge correctly (different frame size per tick,
+	 * different jitter buffer length proportions, etc.). The manager-wide
+	 * callbacks above remain valid for callers that don't carry a pcm_id
+	 * (e.g. MuteInputBuffer / MuteOutputBuffer operate on chip 0).
+	 *
+	 * All variants acquire-load the chip slot internally; if pcm_id is out
+	 * of range or the slot is empty they return a safe zero/no-op value
+	 * (length=0, offset=0, mute_pattern=0).
+	 */
+	uint32_t (*get_frame_size_for_pcm)(void* self, uint32_t pcm_id);
+	uint32_t (*get_live_in_jitter_buffer_length_for_pcm)(void* self, uint32_t pcm_id);
+	uint32_t (*get_live_out_jitter_buffer_length_for_pcm)(void* self, uint32_t pcm_id);
+	uint32_t (*get_live_in_jitter_buffer_offset_for_pcm)(void* self, uint32_t pcm_id, const uint64_t ui64CurrentSAC);
+	uint32_t (*get_live_out_jitter_buffer_offset_for_pcm)(void* self, uint32_t pcm_id, const uint64_t ui64CurrentSAC);
+	unsigned char (*get_live_in_mute_pattern_for_pcm)(void* self, uint32_t pcm_id, uint32_t ulChannelId);
+	unsigned char (*get_live_out_mute_pattern_for_pcm)(void* self, uint32_t pcm_id, uint32_t ulChannelId);
 } rtp_audio_stream_ops;
 
 /// Put functions to be called by PTP ato Manager

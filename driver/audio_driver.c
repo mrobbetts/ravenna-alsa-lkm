@@ -153,6 +153,23 @@ struct mr_alsa_audio_chip
     bool playback_io;
     bool capture_io;
 
+    /*
+     * Multi-rate Stage 2: per-PCM rate + frame size, configured at AddPCM
+     * time (or, for chip 0, at probe and tracked by manager-wide
+     * SetSampleRate). Distinct from `current_rate` below, which reflects
+     * the latest userspace hw_params request — these two will converge
+     * once Stage 2 task #5 narrows hw_params to a single rate per chip,
+     * but for now `pcm_sample_rate` is the source of truth for the
+     * tick-path readers via the *_for_pcm callbacks.
+     *
+     * Writers (netlink context: AddPCM, SetSamplingRate) use
+     * smp_store_release; readers (softirq context: TIC tick, RTP stream
+     * hot paths) use smp_load_acquire — same publish discipline as the
+     * chip-slot pointer in the manager.
+     */
+    uint32_t pcm_sample_rate;
+    uint32_t pcm_frame_size;
+
     unsigned int current_rate;  /// updated on each alsa hw_params and prepare
     unsigned int current_dsd;   /// 0 for pcm, 1 for dsd64, 2 for dsd128, 4 for dsd256. updated on each alsa hw_params and prepare
 
@@ -789,6 +806,57 @@ static bool mr_alsa_audio_get_io_state(void *mr_alsa_audio_chip, bool is_playbac
     return is_playback ? READ_ONCE(chip->playback_io) : READ_ONCE(chip->capture_io);
 }
 
+/*
+ * Multi-rate Stage 2: per-chip sample rate / frame size accessors.
+ *
+ * Set: the manager passes rate and frame_size together so a reader never
+ * sees a torn (rate, frame_size) pair across a rate change. Two
+ * smp_store_release writes give us a partial guarantee — frame_size is
+ * published last, so a reader that reads frame_size first (via
+ * smp_load_acquire) and then rate (via smp_load_acquire) is guaranteed to
+ * see the publishing thread's rate. The hot-path readers below follow
+ * that order. The other ordering (read rate then frame_size) is acceptable
+ * for our callers because rate is only used for mode/format selection (it
+ * doesn't multiply frame_size), and a "rate from new generation, frame_size
+ * from old" combination doesn't produce a worse answer than waiting one
+ * tick — frame_size still works for the old rate's audio data already in
+ * the buffer, which is exactly what we want for the in-flight tick that
+ * raced the rate change.
+ *
+ * The full atomic-pair guarantee will come if/when we serialize chip-rate
+ * changes against the tick (Stage 4's per-rate hrtimers naturally do this
+ * by tearing down the timer for the old rate before publishing the new
+ * one).
+ */
+static void mr_alsa_audio_set_pcm_sample_rate(void *mr_alsa_audio_chip, uint32_t rate, uint32_t frame_size)
+{
+    struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip *)mr_alsa_audio_chip;
+    if (!chip)
+        return;
+    /* Publish rate first, then frame_size. Readers below acquire-load in
+     * the opposite order so they see a consistent pair as long as the
+     * publisher serialized both writes (which the manager does — see
+     * update_chip_rate_and_frame_size in manager.c). */
+    smp_store_release(&chip->pcm_sample_rate, rate);
+    smp_store_release(&chip->pcm_frame_size, frame_size);
+}
+
+static uint32_t mr_alsa_audio_get_pcm_sample_rate(void *mr_alsa_audio_chip)
+{
+    struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip *)mr_alsa_audio_chip;
+    if (!chip)
+        return 0;
+    return smp_load_acquire(&chip->pcm_sample_rate);
+}
+
+static uint32_t mr_alsa_audio_get_pcm_frame_size(void *mr_alsa_audio_chip)
+{
+    struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip *)mr_alsa_audio_chip;
+    if (!chip)
+        return 0;
+    return smp_load_acquire(&chip->pcm_frame_size);
+}
+
 static struct ravenna_mgr_ops g_ravenna_manager_ops = {
     .get_playback_buffer =  mr_alsa_audio_get_playback_buffer,
     .get_playback_buffer_size_in_frames = mr_alsa_audio_get_playback_buffer_size_in_frames,
@@ -804,7 +872,10 @@ static struct ravenna_mgr_ops g_ravenna_manager_ops = {
     .notify_master_volume_change = mr_alsa_audio_notify_master_volume_change,
     .notify_master_switch_change = mr_alsa_audio_notify_master_switch_change,
     .set_io_state = mr_alsa_audio_set_io_state,
-    .get_io_state = mr_alsa_audio_get_io_state
+    .get_io_state = mr_alsa_audio_get_io_state,
+    .set_pcm_sample_rate = mr_alsa_audio_set_pcm_sample_rate,
+    .get_pcm_sample_rate = mr_alsa_audio_get_pcm_sample_rate,
+    .get_pcm_frame_size = mr_alsa_audio_get_pcm_frame_size
 };
 
 
@@ -2345,7 +2416,7 @@ _err:
  * the chip into g_extra_chips before checking the error and let cleanup
  * happen at module unload via mr_alsa_audio_card_free.
  */
-int mr_alsa_audio_add_pcm(int pcm_id)
+int mr_alsa_audio_add_pcm(int pcm_id, uint32_t sample_rate)
 {
     struct mr_alsa_audio_chip *chip;
     int err;
@@ -2371,6 +2442,30 @@ int mr_alsa_audio_add_pcm(int pcm_id)
     if (!chip)
         return -ENOMEM;
     chip->dev = g_device;
+    /*
+     * Multi-rate Stage 2: stash the configured rate on the chip BEFORE
+     * chip_create runs register_alsa_driver. attach_alsa_driver in the
+     * manager reads this via ops->get_pcm_sample_rate, derives
+     * frame_size from it (with the manager's m_TICFrameSizeAt1FS), and
+     * publishes both fields via ops->set_pcm_sample_rate BEFORE the
+     * smp_store_release on the chip-slot pointer. So the first tick-
+     * path reader that acquire-loads the chip slot sees a coherent
+     * (rate, frame_size) pair on the chip.
+     *
+     * A plain assignment here (not smp_store_release) is fine because
+     * nothing reads the chip yet — it isn't in any published data
+     * structure until attach_alsa_driver runs.
+     *
+     * pcm_frame_size starts at 0 and is filled in by attach_alsa_driver
+     * via the ops vtable. A reader that somehow saw the chip before
+     * attach finished (impossible by construction — chip_create is
+     * single-threaded with respect to itself, and attach happens inside
+     * it) would observe frame_size=0, which is the safe-fail value the
+     * tick-path callbacks already handle (length=0 short-circuits the
+     * stream loops).
+     */
+    chip->pcm_sample_rate = sample_rate;
+    chip->pcm_frame_size  = 0;  /* attach_alsa_driver fills this in */
     err = mr_alsa_audio_chip_create(g_card, chip, g_ravenna_peer,
                                     g_mr_alsa_audio_ops, pcm_id);
     if (err < 0)
