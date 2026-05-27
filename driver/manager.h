@@ -54,12 +54,18 @@
 #define MAX_INTERFACE_NAME 64
 
 /*
- * Multi-PCM, Stage 1 (multi-rate project):
+ * Multi-PCM (multi-rate project):
  * PCM 0 is created at module load. Additional PCMs are added on demand via
- * MT_ALSA_Msg_AddPCM. All PCMs share PTP, NICs, sample rate, and the single
- * tick scheduler. MAX_PCMS bounds the per-card device index range.
+ * MT_ALSA_Msg_AddPCM. All PCMs share PTP and NICs. From Stage 2 onward each
+ * PCM carries its own sample rate and tick cadence (one hrtimer per unique
+ * rate). MAX_PCMS bounds the per-card device index range.
+ *
+ * Sized for the target deployment: HT chain @ 48k + music chain at up to
+ * five rates (44.1 / 48 / 88.2 / 96 / 176.4 / 192 kHz), 2 PCMs per chain
+ * pair — comfortably under 16. The marginal cost of the larger array is
+ * negligible (a few pointer slots per chip table).
  */
-#define MAX_PCMS 8
+#define MAX_PCMS 16
 
 #ifndef nullptr
     #define nullptr NULL
