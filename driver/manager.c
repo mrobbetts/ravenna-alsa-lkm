@@ -390,16 +390,27 @@ bool stopIO(struct TManager* self, bool is_playback)
 }
 
 //////////////////////////////////////////////////////////////////////////////////
-void UpdateFrameSize(struct TManager* self)
+/*
+ * Multi-rate Stage 2: compute frame_size (samples per TIC tick) for a
+ * given sample rate. Extracted from UpdateFrameSize so per-chip code
+ * paths (attach_alsa_driver, MT_ALSA_Msg_AddPCM handler, SetSamplingRate's
+ * chip-0 propagation) can call it without modifying manager-wide state.
+ *
+ * The math here is the same as the original UpdateFrameSize: nFS scales
+ * by power-of-two as the rate climbs the AES67 ladder, frame_size =
+ * tic_frame_size_at_1fs * nFS, capped at max_frame_size.
+ */
+uint32_t compute_frame_size_for_rate(uint32_t sample_rate, uint64_t tic_frame_size_at_1fs, uint32_t max_frame_size)
 {
     uint32_t ui32nFS;
-    if(IsDSDRate(self->m_SampleRate))
+    uint32_t frame_size;
+    if(IsDSDRate(sample_rate))
     {
         ui32nFS = 8;
     }
     else
     {
-        switch(self->m_SampleRate)
+        switch(sample_rate)
         {
             case 384000:
             case 352800:
@@ -420,13 +431,55 @@ void UpdateFrameSize(struct TManager* self)
                 break;
         }
     }
+    frame_size = (uint32_t)tic_frame_size_at_1fs * ui32nFS;
+    if(frame_size > max_frame_size)
+        frame_size = max_frame_size;
+    return frame_size;
+}
 
-    self->m_ui32FrameSize = (uint32_t)self->m_TICFrameSizeAt1FS * ui32nFS;
+bool is_valid_pcm_rate(uint32_t sample_rate)
+{
+    switch (sample_rate)
+    {
+        case 44100:
+        case 48000:
+        case 88200:
+        case 96000:
+        case 176400:
+        case 192000:
+        case 352800:
+        case 384000:
+            return true;
+        default:
+            return false;
+    }
+}
 
-    if(self->m_ui32FrameSize > self->m_MaxFrameSize)
-        self->m_ui32FrameSize = self->m_MaxFrameSize;
+void UpdateFrameSize(struct TManager* self)
+{
+    self->m_ui32FrameSize = compute_frame_size_for_rate(
+        self->m_SampleRate,
+        self->m_TICFrameSizeAt1FS,
+        self->m_MaxFrameSize);
 
     MTAL_DP("CManager::UpdateFrameSize() new TIC Frame Size = %u\n", self->m_ui32FrameSize);
+
+    /*
+     * Multi-rate Stage 2: chip 0 follows manager-wide m_SampleRate (its
+     * historical relationship from the single-PCM era). Chips 1+ have
+     * their rate locked at AddPCM time and are not touched here.
+     *
+     * SetSamplingRate / SetDSDSamplingRate require IO stopped before
+     * calling them, so the per-chip publish here can't race the tick
+     * path. We still use the smp_store_release-paired set_pcm_sample_rate
+     * for consistency with the rest of the per-chip publish discipline.
+     */
+    {
+        const struct ravenna_mgr_ops *frontend = smp_load_acquire(&self->m_alsa_driver_frontend);
+        void *chip0 = smp_load_acquire(&self->m_apALSAChip[0]);
+        if (frontend && chip0 && frontend->set_pcm_sample_rate)
+            frontend->set_pcm_sample_rate(chip0, self->m_SampleRate, self->m_ui32FrameSize);
+    }
 }
 
 //////////////////////////////////////////////////////////////////////////////////
@@ -1269,20 +1322,47 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             else
             {
                 struct MT_ALSA_AddPCM_args* args = (struct MT_ALSA_AddPCM_args*)msg_rcv->data;
+                uint32_t effective_rate;
                 MTAL_DP_INFO("MT_ALSA_Msg_AddPCM pcm_id=%d rate=%u in=%u out=%u\n",
                              args->pcm_id, args->sample_rate,
                              args->num_inputs, args->num_outputs);
-                /* Stage 1: shared rate. Refuse mismatched per-PCM rates so
-                 * the daemon learns about the Stage 2 dependency early. */
-                if (args->sample_rate != 0 && args->sample_rate != self->m_SampleRate)
+                /*
+                 * Multi-rate Stage 2: per-PCM rates are now accepted. The
+                 * effective rate is args->sample_rate if non-zero (the
+                 * daemon explicitly requested this chip be at rate X), or
+                 * the manager-wide m_SampleRate otherwise (legacy
+                 * "inherit default" semantics, also used when daemon
+                 * doesn't yet populate DeviceGroup.sample_rate — Stage 2
+                 * task #6).
+                 *
+                 * Validate args->sample_rate against the supported PCM
+                 * rate set if it was specified. We do NOT validate
+                 * m_SampleRate as a fallback because DEFAULT_SAMPLERATE
+                 * is always valid by construction; and the daemon's own
+                 * SetSampleRate has already validated whatever was
+                 * configured.
+                 *
+                 * The tick scheduling (single hrtimer at manager rate)
+                 * still belongs to the manager-wide value in this
+                 * commit; Stage 2 task #4 splits it into one hrtimer per
+                 * unique rate. Until then chips at rates other than
+                 * m_SampleRate will receive ticks at the wrong cadence
+                 * and emit malformed RTP. We accept the AddPCM regardless
+                 * so the kernel-side relaxation is in place ahead of the
+                 * matching daemon-side change in task #6; the daemon
+                 * stays single-rate until task #4 lands.
+                 */
+                if (args->sample_rate != 0 && !is_valid_pcm_rate(args->sample_rate))
                 {
-                    MTAL_DP_ERR("MT_ALSA_Msg_AddPCM rate %u != manager rate %u (Stage 1: shared rate only)\n",
-                                args->sample_rate, self->m_SampleRate);
+                    MTAL_DP_ERR("MT_ALSA_Msg_AddPCM rate %u not in supported PCM set\n",
+                                args->sample_rate);
                     msg_reply.errCode = -EINVAL;
                 }
                 else
                 {
-                    int err = mr_alsa_audio_add_pcm(args->pcm_id);
+                    int err;
+                    effective_rate = args->sample_rate ? args->sample_rate : self->m_SampleRate;
+                    err = mr_alsa_audio_add_pcm(args->pcm_id, effective_rate);
                     msg_reply.errCode = err;
                 }
             }
@@ -1664,6 +1744,160 @@ unsigned char get_live_out_mute_pattern(void* user, uint32_t ulChannelId)
 }
 
 //////////////////////////////////////////////////////////////////////////////////
+// Multi-rate Stage 2: per-PCM tick-path callbacks.
+//
+// These resolve the owning chip from pcm_id (m_uiPCMId on the stream),
+// acquire-load the chip slot, and route to the chip's own rate / buffers.
+// Used by RTP_audio_stream.c hot paths in place of the manager-wide
+// variants so streams at different rates compute frame size and buffer
+// offsets correctly for their own rate.
+//
+// Safe-fail on bad pcm_id or empty slot: length=0, offset=0, pattern=0.
+// Returning 0 lengths short-circuits hot-path loops (min(length-offset,N)
+// becomes 0; the loop body then iterates zero times).
+//////////////////////////////////////////////////////////////////////////////////
+static void* resolve_chip(struct TManager* self, uint32_t pcm_id, const struct ravenna_mgr_ops **out_frontend)
+{
+    void *chip;
+    const struct ravenna_mgr_ops *frontend;
+    if (pcm_id >= smp_load_acquire(&self->m_uPCMCount))
+    {
+        if (out_frontend)
+            *out_frontend = NULL;
+        return NULL;
+    }
+    frontend = smp_load_acquire(&self->m_alsa_driver_frontend);
+    chip = smp_load_acquire(&self->m_apALSAChip[pcm_id]);
+    if (!chip || !frontend)
+    {
+        if (out_frontend)
+            *out_frontend = NULL;
+        return NULL;
+    }
+    if (out_frontend)
+        *out_frontend = frontend;
+    return chip;
+}
+
+uint32_t get_frame_size_for_pcm(void* user, uint32_t pcm_id)
+{
+    struct TManager* self = (struct TManager*)user;
+    const struct ravenna_mgr_ops *frontend = NULL;
+    void *chip = resolve_chip(self, pcm_id, &frontend);
+    if (!chip || !frontend || !frontend->get_pcm_frame_size)
+        return 0;
+    return frontend->get_pcm_frame_size(chip);
+}
+
+uint32_t get_live_in_jitter_buffer_length_for_pcm(void* user, uint32_t pcm_id)
+{
+    struct TManager* self = (struct TManager*)user;
+    const struct ravenna_mgr_ops *frontend = NULL;
+    void *chip = resolve_chip(self, pcm_id, &frontend);
+    if (!chip || !frontend)
+        return 0;
+    return frontend->get_capture_buffer_size_in_frames(chip);
+}
+
+uint32_t get_live_out_jitter_buffer_length_for_pcm(void* user, uint32_t pcm_id)
+{
+    struct TManager* self = (struct TManager*)user;
+    const struct ravenna_mgr_ops *frontend = NULL;
+    void *chip = resolve_chip(self, pcm_id, &frontend);
+    if (!chip || !frontend)
+        return 0;
+    return frontend->get_playback_buffer_size_in_frames(chip);
+}
+
+uint32_t get_live_in_jitter_buffer_offset_for_pcm(void* user, uint32_t pcm_id, const uint64_t ui64CurrentSAC)
+{
+    uint32_t len = get_live_in_jitter_buffer_length_for_pcm(user, pcm_id);
+    if (len == 0)
+        return 0;
+    return (uint32_t)CW_ll_modulo(ui64CurrentSAC, len);
+}
+
+uint32_t get_live_out_jitter_buffer_offset_for_pcm(void* user, uint32_t pcm_id, const uint64_t ui64CurrentSAC)
+{
+    struct TManager* self = (struct TManager*)user;
+    const struct ravenna_mgr_ops *frontend = NULL;
+    void *chip = resolve_chip(self, pcm_id, &frontend);
+    if (!chip || !frontend)
+        return 0;
+    #if defined(MT_TONE_TEST) || defined(MT_RAMP_TEST) || defined(MTLOOPBACK) || defined(MTTRANSPARENCY_CHECK)
+    {
+        /* Test/loopback paths: simple modulo against the ring length. */
+        uint32_t test_len = frontend->get_playback_buffer_size_in_frames(chip);
+        if (test_len == 0)
+            return 0;
+        return (uint32_t)CW_ll_modulo(ui64CurrentSAC, test_len);
+    }
+    #else
+    {
+        /* Production path mirrors the manager-wide
+         * get_live_out_jitter_buffer_offset (chip 0) but reads everything
+         * per-PCM via the chip slot we just resolved. fsize falls back to
+         * the manager-wide value if pcm_frame_size hasn't been published
+         * yet (shouldn't happen — attach_alsa_driver publishes before the
+         * chip slot — but the safe-fail keeps a misordering bug from
+         * producing garbage arithmetic). */
+        uint32_t offset = frontend->get_playback_buffer_offset(chip);
+        uint32_t len = frontend->get_playback_buffer_size_in_frames(chip);
+        uint32_t fsize = frontend->get_pcm_frame_size ? frontend->get_pcm_frame_size(chip) : 0;
+        uint64_t global_sac;
+        uint32_t sac_offset;
+        if (fsize == 0)
+            fsize = self->m_ui32FrameSize;
+        global_sac = get_global_SAC(self);
+        if (ui64CurrentSAC > global_sac)
+        {
+            MTAL_DP("get_live_out_jitter_buffer_offset_for_pcm(pcm=%u): bad SAC request (%llu > global %llu)\n",
+                    pcm_id, ui64CurrentSAC, global_sac);
+            return 0;
+        }
+        sac_offset = (uint32_t)(global_sac - fsize - ui64CurrentSAC);
+        if (sac_offset > 0 && len > 0)
+        {
+            if (sac_offset <= offset)
+                offset -= sac_offset;
+            else
+                offset += len - sac_offset;
+        }
+        return offset;
+    }
+    #endif
+}
+
+unsigned char get_live_in_mute_pattern_for_pcm(void* user, uint32_t pcm_id, uint32_t ulChannelId)
+{
+    /* Mute pattern is rate-mode-dependent (PCM vs DSD); per chip's own
+     * rate, not manager-wide. */
+    struct TManager* self = (struct TManager*)user;
+    const struct ravenna_mgr_ops *frontend = NULL;
+    void *chip = resolve_chip(self, pcm_id, &frontend);
+    uint32_t rate;
+    if (!chip || !frontend || !frontend->get_pcm_sample_rate)
+        return 0;
+    rate = frontend->get_pcm_sample_rate(chip);
+    switch (GetAudioModeFromRate(rate))
+    {
+        case AM_PCM:
+            return 0;
+        case AM_DSD64:
+        case AM_DSD128:
+        case AM_DSD256:
+            return 0x55;
+    }
+    return 0;
+}
+
+unsigned char get_live_out_mute_pattern_for_pcm(void* user, uint32_t pcm_id, uint32_t ulChannelId)
+{
+    /* Same pattern logic as in; share the implementation. */
+    return get_live_in_mute_pattern_for_pcm(user, pcm_id, ulChannelId);
+}
+
+//////////////////////////////////////////////////////////////////////////////////
 // Caudio_streamer_clock_PTP_callback
 //////////////////////////////////////////////////////////////////////////////////
 void AudioFrameTIC(void* user)
@@ -1823,6 +2057,17 @@ void Init_C_Callbacks(struct TManager* self)
     self->m_c_callbacks.get_live_in_mute_pattern = &get_live_in_mute_pattern;
     self->m_c_callbacks.get_live_out_mute_pattern = &get_live_out_mute_pattern;
     self->m_c_callbacks.get_live_buffer_for_pcm = &get_live_buffer_for_pcm;
+    /* Multi-rate Stage 2: per-PCM tick-path variants used by RTP streams
+     * on the hot path. RTP_audio_stream.c calls these with the stream's
+     * pcm_id (TRTP_stream_info::m_uiPCMId) so streams at different rates
+     * compute frame size / buffer offsets against their own chip's state. */
+    self->m_c_callbacks.get_frame_size_for_pcm = &get_frame_size_for_pcm;
+    self->m_c_callbacks.get_live_in_jitter_buffer_length_for_pcm = &get_live_in_jitter_buffer_length_for_pcm;
+    self->m_c_callbacks.get_live_out_jitter_buffer_length_for_pcm = &get_live_out_jitter_buffer_length_for_pcm;
+    self->m_c_callbacks.get_live_in_jitter_buffer_offset_for_pcm = &get_live_in_jitter_buffer_offset_for_pcm;
+    self->m_c_callbacks.get_live_out_jitter_buffer_offset_for_pcm = &get_live_out_jitter_buffer_offset_for_pcm;
+    self->m_c_callbacks.get_live_in_mute_pattern_for_pcm = &get_live_in_mute_pattern_for_pcm;
+    self->m_c_callbacks.get_live_out_mute_pattern_for_pcm = &get_live_out_mute_pattern_for_pcm;
     //m_c_dispatch_callbacks.user = this;
     //m_c_dispatch_callbacks.DispatchPacket = &DispatchPacket;
     self->m_c_audio_streamer_clock_PTP_callback.user = self;
@@ -1875,6 +2120,40 @@ int attach_alsa_driver(void* user, const struct ravenna_mgr_ops *ops, void *alsa
      * struct visible. */
     if (!READ_ONCE(self->m_alsa_driver_frontend))
         smp_store_release(&self->m_alsa_driver_frontend, ops);
+    /*
+     * Multi-rate Stage 2: establish the chip's pcm_sample_rate /
+     * pcm_frame_size BEFORE the slot publish below. Two cases:
+     *
+     *  (a) Chip 0 at probe: mr_alsa_audio_chip_probe didn't pre-set a
+     *      rate, so the chip's pcm_sample_rate is 0 (from kzalloc) when
+     *      it reaches attach. Inherit the manager's current m_SampleRate
+     *      (= DEFAULT_SAMPLERATE at probe time, then updated when the
+     *      daemon sends MT_ALSA_Msg_SetSampleRate via SetSamplingRate
+     *      → UpdateFrameSize → set_pcm_sample_rate on chip 0).
+     *
+     *  (b) Chips 1+ via mr_alsa_audio_add_pcm: the caller pre-stashed a
+     *      rate on chip->pcm_sample_rate before chip_create ran. Honor
+     *      it. (The AddPCM handler is what decides the effective rate
+     *      from args->sample_rate or m_SampleRate.)
+     *
+     * In both cases we compute frame_size from the chosen rate and
+     * publish both fields via the ops vtable's smp_store_release before
+     * publishing the slot pointer. The publish-before-slot ordering
+     * ensures that any reader who acquire-loads the chip slot and then
+     * the chip's rate/frame_size sees a coherent pair.
+     */
+    if (ops->set_pcm_sample_rate && ops->get_pcm_sample_rate)
+    {
+        uint32_t chip_rate = ops->get_pcm_sample_rate(alsa_chip_pointer);
+        uint32_t effective_rate = chip_rate ? chip_rate : self->m_SampleRate;
+        uint32_t fsize = compute_frame_size_for_rate(
+            effective_rate,
+            self->m_TICFrameSizeAt1FS,
+            self->m_MaxFrameSize);
+        ops->set_pcm_sample_rate(alsa_chip_pointer, effective_rate, fsize);
+        MTAL_DP("attach_alsa_driver: pcm_id %d rate=%u frame_size=%u (chip-prestashed=%u)\n",
+                pcm_id, effective_rate, fsize, chip_rate);
+    }
     /* Publish the slot with release semantics so the hrtimer reader sees
      * the chip pointer only after the chip itself is fully constructed. */
     smp_store_release(&self->m_apALSAChip[pcm_id], alsa_chip_pointer);
