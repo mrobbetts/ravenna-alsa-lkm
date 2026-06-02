@@ -171,6 +171,8 @@ extern "C"
 
  uint64_t get_ptp_global_SAC(TClock_PTP* self);
  uint64_t get_ptp_global_time(TClock_PTP* self);
+ /* Multi-rate Stage 3: rate this clock's SAC is counted at (for per-PCM SAC scaling). */
+ uint32_t get_ptp_sampling_rate(TClock_PTP* self);
 
  void ResetPTPLock(TClock_PTP* self, bool bUseMutex);
  
