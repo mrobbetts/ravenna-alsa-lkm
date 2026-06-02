@@ -794,8 +794,13 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 
 		//MTAL_DP("ui32RTPSAC %u  perfcounter %llu\n", ui32RTPSAC, MTAL_LK_GetCounterTime());
 		// ui32UsedSAC is the first frame SAC when this packet will be used
-		/* Multi-rate Stage 2: frame_size is per-PCM. */
-		ui64UsedSAC = (ui64RTPSAC - (CW_ll_modulo(ui64RTPSAC, pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId))));
+		/* Multi-rate Stage 2/3: frame_size is per-PCM and is the modulo
+		 * divisor here — guard against 0 (unresolvable pcm_id) to avoid a
+		 * div-by-zero. 0 => leave ui64UsedSAC unaligned (debug stat only). */
+		{
+			uint32_t ui32DbgFrameSize = pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId);
+			ui64UsedSAC = (ui32DbgFrameSize != 0) ? (ui64RTPSAC - CW_ll_modulo(ui64RTPSAC, ui32DbgFrameSize)) : ui64RTPSAC;
+		}
 
 		i64DeltaSAC =  ui64UsedSAC - ui64GlobalSAC;
 		//MTAL_DP("i64DeltaSAC %llu playout delay %u, frame size: %u\n", i64DeltaSAC, pRTP_stream_info->m_ui32PlayOutDelay, pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId));
@@ -1091,12 +1096,21 @@ void PrepareBufferLives(TRTP_audio_stream* self)
 				if (pEth_netfilter->nic_id == 0)
 				{ // ST2022-7: the stream on NIC 0 is going the mute job; no need to do it again on the stream (on NIC 1)
 					uint32_t ui32Offset;
+					/* Multi-rate Stage 2/3: per-PCM frame size is the DIVISOR below.
+					 * get_frame_size_for_pcm returns 0 when this stream's pcm_id
+					 * doesn't resolve to a live chip (bad/stale m_uiPCMId, or a PCM
+					 * removed under it). Dividing by 0 here would oops in softirq.
+					 * Skip the mute bookkeeping entirely in that case — a stream
+					 * with no live chip has nothing to mute. (At single-PCM /
+					 * pcm_id==0 this is always non-zero, so no behaviour change.) */
+					uint32_t ui32PcmFrameSize = pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId);
 					MTAL_RtTraceEvent(RTTRACEEVENT_SINK_LIVE_MUTED + pEth_netfilter->nic_id, (PVOID)(RT_TRACE_EVENT_OCCURENCE), 0);
 
 					/* Multi-rate Stage 2/3: per-PCM offset/length/frame_size/SAC. */
 					ui32Offset = pManager->get_live_in_jitter_buffer_offset_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId, pManager->get_global_SAC_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId));
 
-					if (self->m_ulLivesInDMCounter < pManager->get_live_in_jitter_buffer_length_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId) / pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId))
+					if (ui32PcmFrameSize != 0 &&
+						self->m_ulLivesInDMCounter < pManager->get_live_in_jitter_buffer_length_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId) / ui32PcmFrameSize)
 					{
 						unsigned short us;
 						if (self->m_ulLivesInDMCounter == 0)
