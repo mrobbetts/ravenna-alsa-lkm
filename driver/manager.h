@@ -233,6 +233,10 @@ unsigned char get_live_out_mute_pattern(void* user, uint32_t /*ulChannelId*/);
  * different rates (different frame_size per tick, different buffer
  * lengths if Stage 4 grows per-chip ring-buffer sizing).
  */
+/* Per-PCM SAC: the chip's media clock (sample count at the chip's own
+ * rate), derived from the anchoring PTP clock's SAC scaled by
+ * chip_rate/clock_rate. Identity when chip_rate == clock_rate. */
+uint64_t get_global_SAC_for_pcm(void* user, uint32_t pcm_id);
 uint32_t get_frame_size_for_pcm(void* user, uint32_t pcm_id);
 uint32_t get_live_in_jitter_buffer_length_for_pcm(void* user, uint32_t pcm_id);
 uint32_t get_live_out_jitter_buffer_length_for_pcm(void* user, uint32_t pcm_id);
