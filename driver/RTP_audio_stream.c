@@ -683,7 +683,12 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 #endif //DEBUG_CHECK
 
 	ui32RTPSAC = ui32RTPTimeStamp;
-	ui64GlobalSAC = pManager->get_global_SAC(pManager->user);
+	/* Multi-rate Stage 3: the incoming 32-bit RTP timestamp is in THIS
+	 * stream's media clock (its rate). We expand it to 64 bits by stitching
+	 * on the high bits of the global SAC, so that SAC must be in the same
+	 * rate — i.e. this PCM's SAC, not the manager-wide one. With a
+	 * different-rate manager SAC the wrap thresholds below would mis-stitch. */
+	ui64GlobalSAC = pManager->get_global_SAC_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId);
 	ui64RTPSAC = (ui64GlobalSAC & 0xFFFFFFFF00000000) | ui32RTPSAC;
 
 	//MTAL_DP("ui64RTPSAC = 0x%llx ui64GlobalSAC = 0x%llx\n", ui64RTPSAC, ui64GlobalSAC);
@@ -773,6 +778,12 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 		uint64_t ui64GlobalSAC, ui64GlobalTime, ui64GlobalPerformanceCounter, ui64Now, ui64UsedSAC, ui64UsedTime;
 		int64_t i64DeltaSAC;
 		uint32_t ui32MinSinkAheadTime;
+		/* Multi-rate Stage 3 caveat: this DEBUG_CHECK-only path reads the
+		 * manager-wide SAC via get_global_times; under multi-rate the
+		 * i64DeltaSAC below mixes rate domains (ui64RTPSAC is per-stream).
+		 * If this instrumentation is ever enabled with mixed-rate PCMs,
+		 * add a get_global_times_for_pcm variant. Left as-is since it's
+		 * compiled out by default. */
 		pManager->get_global_times(pManager->user, &ui64GlobalSAC, &ui64GlobalTime, &ui64GlobalPerformanceCounter);
 		//MTAL_DP("GlobalSAC = %llu  GlobalTime= %llu  GlobalPerfmon = %llu\n", ui64GlobalSAC, ui64GlobalTime, ui64GlobalPerformanceCounter);
 
@@ -857,7 +868,8 @@ int SendRTPAudioPackets(TRTP_audio_stream* self)
 	ui32NbOfSampleRemaining = pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId);
 
 	// Ravenna protocol: we must put in the RTP's time stamp the SAC when the audio was produced
-	ui64CurrentSAC = pManager->get_global_SAC(pManager->user) - pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId);
+	/* Multi-rate Stage 3: per-PCM SAC (this stream's media clock at its own rate). */
+	ui64CurrentSAC = pManager->get_global_SAC_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId) - pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId);
 	ui32Offset = pManager->get_live_out_jitter_buffer_offset_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId, ui64CurrentSAC); // [smpl]
 
 
@@ -1035,9 +1047,11 @@ int IsLivesInMustBeMuted(TRTP_audio_stream* self)
 {
 	// check if the audio for the current (i.e. at GlobalSAC()) frame was filled.
 	//return 0;
-	/* Multi-rate Stage 2: frame_size is per-PCM. */
+	/* Multi-rate Stage 2/3: frame_size AND SAC are per-PCM. m_ui64LastAudioSampleReceivedSAC
+	 * is in this stream's rate (RTP timestamps), so the global SAC it's compared against
+	 * must be this PCM's SAC, not the manager-wide one. */
 	TRTP_stream_info* pRTP_stream_info = &self->m_tRTPStream.m_RTP_stream_info;
-	return (signed)(self->m_tRTPStream.m_ui64LastAudioSampleReceivedSAC - self->m_pManager->get_global_SAC(self->m_pManager->user)) < (signed)self->m_pManager->get_frame_size_for_pcm(self->m_pManager->user, pRTP_stream_info->m_uiPCMId);
+	return (signed)(self->m_tRTPStream.m_ui64LastAudioSampleReceivedSAC - self->m_pManager->get_global_SAC_for_pcm(self->m_pManager->user, pRTP_stream_info->m_uiPCMId)) < (signed)self->m_pManager->get_frame_size_for_pcm(self->m_pManager->user, pRTP_stream_info->m_uiPCMId);
 }
 
 //////////////////////////////////////////////////////////////
@@ -1079,16 +1093,16 @@ void PrepareBufferLives(TRTP_audio_stream* self)
 					uint32_t ui32Offset;
 					MTAL_RtTraceEvent(RTTRACEEVENT_SINK_LIVE_MUTED + pEth_netfilter->nic_id, (PVOID)(RT_TRACE_EVENT_OCCURENCE), 0);
 
-					/* Multi-rate Stage 2: per-PCM offset/length/frame_size. */
-					ui32Offset = pManager->get_live_in_jitter_buffer_offset_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId, pManager->get_global_SAC(pManager->user));
+					/* Multi-rate Stage 2/3: per-PCM offset/length/frame_size/SAC. */
+					ui32Offset = pManager->get_live_in_jitter_buffer_offset_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId, pManager->get_global_SAC_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId));
 
 					if (self->m_ulLivesInDMCounter < pManager->get_live_in_jitter_buffer_length_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId) / pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId))
 					{
 						unsigned short us;
 						if (self->m_ulLivesInDMCounter == 0)
 						{
-							delta = self->m_tRTPStream.m_ui64LastAudioSampleReceivedSAC - pManager->get_global_SAC(pManager->user);
-							MTAL_DP("sink %s: is muted at globalSAC = %llu (delta = %lld)\n", pRTP_stream_info->m_cName, pManager->get_global_SAC(pManager->user), delta);
+							delta = self->m_tRTPStream.m_ui64LastAudioSampleReceivedSAC - pManager->get_global_SAC_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId);
+							MTAL_DP("sink %s: is muted at globalSAC = %llu (delta = %lld)\n", pRTP_stream_info->m_cName, pManager->get_global_SAC_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId), delta);
 						}
 						self->m_ulLivesInDMCounter++;
 
@@ -1113,7 +1127,7 @@ void PrepareBufferLives(TRTP_audio_stream* self)
 			{
 				if (self->m_ulLivesInDMCounter != 0)
 				{
-					MTAL_DP("sink %s: is no longer muted globalSAC = %llu\n", pRTP_stream_info->m_cName, pManager->get_global_SAC(pManager->user));
+					MTAL_DP("sink %s: is no longer muted globalSAC = %llu\n", pRTP_stream_info->m_cName, pManager->get_global_SAC_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId));
 					self->m_ulLivesInDMCounter = 0;
 				}
 			}

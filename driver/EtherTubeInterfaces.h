@@ -115,6 +115,10 @@ typedef struct
 	 * of range or the slot is empty they return a safe zero/no-op value
 	 * (length=0, offset=0, mute_pattern=0).
 	 */
+	/* Multi-rate Stage 3: per-PCM SAC (chip's media clock at its own rate,
+	 * locked to the shared PTP wall clock). Used by RTP timestamp / buffer
+	 * offset hot paths so streams at different rates stay PTP-coherent. */
+	uint64_t (*get_global_SAC_for_pcm)(void* self, uint32_t pcm_id);
 	uint32_t (*get_frame_size_for_pcm)(void* self, uint32_t pcm_id);
 	uint32_t (*get_live_in_jitter_buffer_length_for_pcm)(void* self, uint32_t pcm_id);
 	uint32_t (*get_live_out_jitter_buffer_length_for_pcm)(void* self, uint32_t pcm_id);

@@ -1251,3 +1251,14 @@ uint64_t get_ptp_global_time(TClock_PTP* self)
 {
     return self->m_ui64GlobalTime;
 }
+
+///////////////////////////////////////////////////////////////////////////////
+/* Multi-rate Stage 3: the sampling rate this clock's SAC is counted at.
+ * Used by the manager's per-PCM SAC derivation to scale this clock's SAC
+ * to a chip running at a different rate. m_ui32SamplingRate is set in
+ * StartAudioFrameTICTimer (IO stopped); a plain word-sized read here is
+ * fine for the hot path. */
+uint32_t get_ptp_sampling_rate(TClock_PTP* self)
+{
+    return self->m_ui32SamplingRate;
+}

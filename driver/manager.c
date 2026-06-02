@@ -1513,6 +1513,86 @@ uint64_t get_global_SAC(void* user)
     struct TManager* self = (struct TManager*)user;
     return get_ptp_global_SAC(&self->m_PTP[self->m_Active_PTP_NIC_Idx]);
 }
+
+/* Forward decl: defined with the other per-PCM tick-path helpers below. */
+static void* resolve_chip(struct TManager* self, uint32_t pcm_id, const struct ravenna_mgr_ops **out_frontend);
+
+//////////////////////////////////////////////////////////////////////////////////
+/*
+ * Multi-rate Stage 3: domain-ready clock resolver.
+ *
+ * This is the SINGLE chokepoint that maps a pcm_id to the PTP clock that
+ * anchors it, instead of scattering &m_PTP[m_Active_PTP_NIC_Idx] across the
+ * per-PCM SAC code. Today every PCM is anchored to the one active clock of
+ * the single PTP domain, so pcm_id is ignored. When multi-domain lands
+ * (Stage 9), this is where pcm_id -> domain -> that domain's active clock
+ * gets resolved, and it's the ONLY site that needs to change — the per-PCM
+ * SAC callers below stay as-is.
+ */
+static TClock_PTP* get_clock_for_pcm(struct TManager* self, uint32_t pcm_id)
+{
+    (void)pcm_id; /* single-domain: all PCMs share the active clock */
+    return &self->m_PTP[self->m_Active_PTP_NIC_Idx];
+}
+
+//////////////////////////////////////////////////////////////////////////////////
+/*
+ * Multi-rate Stage 3: per-PCM SAC.
+ *
+ * Each chip's media clock is a sample counter at the chip's own rate,
+ * locked to the shared PTP wall clock. We derive it by scaling the
+ * anchoring clock's SAC by (chip_rate / clock_rate):
+ *
+ *     chip_sac = clock_sac * chip_rate / clock_rate
+ *
+ * Properties:
+ *  - Exact identity when chip_rate == clock_rate (the single-rate case
+ *    today), so this is a zero-behaviour-change refactor for chips at the
+ *    manager rate.
+ *  - Units-safe: clock_sac is already a sample count, so the ratio is
+ *    dimensionless — no dependence on the PTP time-unit conventions.
+ *  - Continuous across a rate change: clock_sac tracks the PTP wall clock,
+ *    so re-deriving at a new chip_rate produces no timestamp discontinuity
+ *    (this is what makes live SetPCMRate clean — Stage 5).
+ *
+ * Frame alignment is NOT applied here; callers (RTP_audio_stream.c) do
+ * their own modulo-by-frame-size alignment as needed, exactly as they did
+ * with the manager-wide SAC.
+ *
+ * Safe-fail: if the chip can't be resolved, or either rate is 0, fall back
+ * to the unscaled clock SAC (i.e. the legacy manager-wide value).
+ */
+uint64_t get_global_SAC_for_pcm(void* user, uint32_t pcm_id)
+{
+    struct TManager* self = (struct TManager*)user;
+    const struct ravenna_mgr_ops *frontend = NULL;
+    void *chip = resolve_chip(self, pcm_id, &frontend);
+    TClock_PTP* clock = get_clock_for_pcm(self, pcm_id);
+    uint64_t clock_sac = get_ptp_global_SAC(clock);
+    uint32_t clock_rate;
+    uint32_t chip_rate;
+    uint64_t whole, frac;
+
+    if (!chip || !frontend || !frontend->get_pcm_sample_rate)
+        return clock_sac;
+
+    clock_rate = get_ptp_sampling_rate(clock);
+    chip_rate  = frontend->get_pcm_sample_rate(chip);
+    if (clock_rate == 0 || chip_rate == 0 || chip_rate == clock_rate)
+        return clock_sac;
+
+    /*
+     * Overflow-safe clock_sac * chip_rate / clock_rate. Split into the
+     * whole-quotient and remainder parts so neither intermediate product
+     * overflows u64 for realistic SAC magnitudes and rates (<= 384 kHz):
+     *   - (clock_sac / clock_rate) * chip_rate : ~seconds * rate, well within u64
+     *   - (clock_sac % clock_rate) * chip_rate : remainder < clock_rate (<=384k)
+     *     times chip_rate (<=384k) < ~1.5e11, far below u64 max
+     */
+    whole = (clock_sac / clock_rate) * (uint64_t)chip_rate;
+    frac  = ((clock_sac % clock_rate) * (uint64_t)chip_rate) / clock_rate;
+    return whole + frac;
+}
 //////////////////////////////////////////////////////////////////////////////////
 uint64_t get_global_time(void* user)
 {
@@ -1848,7 +1928,9 @@ uint32_t get_live_out_jitter_buffer_offset_for_pcm(void* user, uint32_t pcm_id, 
         uint32_t sac_offset;
         if (fsize == 0)
             fsize = self->m_ui32FrameSize;
-        global_sac = get_global_SAC(self);
+        /* Stage 3: per-chip SAC (was manager-wide get_global_SAC in the
+         * Stage 2 first cut — correct only for chips at the manager rate). */
+        global_sac = get_global_SAC_for_pcm(self, pcm_id);
         if (ui64CurrentSAC > global_sac)
         {
             MTAL_DP("get_live_out_jitter_buffer_offset_for_pcm(pcm=%u): bad SAC request (%llu > global %llu)\n",
@@ -2061,6 +2143,7 @@ void Init_C_Callbacks(struct TManager* self)
      * on the hot path. RTP_audio_stream.c calls these with the stream's
      * pcm_id (TRTP_stream_info::m_uiPCMId) so streams at different rates
      * compute frame size / buffer offsets against their own chip's state. */
+    self->m_c_callbacks.get_global_SAC_for_pcm = &get_global_SAC_for_pcm;
     self->m_c_callbacks.get_frame_size_for_pcm = &get_frame_size_for_pcm;
     self->m_c_callbacks.get_live_in_jitter_buffer_length_for_pcm = &get_live_in_jitter_buffer_length_for_pcm;
     self->m_c_callbacks.get_live_out_jitter_buffer_length_for_pcm = &get_live_out_jitter_buffer_length_for_pcm;
