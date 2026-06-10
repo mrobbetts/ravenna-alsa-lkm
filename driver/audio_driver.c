@@ -106,8 +106,9 @@ static struct platform_device *g_device;
 static struct snd_card *g_card; /* the single card; PCMs 0..N-1 attach here */
 /* Extra chips (PCMs 1..MAX_PCMS-1) created via mr_alsa_audio_add_pcm().
  * PCM 0's chip is card->private_data and is freed by mr_alsa_audio_card_free.
- * Extra chips are kzalloc'd and freed in mr_alsa_audio_card_free below. */
-#define MR_ALSA_MAX_EXTRA_PCMS 7
+ * Extra chips are kzalloc'd and freed in mr_alsa_audio_card_free below.
+ * MR_ALSA_MAX_EXTRA_PCMS now lives in audio_driver.h, pinned to
+ * MAX_PCMS - 1 by a _Static_assert in manager.h. */
 static struct mr_alsa_audio_chip *g_extra_chips[MR_ALSA_MAX_EXTRA_PCMS];
 static int g_extra_chip_count;
 static void *g_ravenna_peer;
@@ -187,9 +188,14 @@ struct mr_alsa_audio_chip
      * smp_store_release; readers (softirq context: TIC tick, RTP stream
      * hot paths) use smp_load_acquire — same publish discipline as the
      * chip-slot pointer in the manager.
+     *
+     * 2026-06-09 review fix (F3): rate and frame_size are PACKED into one
+     * u64 (rate in the high 32 bits, frame_size in the low 32) published
+     * with a single release-store, so a reader can never observe a rate
+     * from one generation paired with a frame_size from another. Access
+     * only via mr_alsa_audio_{set,get}_pcm_sample_rate/frame_size.
      */
-    uint32_t pcm_sample_rate;
-    uint32_t pcm_frame_size;
+    uint64_t pcm_rate_and_frame;
 
     unsigned int current_rate;  /// updated on each alsa hw_params and prepare
     unsigned int current_dsd;   /// 0 for pcm, 1 for dsd64, 2 for dsd128, 4 for dsd256. updated on each alsa hw_params and prepare
@@ -924,12 +930,10 @@ static void mr_alsa_audio_set_pcm_sample_rate(void *mr_alsa_audio_chip, uint32_t
     struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip *)mr_alsa_audio_chip;
     if (!chip)
         return;
-    /* Publish rate first, then frame_size. Readers below acquire-load in
-     * the opposite order so they see a consistent pair as long as the
-     * publisher serialized both writes (which the manager does — see
-     * update_chip_rate_and_frame_size in manager.c). */
-    smp_store_release(&chip->pcm_sample_rate, rate);
-    smp_store_release(&chip->pcm_frame_size, frame_size);
+    /* F3: single release-store of the packed pair — readers can never
+     * see a torn (rate, frame_size) combination. */
+    smp_store_release(&chip->pcm_rate_and_frame,
+                      ((uint64_t)rate << 32) | (uint64_t)frame_size);
 }
 
 static uint32_t mr_alsa_audio_get_pcm_sample_rate(void *mr_alsa_audio_chip)
@@ -937,7 +941,7 @@ static uint32_t mr_alsa_audio_get_pcm_sample_rate(void *mr_alsa_audio_chip)
     struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip *)mr_alsa_audio_chip;
     if (!chip)
         return 0;
-    return smp_load_acquire(&chip->pcm_sample_rate);
+    return (uint32_t)(smp_load_acquire(&chip->pcm_rate_and_frame) >> 32);
 }
 
 static uint32_t mr_alsa_audio_get_pcm_frame_size(void *mr_alsa_audio_chip)
@@ -945,7 +949,7 @@ static uint32_t mr_alsa_audio_get_pcm_frame_size(void *mr_alsa_audio_chip)
     struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip *)mr_alsa_audio_chip;
     if (!chip)
         return 0;
-    return smp_load_acquire(&chip->pcm_frame_size);
+    return (uint32_t)(smp_load_acquire(&chip->pcm_rate_and_frame) & 0xFFFFFFFFu);
 }
 
 static struct ravenna_mgr_ops g_ravenna_manager_ops = {
@@ -1146,7 +1150,9 @@ static int mr_alsa_audio_pcm_prepare(struct snd_pcm_substream *substream)
         else if(substream->stream == SNDRV_PCM_STREAM_CAPTURE)
         {
             uint32_t offset = 0;
-            chip->mr_alsa_audio_ops->get_input_jitter_buffer_offset(chip->ravenna_peer, &offset);
+            /* 2026-06-09 review fix: per-PCM offset — this chip's ring and
+             * SAC, not chip 0's (chip->pcm->device == pcm_id). */
+            chip->mr_alsa_audio_ops->get_input_jitter_buffer_offset_for_pcm(chip->ravenna_peer, (uint32_t)chip->pcm->device, &offset);
             
             printk(KERN_DEBUG "mr_alsa_audio_pcm_prepare for capture stream\n");
             if(chip->ravenna_peer)
@@ -2425,6 +2431,16 @@ static int mr_alsa_audio_create_pcm(struct snd_card *card,
         return err;
     }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+    /* 2026-06-09 review fix: attach managed buffers BEFORE the chardev
+     * becomes visible. snd_device_register fires the uevent that lets
+     * userspace open the node; a client whose open/hw_params landed in
+     * the old ordering's window got runtime->dma_area == NULL and the
+     * next TIC's copy NULL-dereffed in tasklet context. In-tree drivers
+     * set managed buffers before registering. */
+    snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC, NULL, 0, 0);
+#endif
+
     /* Post-register dynamic add: trigger snd_pcm_dev_register so the
      * chardev nodes appear. For device_idx == 0 the card-wide register
      * sweep in snd_card_register handles this. */
@@ -2443,10 +2459,6 @@ static int mr_alsa_audio_create_pcm(struct snd_card *card,
             return err;
         }
     }
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-    snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC, NULL, 0, 0);
-#endif
 
     return err;
 }
@@ -2753,8 +2765,9 @@ int mr_alsa_audio_add_pcm(int pcm_id, uint32_t sample_rate)
      * tick-path callbacks already handle (length=0 short-circuits the
      * stream loops).
      */
-    chip->pcm_sample_rate = sample_rate;
-    chip->pcm_frame_size  = 0;  /* attach_alsa_driver fills this in */
+    /* F3 packed pair: rate in the high 32 bits; frame_size 0 until
+     * attach_alsa_driver derives and publishes it. */
+    chip->pcm_rate_and_frame = ((uint64_t)sample_rate << 32);
     err = mr_alsa_audio_chip_create(g_card, chip, g_ravenna_peer,
                                     g_mr_alsa_audio_ops, pcm_id);
     if (err < 0)
