@@ -2084,8 +2084,17 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
             printk(KERN_WARNING "mr_alsa_audio_pcm_open: get_master_switch_value error\n");
         /*else
             printk("mr_alsa_audio_pcm_open: get_master_switch_value returns %d\n", chip->current_playback_switch);*/
-        snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE, &chip->playback_volume_control->id);
-        snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE, &chip->playback_switch_control->id);
+        /* 2026-06-10 hardware-test fix: master volume/switch controls are
+         * registered on chip 0 ONLY (per-PCM controls land in W9), so these
+         * pointers are NULL on chips 1+. The unguarded notify dereferenced
+         * &NULL->id inside snd_ctl_notify on the FIRST playback open of a
+         * dynamically added PCM -> oops holding the card control lock ->
+         * hard lockup of every other PCM on the card. Same guard the
+         * prepare path has always had. */
+        if (chip->playback_volume_control)
+            snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE, &chip->playback_volume_control->id);
+        if (chip->playback_switch_control)
+            snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE, &chip->playback_switch_control->id);
     }
     else if(substream->stream == SNDRV_PCM_STREAM_CAPTURE)
     {
