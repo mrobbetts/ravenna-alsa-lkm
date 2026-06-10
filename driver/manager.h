@@ -66,6 +66,11 @@
  * negligible (a few pointer slots per chip table).
  */
 #define MAX_PCMS 16
+/* Keep the ALSA layer's extra-PCM cap in lockstep — the 8→16 bump
+ * originally updated only this constant and the daemon, leaving AddPCM
+ * rejecting ids 8..15 ("completed must be verified at every boundary"). */
+_Static_assert(MR_ALSA_MAX_EXTRA_PCMS == MAX_PCMS - 1,
+               "MR_ALSA_MAX_EXTRA_PCMS (audio_driver.h) must equal MAX_PCMS - 1");
 
 #ifndef nullptr
     #define nullptr NULL
@@ -106,6 +111,11 @@ struct TManager
     volatile bool m_bIsStarted;
     volatile bool m_bIORunning;
 
+    /* 2026-06-09 review fix (io-flags race): spinlock_t*, allocated in
+     * init(). Serializes recompute_global_io_flags so concurrent ALSA
+     * triggers on different chips can't lose each other's updates. */
+    void* m_csIOState;
+
     char m_cInterfaceName[MAX_INTERFACE_NAME];
 
 
@@ -129,8 +139,12 @@ void destroy(struct TManager* self);
 bool start(struct TManager* self);
 bool stop(struct TManager* self);
 
-bool startIO(struct TManager* self, bool is_playback);
-bool stopIO(struct TManager* self, bool is_playback);
+/* 2026-06-09 review fix (cross-chip mute wipe): startIO/stopIO take the
+ * triggering chip so the mute targets THAT chip's ring buffers — a trigger
+ * on PCM 1 must never memset PCM 0's live audio. alsa_chip_pointer may be
+ * NULL (mute skipped, IO flags still recomputed). */
+bool startIO(struct TManager* self, void* alsa_chip_pointer, bool is_playback);
+bool stopIO(struct TManager* self, void* alsa_chip_pointer, bool is_playback);
 
 bool SetInterfaceName(struct TManager* self, const char* cInterfaceName, const int iEthFilterIndex);
 bool SetSamplingRate(struct TManager* self, uint32_t SamplingRate);
@@ -182,8 +196,8 @@ uint32_t compute_frame_size_for_rate(uint32_t sample_rate, uint64_t tic_frame_si
  */
 bool is_valid_pcm_rate(uint32_t sample_rate);
 
-void MuteInputBuffer(struct TManager* self);
-void MuteOutputBuffer(struct TManager* self);
+void MuteInputBuffer(struct TManager* self, void* alsa_chip_pointer);
+void MuteOutputBuffer(struct TManager* self, void* alsa_chip_pointer);
 
 uint32_t GetTICFrameSizeAt1FS(struct TManager* self);
 uint32_t GetMaxTICFrameSize(struct TManager* self);
@@ -261,6 +275,10 @@ void detach_alsa_driver(void* user, void *alsa_chip_pointer);
 void* get_chip_by_pcm_id(struct TManager* self, int32_t pcm_id);
 void init_alsa_callbacks(struct TManager* self);
 int get_input_jitter_buffer_offset(void* user, uint32_t *offset);
+/* 2026-06-09 review fix (chip-N capture misalignment): per-PCM variant —
+ * chip N's capture prepare must align to ITS ring length and ITS SAC,
+ * not chip 0's. */
+int get_input_jitter_buffer_offset_for_pcm(void* user, uint32_t pcm_id, uint32_t *offset);
 int get_output_jitter_buffer_offset(void* user, uint32_t *offset);
 int get_min_interrupts_frame_size(void* user, uint32_t *framesize);
 int get_max_interrupts_frame_size(void* user, uint32_t *framesize);

@@ -92,6 +92,10 @@ struct alsa_ops
      * pointer. Stage 3 will also call this from a future RemovePCM path. */
     void (*unregister_alsa_driver)(void* ravenna_peer, void *alsa_chip_pointer);
     int (*get_input_jitter_buffer_offset)(void* ravenna_peer, uint32_t *offset);
+    /* 2026-06-09 review fix: per-PCM variant — capture prepare on chip N
+     * must align to chip N's ring length and SAC, not chip 0's. pcm_id is
+     * the per-card device index (chip->pcm->device). */
+    int (*get_input_jitter_buffer_offset_for_pcm)(void* ravenna_peer, uint32_t pcm_id, uint32_t *offset);
     int (*get_output_jitter_buffer_offset)(void* ravenna_peer, uint32_t *offset);
     int (*get_min_interrupts_frame_size)(void* ravenna_peer, uint32_t *framesize); /// returns min Ravenna Frame Size in samples (channel independent)
     int (*get_max_interrupts_frame_size)(void* ravenna_peer, uint32_t *framesize); /// returns max Ravenna Frame Size (hardware dependent) in samples (channel independent)
@@ -117,6 +121,12 @@ struct alsa_ops
 /// Put ALSA driver functions which needs to be used by CPP code here:
 extern int mr_alsa_audio_card_init(void* ravennaPeer, struct alsa_ops *callbacks);
 extern void mr_alsa_audio_card_exit(void);
+/* Extra PCMs created via mr_alsa_audio_add_pcm have ids
+ * 1..MR_ALSA_MAX_EXTRA_PCMS. Must equal MAX_PCMS - 1 (manager.h) —
+ * enforced by a _Static_assert next to MAX_PCMS so the two can never
+ * drift again (the 8→16 bump originally missed this constant, capping
+ * AddPCM at id 7 while everything else accepted 15). */
+#define MR_ALSA_MAX_EXTRA_PCMS 15
 /* Multi-PCM: create an additional PCM (hw:RAVENNA,pcm_id) on the card
  * created at probe. pcm_id must be in [1, MAX_PCMS-1]; 0 is the default
  * PCM created at probe.

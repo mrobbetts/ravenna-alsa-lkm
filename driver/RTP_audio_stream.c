@@ -737,12 +737,28 @@ int ProcessRTPAudioPacket(TRTP_audio_stream* self, TRTPPacketBase* pRTPPacketBas
 	if (bCopyRTPAudioToLivesIn)
 	{
 		/* Multi-rate Stage 2: offset + length come from the stream's
-		 * owning chip (its own rate / ring buffer). */
-		ui32Offset = pManager->get_live_in_jitter_buffer_offset_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId, ui64RTPSAC); // [smpl]
-
-
-		ui32Len1 = min(pManager->get_live_in_jitter_buffer_length_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId) - ui32Offset, ui32NbOfSamplesInThisPacket);
-		ui32Len2 = ui32NbOfSamplesInThisPacket - ui32Len1;
+		 * owning chip (its own rate / ring buffer).
+		 * 2026-06-09 review fix (F2): read the ring length ONCE and derive
+		 * the offset from that SAME value. The length flips between
+		 * period_size*periods (substream open) and the full ring (closed)
+		 * on every client open/close; two separate reads could pair a
+		 * large-ring offset with a small-ring length, underflowing Len1
+		 * into an out-of-bounds write. ui32JBLen == 0 (empty/unresolvable
+		 * chip slot) now skips the copy entirely instead of deinterleaving
+		 * the whole payload at offset 0. */
+		uint32_t ui32JBLen = pManager->get_live_in_jitter_buffer_length_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId);
+		if (ui32JBLen != 0)
+		{
+			ui32Offset = (uint32_t)CW_ll_modulo(ui64RTPSAC, ui32JBLen); // [smpl]
+			ui32Len1 = min(ui32JBLen - ui32Offset, ui32NbOfSamplesInThisPacket);
+			ui32Len2 = ui32NbOfSamplesInThisPacket - ui32Len1;
+		}
+		else
+		{
+			ui32Offset = 0;
+			ui32Len1 = 0;
+			ui32Len2 = 0;
+		}
 
 		MTAL_RtTraceEvent(RTTRACEEVENT_RTP_IN, (PVOID)(RT_TRACE_EVENT_SIGNAL_STOP), 0);
 
@@ -846,6 +862,7 @@ int SendRTPAudioPackets(TRTP_audio_stream* self)
 	uint32_t ui32NbOfSampleRemaining;
 	uint64_t ui64CurrentSAC;
 	uint32_t ui32Offset;
+	uint32_t ui32JBLen;
 
 	TRTP_stream_info* pRTP_stream_info = &self->m_tRTPStream.m_RTP_stream_info;
 	TEtherTubeNetfilter* pEth_netfilter = self->m_tRTPStream.m_pEth_netfilter;
@@ -869,13 +886,23 @@ int SendRTPAudioPackets(TRTP_audio_stream* self)
 	// Send all lives out to the interface
 	// We packet all LivesOut in several RTP packet if needed.
 	// Note: One RTP packet must contain an integer number of samples for ALL LivesOut.
-	/* Multi-rate Stage 2: frame_size + buffer offset are per-PCM. */
+	/* Multi-rate Stage 2: frame_size + buffer offset are per-PCM.
+	 * 2026-06-09 review fix (F2/F3): snapshot frame size and ring length
+	 * ONCE per tick; the same values feed the SAC step, the wrap logic
+	 * below, and (passed down) the Len1/Len2 split inside
+	 * SendRTPAudioPacket — a concurrent client open/close (which flips
+	 * the ring length) or rate change can never produce a torn pair. */
+	ui32JBLen = pManager->get_live_out_jitter_buffer_length_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId);
 	ui32NbOfSampleRemaining = pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId);
+	if (ui32JBLen == 0 || ui32NbOfSampleRemaining == 0)
+		return 0; /* empty/unresolvable chip slot: nothing to send */
 
 	// Ravenna protocol: we must put in the RTP's time stamp the SAC when the audio was produced
 	/* Multi-rate Stage 3: per-PCM SAC (this stream's media clock at its own rate). */
-	ui64CurrentSAC = pManager->get_global_SAC_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId) - pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId);
+	ui64CurrentSAC = pManager->get_global_SAC_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId) - ui32NbOfSampleRemaining;
 	ui32Offset = pManager->get_live_out_jitter_buffer_offset_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId, ui64CurrentSAC); // [smpl]
+	if (ui32Offset >= ui32JBLen)
+		ui32Offset = (uint32_t)CW_ll_modulo(ui32Offset, ui32JBLen); /* re-align if the helper raced a length change */
 
 
 
@@ -896,10 +923,10 @@ int SendRTPAudioPackets(TRTP_audio_stream* self)
 		ASSERT(ui32NbOfSamplesInThisPacket >= 1);
 
 
-		SendRTPAudioPacket(self, ui64CurrentSAC, ui32Offset, ui32NbOfSamplesInThisPacket, self->m_tRTPStream.m_usOutgoingSeqNum);
+		SendRTPAudioPacket(self, ui64CurrentSAC, ui32Offset, ui32NbOfSamplesInThisPacket, self->m_tRTPStream.m_usOutgoingSeqNum, ui32JBLen);
 		if (pAttachedStream)
 		{
-			SendRTPAudioPacket((TRTP_audio_stream*)pAttachedStream, ui64CurrentSAC, ui32Offset, ui32NbOfSamplesInThisPacket, self->m_tRTPStream.m_usOutgoingSeqNum);
+			SendRTPAudioPacket((TRTP_audio_stream*)pAttachedStream, ui64CurrentSAC, ui32Offset, ui32NbOfSamplesInThisPacket, self->m_tRTPStream.m_usOutgoingSeqNum, ui32JBLen);
 		}
 
 
@@ -909,9 +936,9 @@ int SendRTPAudioPackets(TRTP_audio_stream* self)
 
 
 		ui32Offset += ui32NbOfSamplesInThisPacket;
-		/* Multi-rate Stage 2: per-PCM ring length. */
-		if (ui32Offset >= pManager->get_live_out_jitter_buffer_length_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId))
-			ui32Offset -= pManager->get_live_out_jitter_buffer_length_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId);
+		/* Multi-rate Stage 2: per-PCM ring length (F2: same snapshot). */
+		if (ui32Offset >= ui32JBLen)
+			ui32Offset -= ui32JBLen;
 
 	}
 
@@ -919,7 +946,7 @@ int SendRTPAudioPackets(TRTP_audio_stream* self)
 }
 
 ////////////////////////////////////////////////////////////////////
-int SendRTPAudioPacket(TRTP_audio_stream* self, const uint64_t ui64CurrentSAC, const uint32_t ui32Offset, const uint32_t ui32NbOfSamplesInThisPacket, const unsigned short usOutgoingSeqNum)
+int SendRTPAudioPacket(TRTP_audio_stream* self, const uint64_t ui64CurrentSAC, const uint32_t ui32Offset, const uint32_t ui32NbOfSamplesInThisPacket, const unsigned short usOutgoingSeqNum, const uint32_t ui32JBLen)
 {
 	void* pHandle = NULL;
 	void* pvPacket = NULL;
@@ -928,7 +955,6 @@ int SendRTPAudioPacket(TRTP_audio_stream* self, const uint64_t ui64CurrentSAC, c
 
 	TEtherTubeNetfilter* pEth_netfilter = self->m_tRTPStream.m_pEth_netfilter;
 	TRTP_stream_info* pRTP_stream_info = &self->m_tRTPStream.m_RTP_stream_info;
-	rtp_audio_stream_ops* pManager = self->m_pManager;
 
 	TRTPPacketBase* pTRTPPacket;
 	uint32_t ui32PacketSize;
@@ -968,8 +994,9 @@ int SendRTPAudioPacket(TRTP_audio_stream* self, const uint64_t ui64CurrentSAC, c
 	ui32PacketSize = sizeof(TRTPPacketBase) + ui32NbOfSamplesInThisPacket * (GetNbOfLivesOut(self) * pRTP_stream_info->m_byWordLength);
 
 
-	/* Multi-rate Stage 2: per-PCM ring length. */
-	ui32Len1 = min(pManager->get_live_out_jitter_buffer_length_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId) - ui32Offset, ui32NbOfSamplesInThisPacket);
+	/* Multi-rate Stage 2: per-PCM ring length (F2: the caller's single
+	 * snapshot, passed in — never re-read on this path). */
+	ui32Len1 = min(ui32JBLen - ui32Offset, ui32NbOfSamplesInThisPacket);
 	ui32Len2 = ui32NbOfSamplesInThisPacket - ui32Len1;
 	//MTAL_DP("\n @@ SendRTPAudioPackets: outputBuffer = %p (ui32Len1 = %u, ui32Len2 = %u) \n", (unsigned char*)self->m_pvLivesOutCircularBuffer[0] + ui32Offset * 3, ui32Len1, ui32Len2);
 	//MTAL_DP("OutputSAC = %llu Offset = %d, Len1 = %d Len2 = %d\n", ui64OutputSAC, ui32Offset, ui32Len1, ui32Len2);
@@ -1104,15 +1131,21 @@ void PrepareBufferLives(TRTP_audio_stream* self)
 					 * with no live chip has nothing to mute. (At single-PCM /
 					 * pcm_id==0 this is always non-zero, so no behaviour change.) */
 					uint32_t ui32PcmFrameSize = pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId);
+					/* 2026-06-09 review fix (F2/F3): single snapshot of the
+					 * ring length; the offset is derived from this SAME value
+					 * (the helper's internal read could disagree under a
+					 * concurrent client open/close), and the memset below
+					 * reuses the frame-size snapshot instead of re-reading. */
+					uint32_t ui32JBLen = pManager->get_live_in_jitter_buffer_length_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId);
 					MTAL_RtTraceEvent(RTTRACEEVENT_SINK_LIVE_MUTED + pEth_netfilter->nic_id, (PVOID)(RT_TRACE_EVENT_OCCURENCE), 0);
 
-					/* Multi-rate Stage 2/3: per-PCM offset/length/frame_size/SAC. */
-					ui32Offset = pManager->get_live_in_jitter_buffer_offset_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId, pManager->get_global_SAC_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId));
-
-					if (ui32PcmFrameSize != 0 &&
-						self->m_ulLivesInDMCounter < pManager->get_live_in_jitter_buffer_length_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId) / ui32PcmFrameSize)
+					if (ui32PcmFrameSize != 0 && ui32JBLen != 0 &&
+						self->m_ulLivesInDMCounter < ui32JBLen / ui32PcmFrameSize)
 					{
 						unsigned short us;
+						/* Multi-rate Stage 2/3: per-PCM offset from the SAME
+						 * length snapshot (and per-PCM SAC). */
+						ui32Offset = (uint32_t)CW_ll_modulo(pManager->get_global_SAC_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId), ui32JBLen);
 						if (self->m_ulLivesInDMCounter == 0)
 						{
 							delta = self->m_tRTPStream.m_ui64LastAudioSampleReceivedSAC - pManager->get_global_SAC_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId);
@@ -1124,10 +1157,11 @@ void PrepareBufferLives(TRTP_audio_stream* self)
 						{
 							if (self->m_pvLivesInCircularBuffer[us])
 							{	// mute
-								/* Multi-rate Stage 2: per-PCM mute pattern + frame size. */
+								/* Multi-rate Stage 2: per-PCM mute pattern; frame
+								 * size from the F3 snapshot (no re-read). */
 								memset((uint8_t*)self->m_pvLivesInCircularBuffer[us] + ui32Offset * self->m_usAudioEngineSampleWordLength,
 									pManager->get_live_in_mute_pattern_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId, us),
-									pManager->get_frame_size_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId) * self->m_usAudioEngineSampleWordLength);
+									ui32PcmFrameSize * self->m_usAudioEngineSampleWordLength);
 								//for(uint32_t ulSample = ui32Offset; ulSample < ui32Offset + pManager->get_frame_size(pManager->user); ulSample++)
 								//{
 								//	((float*)self->m_pvLivesInCircularBuffer[us])[ulSample] = -1.0f;
