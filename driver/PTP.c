@@ -9,8 +9,13 @@
 *  Date           : 27/07/2010
 *  Modified by    : Baume Florian
 *  Date           : 14/04/2016
-*  Modification   : Linux driver port, removed floating point, 
+*  Modification   : Linux driver port, removed floating point,
 *                   changed time ref unit, stabiliy increased
+*  Modified by    : multi-pcm-stage1 fork
+*  Date           : 06/2026
+*  Modification   : multi-rate W5 — per-rate TIC machinery extracted to
+*                   tic_engine.c; this file is the PTP discipline (servo)
+*                   only, fanning measurements out to attached engines
 *  Known problems : None
 *
 * Copyright(C) 2017 Merging Technologies
