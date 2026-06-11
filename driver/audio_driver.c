@@ -2456,7 +2456,24 @@ int mr_alsa_audio_add_pcm(int pcm_id, uint32_t sample_rate)
     slot = pcm_id - 1;
     if (g_extra_chips[slot])
     {
-        printk(KERN_ERR "mr_alsa_audio_add_pcm: pcm_id %d already exists\n", pcm_id);
+        /* Idempotent re-add (2026-06-10 hardware-test fix): the daemon
+         * re-pushes its full device_groups config on EVERY restart, but
+         * chips persist in the module across daemon restarts (RemovePCM
+         * lands in W10). Same pcm_id at the same rate is therefore a
+         * normal occurrence — succeed as a no-op so a daemon restart
+         * over a live module doesn't fail fatally. A DIFFERENT rate
+         * still refuses loudly: re-rating an existing PCM is W10's
+         * SetPCMRate, not AddPCM. */
+        uint32_t existing_rate =
+            (uint32_t)(g_extra_chips[slot]->pcm_rate_and_frame >> 32);
+        if (existing_rate == sample_rate)
+        {
+            printk(KERN_INFO "mr_alsa_audio_add_pcm: pcm_id %d already exists at rate %u; idempotent success\n",
+                   pcm_id, sample_rate);
+            return 0;
+        }
+        printk(KERN_ERR "mr_alsa_audio_add_pcm: pcm_id %d already exists at rate %u (requested %u); use SetPCMRate (W10) to re-rate\n",
+               pcm_id, existing_rate, sample_rate);
         return -EEXIST;
     }
     chip = kzalloc(sizeof(*chip), GFP_KERNEL);
