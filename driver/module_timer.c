@@ -229,7 +229,7 @@ int init_clock_timer(void)
 
 void kill_clock_timer(void)
 {
-    //stop_clock_timer(); //used when no daemon
+    stop_clock_timer(); //used when no daemon
 }
 
 int start_clock_timer(void)
