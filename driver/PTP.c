@@ -46,11 +46,8 @@
 
 #define PTP_LOCK_HYSTERESIS		4
 #define PTP_WATCHDOG_ELAPSE		20000	// we assume to receive at least one sync each 2s
-#define TIC_LOCK_HYSTERESIS		5
-
-//REF_UNIT is cent of microseconde (100us)
-#define PS_2_REF_UNIT 100000000 // ps is the PTP unit
-#define NS_2_REF_UNIT 100000 // ns is the linux time unit
+/* TIC_LOCK_HYSTERESIS, PS_2_REF_UNIT and NS_2_REF_UNIT moved to
+ * tic_engine.h (W5 per-rate TIC engine extraction). */
 
 // PTP Domain
 #define PTPMASTER_ANNOUNCE_TIMEOUT	50000000 // [100ns]
@@ -59,13 +56,7 @@
 //////////////////////////////////////////////////////////////
 void get_ptp_global_times(TClock_PTP* self, uint64_t* pui64GlobalSAC, uint64_t* pui64GlobalTime, uint64_t* pui64GlobalPerformanceCounter) // get the time and the SAC atomically
 {
-    spin_lock((spinlock_t*)self->m_csSAC_Time_Lock);
-
-    *pui64GlobalSAC = self->m_ui64GlobalSAC;
-    *pui64GlobalTime = self->m_ui64GlobalTime;
-    *pui64GlobalPerformanceCounter = self->m_ui64GlobalPerformanceCounter;
-
-    spin_unlock((spinlock_t*)self->m_csSAC_Time_Lock);
+    tic_engine_get_times(&self->m_TicEngine, pui64GlobalSAC, pui64GlobalTime, pui64GlobalPerformanceCounter);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -115,16 +106,8 @@ bool init_ptp(TClock_PTP* self, TEtherTubeNetfilter* pEth_netfilter, clock_ptp_o
 {
     self->m_pEth_netfilter = NULL;
 
-	self->m_ui64GlobalSAC = 0;
-	self->m_ui64GlobalTime = 0;
-	self->m_ui32FrameSize = 64;
-	self->m_ui32SamplingRate = 48000;
-	self->m_bAudioFrameTICTimerStarted = false;
-
 	self->m_bInitialized = false;
 	self->m_audio_streamer_clock_PTP_callback_ptr = audio_streamer_clock_PTP_callback_ptr;
-
-	self->m_ui64TICSAC = 0;
 
 	self->m_wLastSyncSequenceId = 0;
 	self->m_wLastFollowUp = 0;
@@ -134,20 +117,8 @@ bool init_ptp(TClock_PTP* self, TEtherTubeNetfilter* pEth_netfilter, clock_ptp_o
 
 	self->m_usPTPLockCounter = PTP_LOCK_HYSTERESIS;
 
-	self->m_uiTIC_DropCounter = 0;
-	self->m_uiTIC_LastDropCounter = 0;
-
 	////////////// new algorithm
-	//self->m_ui64TIC_Counter = 0;
 	self->m_i64TIC_PTPToRTXClockOffset = 0;
-
-	self->m_ui64TIC_LastRTXClockTime = 0; // [100us]
-	self->m_ui64TIC_LastRTXClockTimeAtT2 = 0; // [100us]
-	self->m_ui64TIC_NextAbsoluteTime = 0; // [100us]
-	self->m_dTIC_NextAbsoluteTime_frac = 0;
-	self->m_dTIC_BasePeriod = 64 * 1000000000000 / 48000; // [ps] in that case we loose 0.33333...
-	self->m_dTIC_CurrentPeriod = self->m_dTIC_BasePeriod;
-	self->m_dTIC_IGR = 0;
 
 	self->m_wLastDelayReqSequenceId = 0;
 	memset(&self->m_PTPV2MsgDelayReqPacket, 0, sizeof(self->m_PTPV2MsgDelayReqPacket));
@@ -160,6 +131,14 @@ bool init_ptp(TClock_PTP* self, TEtherTubeNetfilter* pEth_netfilter, clock_ptp_o
 	self->m_ui64PTP_GMID = 0;
 	self->m_ui8PTPClockDomain = 0;
 
+	/* Multi-rate W5: all rate-keyed TIC state lives in the engine. Step 1:
+	 * one embedded engine, attached here — behaviorally identical to the
+	 * pre-extraction single-rate servo. Step 2 moves engine ownership into
+	 * the manager's (domain, rate) timer registry. */
+	tic_engine_init(&self->m_TicEngine, self);
+	self->m_apEngines[0] = &self->m_TicEngine;
+	self->m_uNumEngines = 1;
+
     //////////////
 	self->m_pEth_netfilter = pEth_netfilter;
 	// PTP Master
@@ -171,17 +150,11 @@ bool init_ptp(TClock_PTP* self, TEtherTubeNetfilter* pEth_netfilter, clock_ptp_o
     memset(self->m_csPTPTime, 0, sizeof(spinlock_t));
     spin_lock_init((spinlock_t*)self->m_csPTPTime);
 
-    self->m_csSAC_Time_Lock = (void*)kmalloc(sizeof(spinlock_t), GFP_ATOMIC/*GFP_KERNEL*/);
-    memset(self->m_csSAC_Time_Lock, 0, sizeof(spinlock_t));
-    spin_lock_init((spinlock_t*)self->m_csSAC_Time_Lock);
-    
     //######################################################
     memset(&self->m_PTPConfig, 0, sizeof(TPTPConfig));
     self->m_ui32PTPConfigChangedCounter = self->m_ui32LastPTPConfigChangedCounter = 0;
     ResetPTPMaster(self);
     //######################################################
-
-	self->m_maxClkJitter = 0; // [us]
 
 	return true;
 }
@@ -190,9 +163,10 @@ bool init_ptp(TClock_PTP* self, TEtherTubeNetfilter* pEth_netfilter, clock_ptp_o
 void destroy_ptp(TClock_PTP* self)
 {
 	StopAudioFrameTICTimer(self);
-	
+
+	tic_engine_destroy(&self->m_TicEngine);
+
     kfree(self->m_csPTPTime);
-    kfree(self->m_csSAC_Time_Lock);
 
 	self->m_bInitialized = false;
 }
@@ -204,11 +178,14 @@ void ResetPTPLock(TClock_PTP* self, bool bUseMutex)
 		spin_lock((spinlock_t*)self->m_csPTPTime);
 
 	{
+		unsigned int e;
 		MTAL_DP("[%u] ResetPTPLock()\n", self->m_pEth_netfilter->nic_id);
 		self->m_usPTPLockCounter = PTP_LOCK_HYSTERESIS;
 
-		self->m_dTIC_IGR = 0;
-		self->m_usTICLockCounter = TIC_LOCK_HYSTERESIS;
+		/* W5: PTP-level events legitimately disturb every rate — reset all
+		 * attached engines (IGR + TIC lock counter). */
+		for (e = 0; e < self->m_uNumEngines; e++)
+			tic_engine_reset(self->m_apEngines[e]);
 	}
 
 	if(bUseMutex)
@@ -226,10 +203,23 @@ void SetPTPMasterPortNumber(TClock_PTP* self, unsigned short const usPTPMasterPo
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+/* W5: "is this servo driving audio" = any attached engine started. The
+ * unlocked volatile read mirrors the old m_bAudioFrameTICTimerStarted gate. */
+static bool clock_ptp_has_started_engine(TClock_PTP* self)
+{
+	unsigned int e;
+	for (e = 0; e < self->m_uNumEngines; e++)
+	{
+		if (self->m_apEngines[e]->m_bAudioFrameTICTimerStarted)
+			return true;
+	}
+	return false;
+}
+///////////////////////////////////////////////////////////////////////////////
 EDispatchResult process_PTP_packet(TClock_PTP* self, TUDPPacketBase* pUDPPacketBase, uint32_t ui32PacketSize)
 {
     TPTPPacketBase* pPTPPacketBase = (TPTPPacketBase*)pUDPPacketBase;
-	if(!self->m_bInitialized || !self->m_bAudioFrameTICTimerStarted)
+	if(!self->m_bInitialized || !clock_ptp_has_started_engine(self))
 	{
 		return DR_PACKET_NOT_USED;
 	}
@@ -427,8 +417,13 @@ EDispatchResult process_PTP_packet(TClock_PTP* self, TUDPPacketBase* pUDPPacketB
 
 					//////////////////////////////////////////////
 					// Syntonization
-					self->m_ui64T2 = ui64T2;
-					self->m_ui64TIC_LastRTXClockTimeAtT2 = self->m_ui64TIC_LastRTXClockTime;
+					{
+						unsigned int e;
+						self->m_ui64T2 = ui64T2;
+						/* W5: snapshot each engine's last tick time at T2 */
+						for (e = 0; e < self->m_uNumEngines; e++)
+							tic_engine_snapshot_at_t2(self->m_apEngines[e]);
+					}
 
                     spin_unlock((spinlock_t*)self->m_csPTPTime);
 				}
@@ -531,13 +526,10 @@ void ProcessT1(TClock_PTP* self, uint64_t ui64T1)
 		MTAL_DP("[%u] ui64DeltaT1 = %llu, current TIC period not proceed in order to prevent a 0 division !!\n", self->m_pEth_netfilter->nic_id, ui64DeltaT1);
 		return;
 	}
-	/*if(ui64DeltaT1 > 7000000)
-	{
-	MTAL_DP("ui64DeltaT1 = %llu [100ns] > 0.5ms; Seq = %u\n", ui64DeltaT1, MTAL_SWAP16(pPTPV2MsgFollowUpPacket->V2MsgHeader.wSequenceId));
-	}*/
 	// Atomicity
 	{
-        spin_lock((spinlock_t*)self->m_csPTPTime);
+		unsigned int e;
+		spin_lock((spinlock_t*)self->m_csPTPTime);
 		if (self->m_usPTPLockCounter > 0)
 		{
 			self->m_usPTPLockCounter--;
@@ -550,33 +542,10 @@ void ProcessT1(TClock_PTP* self, uint64_t ui64T1)
 				MTAL_DP("[%u] PTP lock pending (%d)\n", self->m_pEth_netfilter->nic_id, self->m_usPTPLockCounter);
 				if (self->m_usPTPLockCounter == 1)
 				{
-					//MTAL_DP("====================================================\n");
-
-					//uint64_t a = CW_ll_modulo((uint64_t)(CInt128(ui64T1) * CInt128(self->m_ui32SamplingRate) / CInt128(10000000)), self->m_ui32FrameSize);
-					uint64_t a = CW_ll_modulo(((ui64T1) * self->m_ui32SamplingRate) / 10000, self->m_ui32FrameSize);
-					uint64_t ui64LastTICFrameFraction = ((a) * 10000 / self->m_ui32SamplingRate); // in RTX clock
-					//uint64_t ui64LastTICFrameFraction = (((uint64_t)(CInt128(ui64T1) * CInt128(self->m_ui32SamplingRate) / CInt128(10000000)) % self->m_ui32FrameSize) * 10000000 / self->m_ui32SamplingRate); // in RTX clock
-					int32_t i32DeltaTICFrame = (int32_t)((self->m_ui64T2 - ui64LastTICFrameFraction) - self->m_ui64TIC_LastRTXClockTimeAtT2); // [100ns]
-
-					int32_t i32MidPeriod = (int32_t)(self->m_dTIC_BasePeriod / (PS_2_REF_UNIT * 2));
-					if (i32DeltaTICFrame > i32MidPeriod)
-					{
-						i32DeltaTICFrame -= (int32_t)(self->m_dTIC_BasePeriod / PS_2_REF_UNIT);
-					}
-					else if (i32DeltaTICFrame < -i32MidPeriod)
-					{
-						i32DeltaTICFrame += (int32_t)(self->m_dTIC_BasePeriod / PS_2_REF_UNIT);
-					}
-
-
-					//self->m_pmmmPTPStatDeltaTICFrame.NewPoint(i32DeltaTICFrame);
-
-					self->m_dTIC_CurrentPeriod = (self->m_dTIC_BasePeriod * self->m_ui64DeltaT2) / ui64DeltaT1; // [ps]
-					//MTAL_DP("self->m_ui64DeltaT2 = %I64u, ui64DeltaT1 = %I64u\n", self->m_ui64DeltaT2 , ui64DeltaT1);
-					MTAL_DP("[%u] self->m_dTIC_CurrentPeriod = %ull , self->m_dTIC_BasePeriod = %ull\n", self->m_pEth_netfilter->nic_id, self->m_dTIC_CurrentPeriod , self->m_dTIC_BasePeriod);
-
-					self->m_ui64TIC_NextAbsoluteTime = self->m_ui64TIC_LastRTXClockTimeAtT2 + i32DeltaTICFrame + (5 * self->m_dTIC_CurrentPeriod / PS_2_REF_UNIT);
-					self->m_dTIC_NextAbsoluteTime_frac = 0;
+					/* W5: initial period syntonization + tick phase placement
+					 * is rate-keyed — fan out to every attached engine. */
+					for (e = 0; e < self->m_uNumEngines; e++)
+						tic_engine_prelock_phase_init(self->m_apEngines[e], ui64T1, ui64DeltaT1);
 				}
 			}
 		}
@@ -584,150 +553,13 @@ void ProcessT1(TClock_PTP* self, uint64_t ui64T1)
 		if (self->m_usPTPLockCounter == 0)
 		{
 			self->m_i64TIC_PTPToRTXClockOffset = (int64_t)self->m_ui64T2 - (int64_t)ui64T1;
-			//MTAL_DP("self->m_ui64T1 = %I64u\n", self->m_ui64T1);
-			//MTAL_DP("self->m_ui64T2 = %I64u\n", self->m_ui64T2);
-			///MTAL_DP("self->m_i64TIC_PTPToRTXClockOffset = %llu\n", self->m_i64TIC_PTPToRTXClockOffset);
 
-
-			////////////////////////////////////////
-			// Audio TIC
-
-			// Syntonization
-			//self->m_dTIC_CurrentPeriod = (self->m_dTIC_BasePeriod * self->m_ui64DeltaT2) / (ui64DeltaT1); // [ps]
-			self->m_dTIC_CurrentPeriod = self->m_dTIC_BasePeriod; // [ps]
-			//MTAL_DP("self->m_dTIC_Period = %f	[ns]\n", (float)self->m_dTIC_Period);
-			//MTAL_DP("Ratio: %f\n", (double)self->m_ui64DeltaT2 / (double)ui64DeltaT1);
-
-			// period must not derive from base period from more than X ppm
-			//if(abs(1 - self->m_dTIC_BasePeriod / self->m_dTIC_CurrentPeriod) > 0.2)
-			if (self->m_dTIC_CurrentPeriod == 0)
-			{
-				MTAL_DP("[%u] self->m_dTIC_CurrentPeriod = 0 (self->m_dTIC_BasePeriod = %llu; self->m_ui64DeltaT2 = %llu; ui64DeltaT1 = %llu)!!!", self->m_pEth_netfilter->nic_id, self->m_dTIC_BasePeriod, self->m_ui64DeltaT2, ui64DeltaT1);
-				self->m_dTIC_CurrentPeriod = self->m_dTIC_BasePeriod;
-			}
-			else
-			{
-				if (abs((((signed)self->m_dTIC_CurrentPeriod - (signed)self->m_dTIC_BasePeriod) * 100) / (signed)self->m_dTIC_CurrentPeriod) > 20)
-				{
-					//bug: cannot print 2 doubles in one single MTAL_DP, in RTX, to investigate....
-					MTAL_DP("[%u] self->m_dTIC_CurrentPeriod = %llu , ", self->m_pEth_netfilter->nic_id, self->m_dTIC_CurrentPeriod);
-					MTAL_DP("[%u] self->m_dTIC_BasePeriod = %llu\n", self->m_pEth_netfilter->nic_id, self->m_dTIC_BasePeriod);
-					self->m_dTIC_CurrentPeriod = self->m_dTIC_BasePeriod;
-				}
-			}
-
-			do
-            {
-                // TIC frame alignment
-                // TODO: verify if we have enough word length (is 128bits need?)
-                ///uint64_t a = CW_ll_modulo((uint64_t)(CInt128(ui64T1) * CInt128(self->m_ui32SamplingRate) / CInt128(10000000)), (uint64_t)self->m_ui32FrameSize);
-                uint64_t a = CW_ll_modulo(((ui64T1) * self->m_ui32SamplingRate) / 10000, (uint64_t)self->m_ui32FrameSize);
-                //uint64_t ui64LastTICFrameFraction = (((uint64_t)(CInt128(ui64T1) * CInt128(self->m_ui32SamplingRate) / CInt128(10000000)) % self->m_ui32FrameSize) * 10000000 / self->m_ui32SamplingRate); // in RTX clock
-                uint64_t ui64LastTICFrameFraction = ((a * 10000) / self->m_ui32SamplingRate); // in RTX clock
-                //MTAL_DP("ui64T1 = %llu\n", ui64T1);
-                //MTAL_DP("self->m_ui32SamplingRate = %u\n", self->m_ui32SamplingRate);
-                //MTAL_DP("ui64LastTICFrameFraction = %llu\n", ui64LastTICFrameFraction);
-                //MTAL_DP("ui64LastTICFrameFraction = %llu, %llu self->m_ui64TIC_LastRTXClockTimeAtT2 = %llu\n", ui64LastTICFrameFraction, self->m_ui64T2 - ui64LastTICFrameFraction, self->m_ui64TIC_LastRTXClockTimeAtT2);
-                int32_t i32DeltaTICFrame = (int32_t)((self->m_ui64T2 - ui64LastTICFrameFraction) - self->m_ui64TIC_LastRTXClockTimeAtT2); // [100ns]
-                int64_t dProportional;
-                int64_t dPhaseAdj;
-
-                int32_t i32MidPeriod = (int32_t)(self->m_dTIC_BasePeriod / (PS_2_REF_UNIT * 2));
-
-				if (i32DeltaTICFrame > 3 * i32MidPeriod || i32DeltaTICFrame < -3 * i32MidPeriod)
-				{
-					MTAL_DP("[%u] i32DeltaTICFrame(%d) is out of range. ProcessT1 is not procceed\n", self->m_pEth_netfilter->nic_id, i32DeltaTICFrame);
-					break;
-				}
-
-				//MTAL_DP("self->m_ui64T2 = %llu\n", self->m_ui64T2);
-				//MTAL_DP("self->m_ui64TIC_LastRTXClockTimeAtT2 = %I64u\n", self->m_ui64TIC_LastRTXClockTimeAtT2);
-				//MTAL_DP("i32DeltaTICFrame = %d\n", i32DeltaTICFrame);
-
-                if (i32DeltaTICFrame > i32MidPeriod)
-                {
-                    i32DeltaTICFrame -= (int32_t)(self->m_dTIC_BasePeriod / PS_2_REF_UNIT);
-                }
-                else if (i32DeltaTICFrame < -i32MidPeriod)
-                {
-                    i32DeltaTICFrame += (int32_t)(self->m_dTIC_BasePeriod / PS_2_REF_UNIT);
-                }
-                //MTAL_DP("i32DeltaTICFrame = %d\n", i32DeltaTICFrame);
-
-
-                // Stat
-                //self->m_pmmmPTPStatDeltaTICFrame.NewPoint(i32DeltaTICFrame);
-                //MTAL_DP("i32DeltaTICFrame = %lld\n", i32DeltaTICFrame);
-
-                // compute proportional
-                //double dProportional = (i32DeltaTICFrame * 100) / (.5 * 1000000000. / self->m_dTIC_BasePeriod); // [ns] gain is 1/100 of (0.5s / 1.33ms = 375). 0.5 is recommended delta S
-                //int64_t dProportional = (int64_t)((CInt128(i32DeltaTICFrame * 100) * CInt128((signed)self->m_dTIC_BasePeriod)) / CInt128((int64_t)500000000)); // [ps] gain is 1/100 of (0.5s / 1.33ms = 375). 0.5 is recommended delta S
-                //int64_t dProportional = (((i32DeltaTICFrame * 100) * self->m_dTIC_BasePeriod) / 500000000);
-                dProportional = (((i32DeltaTICFrame) * self->m_dTIC_BasePeriod));
-                //dProportional /= 500000000000;
-                dProportional /= 5000000; // implicitly converted i32DeltaTICFrame into [ps] 
-
-                // compute leaky integrator
-                self->m_dTIC_IGR = ((self->m_dTIC_IGR + dProportional) * 95) / 100; // [ps]
-                //MTAL_DP("Delta PTPFrameTime = %i [100ns] dProportional = %f [ns] self->m_dTIC_IGR = %f [ns]\n", i32DeltaTICFrame, (float)dProportional, (float)self->m_dTIC_IGR);
-                self->m_dTIC_IGR = max(min(self->m_dTIC_IGR, 4000000LL), -4000000LL);// integral part is bound to +/- 4us which corresponds to +/- 400ns in the formula below
-
-                //MTAL_DP("self->m_dTIC_IGR = %lld [ns]\n", self->m_dTIC_IGR);
-                //MTAL_DP("dPhaseAdj = %lld [ns]\n", dPhaseAdj);
-                //MTAL_DP("dProportional = %lld [ns]\n", dProportional);
-                //MTAL_DP("self->m_dTIC_CurrentPeriod = %lld [ps]\n", self->m_dTIC_CurrentPeriod);
-
-                // Proportional + integral part
-                dPhaseAdj = /*dProportional + */self->m_dTIC_IGR / 10; // we allow the integral part to correct up to +/- 150us for the coming half a second or +/- 300ppm
-
-                // limitor
-                dPhaseAdj = max(min(dPhaseAdj, 4000000LL), -4000000LL); // we allow the total correction up to +/- 1500us for the coming half a second or +/- 3000ppm
-
-                self->m_dTIC_CurrentPeriod += dPhaseAdj * 1000; // [ps]
-
-                //MTAL_DP("self->m_dTIC_IGR = %lld [ns]\n", self->m_dTIC_IGR);
-                //MTAL_DP("dPhaseAdj = %lld [ns]\n", dPhaseAdj);
-                //MTAL_DP("dProportional = %lld [ns]\n", dProportional);
-                //MTAL_DP("self->m_dTIC_CurrentPeriod = %lld [ps]\n", self->m_dTIC_CurrentPeriod);
-
-                // Lock detection
-                if (abs(dPhaseAdj) < 800000 && self->m_usTICLockCounter > 0)
-                {
-                    self->m_usTICLockCounter--;
-                    if (self->m_usTICLockCounter == 0)
-                    {
-                        MTAL_DP("[%u] TIC locked\n", self->m_pEth_netfilter->nic_id);
-                    }
-                }
-                else if (abs(dPhaseAdj) > 1000000)
-                {
-                    self->m_usTICLockCounter = TIC_LOCK_HYSTERESIS;
-                }
-
-                //MTAL_DP("%I64u / %I64u = %e\n", self->m_ui64TIC_PTPClockTimeFromOrigin ,self->m_ui64TIC_RTXClockTimeFromOrigin, (double)self->m_ui64TIC_PTPClockTimeFromOrigin / (double)self->m_ui64TIC_RTXClockTimeFromOrigin - 1.);
-			} while (0);
+			/* W5: frame alignment + PI steering is rate-keyed — fan out. */
+			for (e = 0; e < self->m_uNumEngines; e++)
+				tic_engine_steer(self->m_apEngines[e], ui64T1);
 		}
 		spin_unlock((spinlock_t*)self->m_csPTPTime);
 	}
-
-	//MTAL_DP("Delta T1= %I64u\n", ui64T1 - self->m_ui64T1);
-	//MTAL_DP("self->m_ui64PTPClockTimeFromOrigin %I64u,  self->m_ui64TC_RTXClockOriginTime= %I64u PTP/RTX = %I64u = %e\n", self->m_ui64PTPClockTimeFromOrigin, self->m_ui64RTXClockTimeFromOrigin, (uint64_t)(CInt128(self->m_ui64PTPClockTimeFromOrigin) / CInt128(self->m_ui64RTXClockTimeFromOrigin)), (double)self->m_ui64PTPClockTimeFromOrigin / (double)self->m_ui64RTXClockTimeFromOrigin);
-
-	// Atomicity
-    spin_lock((spinlock_t*)self->m_csPTPTime);
-	if (self->m_usPTPLockCounter == 0)
-	{
-		// Stats
-		{
-			if (ui64DeltaT1 != 0)
-			{
-				//self->m_pmmmPTPStatSyncInterval.NewPoint((uint32_t)self->m_ui64DeltaT2);
-				//self->m_pmmmPTPStatFollowInterval.NewPoint((uint32_t)ui64DeltaT1);
-				//self->m_pmmmPTPStatRatio.NewPoint((float)self->m_ui64DeltaT2/(float)ui64DeltaT1);
-			}
-		}
-	}
-    spin_unlock((spinlock_t*)self->m_csPTPTime);
 
 	self->m_ui64T1 = ui64T1;
 }
@@ -798,34 +630,7 @@ bool SendDelayReq(TClock_PTP* self, TPTPV2MsgFollowUpPacket* pPTPV2MsgFollowUpPa
 
 
 ///////////////////////////////////////////////////////////////////////////////
-void computeNextAbsoluteTime(TClock_PTP* self, uint32_t ui32FrameCount)
-{
-	uint64_t ui64Period = self->m_dTIC_CurrentPeriod / PS_2_REF_UNIT; // [ps -> 100us]
-
-	self->m_ui64TIC_NextAbsoluteTime += ui64Period * ui32FrameCount;
-	self->m_dTIC_NextAbsoluteTime_frac += CW_ll_modulo(self->m_dTIC_CurrentPeriod, PS_2_REF_UNIT) * ui32FrameCount;
-	if (self->m_dTIC_NextAbsoluteTime_frac > PS_2_REF_UNIT)
-	{
-		uint32_t ui32EpsilonCount = (uint32_t)(self->m_dTIC_NextAbsoluteTime_frac) / PS_2_REF_UNIT;
-		self->m_dTIC_NextAbsoluteTime_frac -= PS_2_REF_UNIT * ui32EpsilonCount;
-		self->m_ui64TIC_NextAbsoluteTime += ui32EpsilonCount;
-	}
-
-	/* Orignial code with a loop :
-	uint64_t ui64Period = self->m_dTIC_CurrentPeriod / PS_2_REF_UNIT; // [ps -> 100us]
-	while (ui32FrameCount-- != 0)
-	{
-		self->m_ui64TIC_NextAbsoluteTime += ui64Period;
-		self->m_dTIC_NextAbsoluteTime_frac += CW_ll_modulo(self->m_dTIC_CurrentPeriod, PS_2_REF_UNIT);
-		//self->m_dTIC_NextAbsoluteTime_frac += self->m_dTIC_CurrentPeriod % PS_2_REF_UNIT;
-		if (self->m_dTIC_NextAbsoluteTime_frac > PS_2_REF_UNIT)
-		{
-			self->m_dTIC_NextAbsoluteTime_frac -= PS_2_REF_UNIT;
-			self->m_ui64TIC_NextAbsoluteTime++;
-		}
-	}
-	*/
-}
+/* computeNextAbsoluteTime moved to tic_engine.c (W5 extraction). */
 
 ///////////////////////////////////////////////////////////////////////////////
 // Timer
@@ -834,237 +639,53 @@ void computeNextAbsoluteTime(TClock_PTP* self, uint32_t ui32FrameCount)
 
 void timerSetNextAbsoluteTime(TClock_PTP* self, uint64_t ui64NextAbsoluteTime)
 {
-	spin_lock/*_irqsave*/((spinlock_t*)self->m_csPTPTime/*, flags*/);
-	self->m_ui64TIC_NextAbsoluteTime = ui64NextAbsoluteTime / NS_2_REF_UNIT;
-	spin_unlock/*_irqrestore*/((spinlock_t*)self->m_csPTPTime/*, flags*/);
+	tic_engine_set_next_abs_time(&self->m_TicEngine, ui64NextAbsoluteTime);
 }
 
 void timerProcess(TClock_PTP* self, uint64_t* pui64NextRTXClockTime, uint64_t ui64RTXClockTime)
 {
-	// debug
-	//int iTICCountUpdateMethod = 0;
-	int32_t clkJitter;
+	TTicEngineTickCtx ctx;
 
-	// Set the timer to the next Frame
-	uint64_t ui64AbsoluteTime;
-	uint64_t ui64CurrentTICCount = 0;
+	/* W5 step 1: single embedded engine. The advance/schedule split (with
+	 * the servo-level link/watchdog checks between them, exactly where the
+	 * old monolithic timerProcess ran them) is the shape the per-(domain,
+	 * rate) timer callbacks build on in step 2. */
+	tic_engine_tick_advance(&self->m_TicEngine, &ctx);
 
-	uint64_t ui64CurrentRTXClockTime;
-	//ui64CurrentRTXClockTime = ui64RTXClockTime / NS_2_REF_UNIT;
-	get_clock_time(&ui64CurrentRTXClockTime);
-
-	clkJitter = (int32_t)((signed)(self->m_ui64TIC_NextAbsoluteTime * 100) - (signed)(ui64CurrentRTXClockTime / 1000));
-	self->m_maxClkJitter = max(clkJitter, self->m_maxClkJitter);
-
-	ui64CurrentRTXClockTime /= NS_2_REF_UNIT; // [100us]
-
-	if (self == NULL)
+	if (ctx.bStarted)
 	{
-		return;
-	}
-	if (!self->m_bAudioFrameTICTimerStarted)
-	{
-		return;
-	}
-
-	//MTAL_RtTraceEvent(RTTRACEEVENT_PTP_TIC, (PVOID)(RT_TRACE_EVENT_SIGNAL_STOP), 0);
-	//MTAL_RtTraceEvent(RTTRACEEVENT_PTP_TIC, (PVOID)(RT_TRACE_EVENT_SIGNAL_START), (PVOID)(self->m_ui64TICSAC));
-
-
-#if 0
-	/////// debug
-	if (abs((int)((signed)self->m_ui64TIC_NextAbsoluteTime - (signed)ui64CurrentRTXClockTime)) > self->m_dTIC_CurrentPeriod / 2 / PS_2_REF_UNIT)
-	{
-		if (ui64CurrentRTXClockTime > self->m_ui64TIC_NextAbsoluteTime)
+		// Check the link status
+		if(!IsLinkUp(self->m_pEth_netfilter) && GetLockStatus(self) != PTPLS_UNLOCKED)
 		{
-			//if (bAudioFrameTIC)
-			if (GetLockStatus(self) == PTPLS_LOCKED)
+			spin_lock((spinlock_t*)self->m_csPTPTime);
 			{
-				printk(KERN_DEBUG "[%u] Wake up late of 1/2 period. Now(%llu), Asked(%llu), Diff(%i) [100us] neg means earlier (Current period = %llu)\n", self->m_pEth_netfilter->nic_id, ui64CurrentRTXClockTime, self->m_ui64TIC_NextAbsoluteTime, (int)((signed)ui64CurrentRTXClockTime - (signed)self->m_ui64TIC_NextAbsoluteTime), self->m_dTIC_CurrentPeriod);
+				MTAL_DP("[%u] PTP detects that the link is down\n", self->m_pEth_netfilter->nic_id);
+				ResetPTPLock(self, false);
+			}
+			spin_unlock((spinlock_t*)self->m_csPTPTime);
+		}
+
+		// PTP watch dog
+		{
+			uint64_t ui64WatchDogElapse = ctx.ui64CurrentRTXClockTime - self->m_ui64LastWatchDogTime;
+			if(ui64WatchDogElapse >= PTP_WATCHDOG_ELAPSE)
+			{
+				spin_lock((spinlock_t*)self->m_csPTPTime);
+				if(self->m_wLastWatchDogSyncSequenceId == self->m_wLastSyncSequenceId && GetLockStatus(self) != PTPLS_UNLOCKED)
+				{
+					printk("[%u] PTP Master sync timeout, resetting ...\n", self->m_pEth_netfilter->nic_id);
+					MTAL_DP("[%u] Didn't received PTP sync since 2s\n", self->m_pEth_netfilter->nic_id);
+					MTAL_DP("[%u] ui64WatchDogElapse = %llu = %llu - %llu\n", self->m_pEth_netfilter->nic_id, ui64WatchDogElapse, ctx.ui64CurrentRTXClockTime, self->m_ui64LastWatchDogTime);
+					ResetPTPLock(self, false);
+				}
+				spin_unlock((spinlock_t*)self->m_csPTPTime);
+				self->m_wLastWatchDogSyncSequenceId = self->m_wLastSyncSequenceId;
+				self->m_ui64LastWatchDogTime = ctx.ui64CurrentRTXClockTime;
 			}
 		}
 	}
-#endif
 
-	// Atomicity
-	{
-        spin_lock((spinlock_t*)self->m_csPTPTime);
-		// Stat; compute must be protected by self->m_csPTPTime for atomicity
-        /*{
-            CMTAL_PerfMonInterval pmiTICIntervalTmp
-            pmiTICIntervalTmp = self->m_pmiTICInterval;
-            self->m_pmiTICInterval.NewPoint();
-            //MTAL_DP("TIC Interfave = %llu", self->m_pmiTICInterval.GetLastUsedInterval());
-            if(self->m_pmiTICInterval.GetMax() > pmiTICIntervalTmp.GetMax() || self->m_pmiTICInterval.GetMin() < pmiTICIntervalTmp.GetMin())
-            {
-                //MTAL_DP("TIC Interfave = %llu, min = %llu, avg = %llu, max = %llu [us]\n", self->m_pmiTICInterval.GetLastUsedInterval(), self->m_pmiTICInterval.GetMin(), self->m_pmiTICInterval.GetAvg(), self->m_pmiTICInterval.GetMax());
-            }
-        }*/
-        self->m_ui64TIC_LastRTXClockTime = ui64CurrentRTXClockTime;
-
-        computeNextAbsoluteTime(self, 1);
-        {
-            //MTAL_DP("self->m_ui64TIC_NextAbsoluteTime %llu\n", self->m_ui64TIC_NextAbsoluteTime);
-            uint64_t ui64Q = (uint64_t)((ui64CurrentRTXClockTime - self->m_i64TIC_PTPToRTXClockOffset) * (self->m_ui32SamplingRate / 100) / 100) / self->m_ui32FrameSize; // [frame count]
-            uint32_t ui32R = CW_ll_modulo((uint64_t)((ui64CurrentRTXClockTime - self->m_i64TIC_PTPToRTXClockOffset) * (self->m_ui32SamplingRate / 100) / 100), self->m_ui32FrameSize);
-            //uint32_t ui32R = (uint64_t)(CInt128(ui64CurrentRTXClockTime - self->m_i64TIC_PTPToRTXClockOffset) * CInt128(self->m_ui32SamplingRate / 100) / CInt128(100000)) % self->m_ui32FrameSize;
-
-            //if (print_coutner % 1000 == 0)
-            //{
-            //	MTAL_DP("ui64CurrentRTXClockTime = %llu, self->m_i64TIC_PTPToRTXClockOffset=%lli\n", ui64CurrentRTXClockTime, self->m_i64TIC_PTPToRTXClockOffset);
-            //}
-            //print_coutner++;
-
-            //MTAL_DP("ui64CurrentRTXClockTime = %I64u\n", ui64CurrentRTXClockTime);
-            //MTAL_DP("self->m_i64TIC_PTPToRTXClockOffset = %I64i\n", self->m_i64TIC_PTPToRTXClockOffset);
-
-            //MTAL_DP("ui64Q = %I64u ui32R = %u\n", ui64Q, ui32R);
-
-            //ui64Q = (uint64_t)((int64_t)ui64CurrentRTXClockTime - self->m_i64TIC_PTPToRTXClockOffset) * (self->m_ui32SamplingRate / 100) / 100000 / self->m_ui32FrameSize;
-            //MTAL_DP("2.ui64Q = %I64u \n", ui64Q);
-
-            //printk("Q : %llu R: %u\n", ui64Q, ui32R);
-            if(ui32R < 4 * self->m_ui32SamplingRate / 44100) // to avoid using timestamps outside 80us of theoretical time
-            {
-                ui64CurrentTICCount = ui64Q + 1; // we add 1 because ui64Q is the count for the previous frame
-                //iTICCountUpdateMethod = 1;
-            }
-            else if(ui32R > self->m_ui32FrameSize - 4 * self->m_ui32SamplingRate / 44100)
-            {
-                ui64CurrentTICCount = ui64Q + 1 + 1; // we add 1 because ui64Q is the count for the previous frame
-                //iTICCountUpdateMethod = 2;
-            }
-            else
-            {
-                // For debug
-                /*if (self->m_ui64LastTIC_Count != ui64Q)
-                {
-                    printk("self->m_ui64LastTIC_Count(%llu) != ui64Q(%llu) | ui32R[%u]\n", self->m_ui64LastTIC_Count, ui64Q, ui32R);
-                }*/
-                ui64CurrentTICCount = self->m_ui64LastTIC_Count + 1;
-                //iTICCountUpdateMethod = 3;
-            }
-        }
-
-        ui64AbsoluteTime = self->m_ui64TIC_NextAbsoluteTime;
-        spin_unlock((spinlock_t*)self->m_csPTPTime);
-    }
-
-    //MTAL_DP("TIC Intervale = %llu ui64Period = %llu", self->m_pmiTICInterval.GetLastUsedInterval(), ui64Period);
-
-    self->m_ui64TICSAC = (ui64CurrentTICCount - 1) * self->m_ui32FrameSize;
-    {
-        spin_lock((spinlock_t*)self->m_csSAC_Time_Lock);
-        {
-            self->m_ui64GlobalPerformanceCounter = MTAL_LK_GetCounterTime();
-            self->m_ui64GlobalTime = ui64CurrentRTXClockTime;
-            self->m_ui64GlobalSAC = self->m_ui64TICSAC;
-        }
-        spin_unlock((spinlock_t*)self->m_csSAC_Time_Lock);
-    }
-
-	//// Call AudioTICFrame now done in module_main
-	//self->m_audio_streamer_clock_PTP_callback_ptr->AudioFrameTIC(self->m_audio_streamer_clock_PTP_callback_ptr->user);
-
-	// Check the link status
-	if(!IsLinkUp(self->m_pEth_netfilter) && GetLockStatus(self) != PTPLS_UNLOCKED)
-	{
-		spin_lock((spinlock_t*)self->m_csPTPTime);
-		{
-			MTAL_DP("[%u] PTP detects that the link is down\n", self->m_pEth_netfilter->nic_id);
-			ResetPTPLock(self, false);
-		}
-		spin_unlock((spinlock_t*)self->m_csPTPTime);
-	}
-
-	// PTP watch dog
-	{
-        uint64_t ui64WatchDogElapse = ui64CurrentRTXClockTime - self->m_ui64LastWatchDogTime;
-        if(ui64WatchDogElapse >= PTP_WATCHDOG_ELAPSE)
-        {
-            spin_lock((spinlock_t*)self->m_csPTPTime);
-            if(self->m_wLastWatchDogSyncSequenceId == self->m_wLastSyncSequenceId && GetLockStatus(self) != PTPLS_UNLOCKED)
-            {
-                printk("[%u] PTP Master sync timeout, resetting ...\n", self->m_pEth_netfilter->nic_id);
-				MTAL_DP("[%u] Didn't received PTP sync since 2s\n", self->m_pEth_netfilter->nic_id);
-                MTAL_DP("[%u] ui64WatchDogElapse = %llu = %llu - %llu\n", self->m_pEth_netfilter->nic_id, ui64WatchDogElapse, ui64CurrentRTXClockTime, self->m_ui64LastWatchDogTime);
-                ResetPTPLock(self, false);
-            }
-            spin_unlock((spinlock_t*)self->m_csPTPTime);
-            self->m_wLastWatchDogSyncSequenceId = self->m_wLastSyncSequenceId;
-            self->m_ui64LastWatchDogTime = ui64CurrentRTXClockTime;
-        }
-    }
-
-	// Report drop
-	if(GetLockStatus(self) == PTPLS_LOCKED && ui64CurrentTICCount != self->m_ui64LastTIC_Count + 1)
-	{
-		//MTAL_DP("iTICCountUpdateMethod = %i\n", iTICCountUpdateMethod);
-		MTAL_DP("[%u] LastTICCounter = %llu ui64TICCounter = %llu (Timer period = %llu [100us])\n", self->m_pEth_netfilter->nic_id, self->m_ui64LastTIC_Count, ui64CurrentTICCount, ui64CurrentRTXClockTime-self->m_ui64LastCurrentRTXClockTime);
-		//MTAL_DP("\tTIC_RTXClockTimeFromOrigin %I64u  TIC_PTPClockTimeFromOrigin %I64u\n", self->m_ui64TIC_RTXClockTimeFromOrigin, self->m_ui64TIC_PTPClockTimeFromOrigin);
-		//MTAL_DP("\t ui64CurrentRTXClockTimeDbg %I64u - self->m_ui64TIC_RTXClockOriginTime %I64u =  %I64u\n", ui64CurrentRTXClockTimeDbg, self->m_ui64TIC_RTXClockOriginTime, ui64CurrentRTXClockTime);
-
-		//MTAL_RtTraceEvent(RTTRACEEVENT_PTP_TIC_DROP, (PVOID)(RT_TRACE_EVENT_OCCURENCE), 0);
-		self->m_uiTIC_DropCounter++;
-	}
-	self->m_ui64LastTIC_Count = ui64CurrentTICCount;
-
-    {
-        //$bypass$
-        //ui64AbsoluteTime = self->m_dTIC_CurrentPeriod / 100000 + ui64CurrentRTXClockTime; // Real box
-        //ui64AbsoluteTime = self->m_dTIC_CurrentPeriod / 10000 + ui64CurrentRTXClockTime; // Virtual box
-        // too late detection
-        uint64_t ui64CurrentTime;
-		bool dropout_every_5second = false; // DSD mute debug
-		
-        get_clock_time(&ui64CurrentTime);
-        ui64CurrentTime /= NS_2_REF_UNIT; // [100us]
-        //ui64CurrentTime /= NS_2_REF_UNIT; // [100us]		
-		
-        if (ui64AbsoluteTime <= ui64CurrentTime || dropout_every_5second)
-        {
-            if (ui64CurrentTime - ui64AbsoluteTime < self->m_dTIC_CurrentPeriod / 2 / PS_2_REF_UNIT) // give a chance to be late of 200us
-            {
-                MTAL_DP("[%u] %llu [100us] Overrun (upto Period / 2 (%llu [100us]), let try to catch up)\n", self->m_pEth_netfilter->nic_id, ui64CurrentTime - ui64AbsoluteTime, self->m_dTIC_CurrentPeriod / 2 / PS_2_REF_UNIT);
-            }
-			else if (GetLockStatus(self) == PTPLS_LOCKED)
-            {
-				MTAL_DP("[%u] timerProcess elapsed time = %llu [100us]", self->m_pEth_netfilter->nic_id, ui64CurrentTime-ui64CurrentRTXClockTime);
-				//MTAL_DP("Delta absolute time %llu; Timer CPU time period %llu\n", ui64AbsoluteTime, (ui64AbsoluteTime - self->m_ui64LastAbsoluteTime), ui64CurrentRTXClockTime - self->m_ui64LastCurrentRTXClockTime);
-				self->m_ui64LastAbsoluteTime = ui64AbsoluteTime;
-				self->m_ui64LastCurrentRTXClockTime = ui64CurrentRTXClockTime;
-                /*
-				MTAL_DP("%llu [us] Overrun ! Jump to 500 [ms] from now; ui64AbsoluteTime = %llu, ui64CurrentTime = %llu\n", (ui64CurrentTime-ui64AbsoluteTime)/10, ui64AbsoluteTime, ui64CurrentTime);
-                computeNextAbsoluteTime(self, self->m_ui32SamplingRate / self->m_ui32FrameSize / 2); // near 500ms jump
-                ui64AbsoluteTime = self->m_ui64TIC_NextAbsoluteTime;
-				MTAL_DP("Next wakeup time (absolute time) =  %llu\n", ui64AbsoluteTime);
-				*/
-            }
-			else
-			{
-				// When we are not locked, we continue to wakeup the timer on the period time 
-				// This allow to continue to update self->m_ui64TIC_LastRTXClockTime which is mandatory to adjust the tic phase when PTP packet is received (TIC lock)
-				self->m_ui64TIC_NextAbsoluteTime = ui64AbsoluteTime = ui64CurrentTime + self->m_dTIC_BasePeriod / PS_2_REF_UNIT;
-			}
-        }
-        /////// debug
-		//MTAL_DP("PTP GlobalSAC : self->m_ui64GlobalSAC = 0x%I64x\n", self->m_ui64GlobalSAC);
-        //MTAL_DP("Delta absolute time %llu; Timer CPU time period %llu\n", ui64AbsoluteTime, (ui64AbsoluteTime - g_ui64LastAbsoluteTime), ui64CurrentRTXClockTime - g_ui64LastCurrentRTXClockTime);
-        self->m_ui64LastAbsoluteTime = ui64AbsoluteTime;
-        self->m_ui64LastCurrentRTXClockTime = ui64CurrentRTXClockTime;
-
-        *pui64NextRTXClockTime = ui64AbsoluteTime * NS_2_REF_UNIT;
-
-        /*if (GetLockStatus(self) == PTPLS_LOCKED)
-        {
-            if (self->m_ui64PTPMaster_AnnounceTime != 0 && ui64CurrentTimeRef - self->m_ui64PTPMaster_AnnounceTime > PTPMASTER_ANNOUNCE_TIMEOUT)
-            {
-                printk("PTP Master announce timeout, resetting ...\n");
-                ResetPTPLock(self, true);
-                ResetPTPMaster(self);
-            }
-        }*/
-    }
+	tic_engine_tick_schedule(&self->m_TicEngine, &ctx, pui64NextRTXClockTime);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1075,18 +696,13 @@ bool StartAudioFrameTICTimer(TClock_PTP* self, uint32_t ulFrameSize, uint32_t ul
 	// Atomicity
 	{
         spin_lock((spinlock_t*)self->m_csPTPTime);
-        self->m_ui32FrameSize = ulFrameSize;
-        self->m_ui32SamplingRate = ulSamplingRate;
-        self->m_bAudioFrameTICTimerStarted = true;
-		self->m_dTIC_CurrentPeriod = self->m_dTIC_BasePeriod = (self->m_ui32FrameSize * 1000000000000) / self->m_ui32SamplingRate; // [ps]
-		set_base_period(self->m_dTIC_BasePeriod/1000);
+		tic_engine_start(&self->m_TicEngine, ulFrameSize, ulSamplingRate);
+		set_base_period(self->m_TicEngine.m_dTIC_BasePeriod/1000);
 		spin_unlock((spinlock_t*)self->m_csPTPTime);
 	}
 	MTAL_DP("[%u] StartAudioFrameTICTimer with...\n", self->m_pEth_netfilter->nic_id);
-	MTAL_DP("self->m_dTIC_BasePeriod = %llu	[ps]\n", self->m_dTIC_BasePeriod);
-	MTAL_DP("self->m_ui32FrameSize = %u self->m_ui32SamplingRate = %u\n", self->m_ui32FrameSize, self->m_ui32SamplingRate);
-
-    //start_clock_timer();
+	MTAL_DP("self->m_dTIC_BasePeriod = %llu	[ps]\n", self->m_TicEngine.m_dTIC_BasePeriod);
+	MTAL_DP("self->m_ui32FrameSize = %u self->m_ui32SamplingRate = %u\n", self->m_TicEngine.m_ui32FrameSize, self->m_TicEngine.m_ui32SamplingRate);
 
 	// samplingrate and/or framesize changed so computation made during PTP locking is no longer valid
 	ResetPTPLock(self, true);
@@ -1097,9 +713,9 @@ bool StartAudioFrameTICTimer(TClock_PTP* self, uint32_t ulFrameSize, uint32_t ul
 ///////////////////////////////////////////////////////////////////////////////
 bool StopAudioFrameTICTimer(TClock_PTP* self)
 {
-    //stop_clock_timer();
-
-    self->m_bAudioFrameTICTimerStarted = false;
+	unsigned int e;
+	for (e = 0; e < self->m_uNumEngines; e++)
+		tic_engine_stop(self->m_apEngines[e]);
 
     ResetPTPLock(self, true);
 
@@ -1109,26 +725,13 @@ bool StopAudioFrameTICTimer(TClock_PTP* self)
 ////////////////////////////////////////////////////////////////////
 bool IsAudioFrameTICDropped(TClock_PTP* self, bool bReset)
 {
-	bool bDrop = self->m_uiTIC_DropCounter != self->m_uiTIC_LastDropCounter;
-	if(bDrop && bReset)
-	{
-		self->m_uiTIC_LastDropCounter = self->m_uiTIC_DropCounter;
-	}
-	return bDrop;
+	return tic_engine_is_drop(&self->m_TicEngine, bReset);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 EPTPLockStatus GetLockStatus(TClock_PTP* self)
 {
-	if(self->m_usPTPLockCounter != 0)
-	{
-		return PTPLS_UNLOCKED;
-	}
-	if(self->m_usTICLockCounter != 0)
-	{
-		return PTPLS_LOCKING;
-	}
-	return PTPLS_LOCKED;
+	return tic_engine_lock_status(&self->m_TicEngine);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1170,10 +773,10 @@ void GetPTPStatus(TClock_PTP* self, TPTPStatus* pPTPStatus)
     pPTPStatus->nPTPLockStatus = GetLockStatus(self);
     pPTPStatus->ui64GMID[0] = self->m_ui64PTPMaster_GMID;
     pPTPStatus->i32NetworkJitter = 0; // TODO
-	pPTPStatus->i32ClockJitter = self->m_maxClkJitter;
+	pPTPStatus->i32ClockJitter = self->m_TicEngine.m_maxClkJitter;
 
 	//MTAL_DP("[%u] CLK jitter = %u\n", self->m_pEth_netfilter->nic_id, self->m_maxClkJitter);
-	self->m_maxClkJitter = 0;
+	self->m_TicEngine.m_maxClkJitter = 0;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1243,22 +846,19 @@ void GetTICStats(TClock_PTP* self, TTICStats* pTICStats)
 ///////////////////////////////////////////////////////////////////////////////
 uint64_t get_ptp_global_SAC(TClock_PTP* self)
 {
-    return self->m_ui64GlobalSAC;
+    return tic_engine_get_sac(&self->m_TicEngine);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 uint64_t get_ptp_global_time(TClock_PTP* self)
 {
-    return self->m_ui64GlobalTime;
+    return tic_engine_get_time(&self->m_TicEngine);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 /* Multi-rate Stage 3: the sampling rate this clock's SAC is counted at.
- * Used by the manager's per-PCM SAC derivation to scale this clock's SAC
- * to a chip running at a different rate. m_ui32SamplingRate is set in
- * StartAudioFrameTICTimer (IO stopped); a plain word-sized read here is
- * fine for the hot path. */
+ * W5: delegates to the servo's single step-1 engine. */
 uint32_t get_ptp_sampling_rate(TClock_PTP* self)
 {
-    return self->m_ui32SamplingRate;
+    return tic_engine_get_rate(&self->m_TicEngine);
 }
