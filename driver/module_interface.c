@@ -237,13 +237,8 @@ static int __init merging_alsa_mod_init(void)
         cleanup_netlink();
         goto _failed;
     }
-    err = init_clock_timer();
-    if(err < 0)
-    {
-        cleanup_netlink();
-        destroy_driver();
-        goto _failed;
-    }
+    /* W5: clock timers are per (domain, rate) registry entry, initialised
+     * by the manager as entries are created — no module-level timer. */
     printk(KERN_INFO "Merging RAVENNA ALSA module installed\n");
 
     return 0;
@@ -256,7 +251,6 @@ _failed:
  */
 static void __exit merging_alsa_mod_exit(void)
 {
-    kill_clock_timer();
     cleanup_netlink();
     destroy_driver();
     printk(KERN_INFO "Merging RAVENNA ALSA module removed\n");

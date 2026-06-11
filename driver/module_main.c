@@ -107,27 +107,11 @@ void nf_hook_fct(void* hook_fct, void* hook_struct)
     EtherTubeHookFct(&man, hook_fct, hook_struct);
 }
 
-void t_clock_timer(void* next, uint64_t now)
+void t_clock_timer_tick(void* entry_ctx, void* next, uint64_t now)
 {
-    uint64_t ui64CurrentRTXClockTime[_MAX_NICS];
-    unsigned short uSelectedNIC = 0;
-
-    Select_PTP_NIC(&man);
-    uSelectedNIC = GetSelected_PTP_NIC(&man);
-
-    timerProcess(GetPTP(&man, 0), &ui64CurrentRTXClockTime[0], now);
-    timerProcess(GetPTP(&man, 1), &ui64CurrentRTXClockTime[1], now);
-  
-    if (uSelectedNIC == 1)
-    {
-        *(uint64_t*)next = ui64CurrentRTXClockTime[1];
-        timerSetNextAbsoluteTime(GetPTP(&man, 0), ui64CurrentRTXClockTime[1]);
-    }
-    else
-    {
-        *(uint64_t*)next = ui64CurrentRTXClockTime[0];
-        timerSetNextAbsoluteTime(GetPTP(&man, 1), ui64CurrentRTXClockTime[0]);
-    }
-
-    AudioFrameTIC(&man);
+    /* W5: the per-(domain, rate) hrtimer callback. All tick work — engine
+     * advance/schedule on both NIC servos, the servo periodic checks,
+     * per-entry NIC selection, ST2022-7 standby rephase and the audio
+     * pump — lives in manager_entry_tick. */
+    manager_entry_tick((struct tic_timer_entry*)entry_ctx, (uint64_t*)next, now);
 }

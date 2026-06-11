@@ -150,6 +150,13 @@ void tic_engine_snapshot_at_t2(TTicEngine* self);
 void tic_engine_prelock_phase_init(TTicEngine* self, uint64_t ui64T1, uint64_t ui64DeltaT1);
 void tic_engine_steer(TTicEngine* self, uint64_t ui64T1);
 
+/* W5: phase-init for an engine started while its servo is already
+ * PTP-locked (adding a rate must not glitch running engines — no
+ * ResetPTPLock). First tick lands just past the next frame boundary per
+ * the live RTX<->PTP offset; TIC convergence follows via steering.
+ * Caller holds the servo's m_csPTPTime. */
+void tic_engine_phase_init_from_locked(TTicEngine* self);
+
 /* The two halves of the old timerProcess (servo link/watchdog checks run
  * between them). Take the servo lock internally, as timerProcess did.
  * advance: tick bookkeeping, Q/R classification, TICSAC publication.
