@@ -11,6 +11,10 @@
 *  Date           : 14/04/2016
 *  Modification   : Linux driver port, removed floating point,
 *                   changed time ref unit, stabiliy increased
+*  Modified by    : multi-pcm-stage1 fork
+*  Date           : 06/2026
+*  Modification   : multi-rate W5 — TClock_PTP slimmed to PTP discipline;
+*                   rate-keyed TIC state moved to TTicEngine (tic_engine.h)
 *  Known problems : None
 *
 * Copyright(C) 2017 Merging Technologies
