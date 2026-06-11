@@ -37,6 +37,7 @@
 
 #include "PTP.h"
 #include "RTP_streams_manager.h"
+#include "module_timer.h"
 
 #include "../common/MergingRAVENNACommon.h"
 #include "../common/MT_ALSA_message_defs.h"
@@ -82,6 +83,38 @@ _Static_assert(MR_ALSA_MAX_EXTRA_PCMS == MAX_PCMS - 1,
 //#define MT_TONE_TEST 1
 //#define MT_RAMP_TEST 1
 
+/*
+ * Multi-rate W5: the (domain, tick_rate) timer registry. One entry per
+ * unique tick cadence; same-rate chips share an entry (Decision 2). Each
+ * entry owns its own hrtimer instance, a TIC engine per NIC servo
+ * (ST2022-7 pair, slaved standby), a chip refcount (W10 RemovePCM hook)
+ * and its own active-NIC selection.
+ *
+ * active_nic is single-writer: only this entry's timer callback
+ * (manager_entry_tick → tic_entry_select_nic) writes it; every other
+ * context reads with READ_ONCE. That makes per-entry NIC selection
+ * race-free by construction — there is no domain-global selection state
+ * (Decision 9 annotation, 2026-06-11).
+ *
+ * Eight valid tick rates (44.1/48/88.2/96/176.4/192/352.8/384 kHz; DSD
+ * keys on its 352.8k tick-rate clock domain, not the 2.8M bit rate).
+ */
+#define MAX_TIC_ENTRIES 8
+
+struct TManager;
+
+struct tic_timer_entry
+{
+    bool active;                        /// slot in use; published with release
+    uint8_t domain;                     /// PTP domain (0 until W11)
+    uint32_t tick_rate;                 /// registry key (DSD: 352800)
+    uint32_t frame_size;                /// samples per tick at tick_rate
+    unsigned int chip_refcount;         /// chips bound to this cadence
+    volatile unsigned short active_nic; /// single-writer: this entry's timer callback
+    TTicEngine engine[_MAX_NICS];       /// one per NIC servo
+    struct clock_timer timer;           /// this entry's own hrtimer
+    struct TManager* mgr;
+};
 
 struct TManager
 {
@@ -90,8 +123,6 @@ struct TManager
     TEtherTubeNetfilter m_EthernetFilter[_MAX_NICS];
     TClock_PTP m_PTP[_MAX_NICS];
     TRTP_streams_manager m_RTP_streams_manager;
-    EPTPLockStatus m_lastLockStatus[_MAX_NICS];
-    unsigned short m_Active_PTP_NIC_Idx;
     uint32_t m_NumberOfInputs;
     uint32_t m_NumberOfOutputs;
     uint64_t m_RingBufferFrameSize;
@@ -130,6 +161,13 @@ struct TManager
     uint32_t m_uPCMCount;                           /// number of valid entries in m_apALSAChip
     const struct ravenna_mgr_ops *m_alsa_driver_frontend;   /// Manager to ALSA driver (e.g. buffers access and lock)
     struct alsa_ops m_alsa_callbacks;                /// ALSA driver to Manager (e.g. audio setup at runtime)
+
+    /* Multi-rate W5: the (domain, tick_rate) timer registry, and the
+     * chip → entry map (the per-chip clock handle — the W11 chokepoint).
+     * m_apChipEntry slots are published with release before the matching
+     * m_apALSAChip slot, read with acquire from the tick/RTP paths. */
+    struct tic_timer_entry m_TicTimers[MAX_TIC_ENTRIES];
+    struct tic_timer_entry* m_apChipEntry[MAX_PCMS];
 };
 
 
@@ -154,9 +192,12 @@ bool SetMaxTICFrameSize(struct TManager* self, uint64_t max_frameSize);
 bool SetNumberOfInputs(struct TManager* self, uint32_t NumberOfChannels);
 bool SetNumberOfOutputs(struct TManager* self, uint32_t NumberOfChannels);
 
-TClock_PTP* GetPTP(struct TManager* self, unsigned short ptp_idx);
-void Select_PTP_NIC(struct TManager* self);
-unsigned short GetSelected_PTP_NIC(struct TManager* self);
+/* W5: per-(domain, rate) tick — called from each entry's hrtimer callback
+ * via t_clock_timer_tick. Advances both NIC engines, runs the servo
+ * periodic checks, re-evaluates this entry's NIC selection, programs the
+ * next wakeup from the active engine, rephases the standby, and pumps
+ * audio for this entry. */
+void manager_entry_tick(struct tic_timer_entry* entry, uint64_t* pui64NextRTXClockTime, uint64_t ui64Now);
 
 bool IsStarted(struct TManager* self);
 bool IsIOStarted(struct TManager* self);

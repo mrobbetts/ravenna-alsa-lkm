@@ -126,6 +126,16 @@ static int cosbuf[48] = {
 #endif // MT_TONE_TEST
 
 //////////////////////////////////////////////////////////////////////////////////
+/* W5 registry helpers (definitions follow Set* functions, which use them) */
+static uint32_t tick_rate_for_sample_rate(uint32_t sample_rate);
+static void tic_entry_refresh_base_period(struct tic_timer_entry* entry);
+static void tic_entry_start(struct TManager* self, struct tic_timer_entry* entry, bool bResetPTPLock);
+static void tic_entry_stop(struct TManager* self, struct tic_timer_entry* entry);
+static struct tic_timer_entry* get_or_create_tic_entry(struct TManager* self, uint8_t domain, uint32_t sample_rate);
+static void put_tic_entry(struct TManager* self, struct tic_timer_entry* entry);
+static void manager_audio_frame_tic(struct TManager* self, struct tic_timer_entry* entry);
+
+//////////////////////////////////////////////////////////////////////////////////
 bool init(struct TManager* self, int* errorCode)
 {
     bool theAnswer = true;
@@ -135,11 +145,11 @@ bool init(struct TManager* self, int* errorCode)
     self->m_Is_NIC_Active[0] = true;
     self->m_Is_NIC_Active[1] = false;
     
-    self->m_Active_PTP_NIC_Idx = 0;
-    for (i = 0; i < _MAX_NICS; i++)
-    {
-        self->m_lastLockStatus[i] = PTPLS_UNLOCKED;
-    }    
+    /* W5: per-entry NIC selection — no domain-global selection state.
+     * Registry slots and the chip->entry map start empty; chip 0's entry
+     * is created when its chip attaches during card init below. */
+    memset(self->m_TicTimers, 0, sizeof(self->m_TicTimers));
+    memset(self->m_apChipEntry, 0, sizeof(self->m_apChipEntry));
 
     self->m_bIsStarted = false;
     self->m_bIORunning = false;
@@ -252,6 +262,22 @@ void destroy(struct TManager* self)
 
     mr_alsa_audio_card_exit();
     destroy_(&self->m_RTP_streams_manager);
+    /* W5 safety sweep: card_exit should drop every chip's entry reference
+     * via detach_alsa_driver, but the unload path is known-leaky (W10:
+     * card_free doesn't clear m_apALSAChip[]). Force-free any entry still
+     * active so engine SAC locks aren't leaked and its hrtimer is
+     * cancelled before the servos are destroyed. */
+    {
+        unsigned int t;
+        for (t = 0; t < MAX_TIC_ENTRIES; t++)
+        {
+            struct tic_timer_entry* entry = &self->m_TicTimers[t];
+            if (!entry->active)
+                continue;
+            entry->chip_refcount = 1;
+            put_tic_entry(self, entry);
+        }
+    }
     for (i = 0; i < _MAX_NICS; i++)
     {
         destroy_ptp(&self->m_PTP[i]);
@@ -272,14 +298,18 @@ void destroy(struct TManager* self)
 bool start(struct TManager* self)
 {
     int i = 0;
-    for (i = 0; i < _MAX_NICS; i++)
+    unsigned int t;
+    /* W5: per-entry engines + hrtimer. Entry metadata (tick_rate,
+     * frame_size) already tracks m_SampleRate via UpdateFrameSize;
+     * bResetPTPLock=true preserves the legacy StartAudioFrameTICTimer
+     * relock semantics on the start path. */
+    for (t = 0; t < MAX_TIC_ENTRIES; t++)
     {
-        if (self->m_Is_NIC_Active[i])
-        {
-            StartAudioFrameTICTimer(&self->m_PTP[i], get_frame_size(self), (IsDSDRate(self->m_SampleRate) ? 352800 : self->m_SampleRate));
-        }
+        struct tic_timer_entry* entry = &self->m_TicTimers[t];
+        if (!entry->active)
+            continue;
+        tic_entry_start(self, entry, true);
     }
-    start_clock_timer();
     for (i = 0; i < _MAX_NICS; i++)
     {
         EnableEtherTube(&self->m_EthernetFilter[i], 1);
@@ -315,11 +345,15 @@ bool stop(struct TManager* self)
         EnableEtherTube(&self->m_EthernetFilter[i], 0);
     }
 
-    stop_clock_timer();
-    
-    for (i = 0; i < _MAX_NICS; i++)
     {
-        StopAudioFrameTICTimer(&self->m_PTP[i]);
+        unsigned int t;
+        for (t = 0; t < MAX_TIC_ENTRIES; t++)
+        {
+            struct tic_timer_entry* entry = &self->m_TicTimers[t];
+            if (!entry->active)
+                continue;
+            tic_entry_stop(self, entry);
+        }
     }
 
     self->m_bIsStarted = false;
@@ -527,6 +561,21 @@ void UpdateFrameSize(struct TManager* self)
         if (frontend && chip0 && frontend->set_pcm_sample_rate)
             frontend->set_pcm_sample_rate(chip0, self->m_SampleRate, self->m_ui32FrameSize);
     }
+
+    /* W5: chip 0's registry entry follows the manager-wide rate (its
+     * historical relationship). Engines pick the new values up via
+     * tic_entry_start on the start / rate-change paths; refreshing the
+     * metadata here keeps the registry key correct even while stopped
+     * (the daemon sets rate before AddPCM and before Start). */
+    {
+        struct tic_timer_entry* entry = smp_load_acquire(&self->m_apChipEntry[0]);
+        if (entry)
+        {
+            entry->tick_rate = tick_rate_for_sample_rate(self->m_SampleRate);
+            entry->frame_size = self->m_ui32FrameSize;
+            tic_entry_refresh_base_period(entry);
+        }
+    }
 }
 
 //////////////////////////////////////////////////////////////////////////////////
@@ -568,7 +617,6 @@ bool SetInterfaceName(struct TManager* self, const char* cInterfaceName, const i
 //////////////////////////////////////////////////////////////////////////////////
 bool SetSamplingRate(struct TManager* self, uint32_t samplingRate)
 {
-    int i;
     uint64_t nbloop = 0;
     //MTAL_DP("CManager::SetSamplingRate from %u to %u\n", self->m_SampleRate, samplingRate);
 
@@ -590,14 +638,9 @@ bool SetSamplingRate(struct TManager* self, uint32_t samplingRate)
 
     if(self->m_bIsStarted)
     {
-        for (i = 0; i < _MAX_NICS; i++)
-        {
-            if (self->m_Is_NIC_Active[i])
-            {
-                StartAudioFrameTICTimer(&self->m_PTP[i], get_frame_size(self), (IsDSDRate(self->m_SampleRate) ? 352800 : self->m_SampleRate));
-            }
-        }
-        start_clock_timer();
+        struct tic_timer_entry* entry = smp_load_acquire(&self->m_apChipEntry[0]);
+        if (entry)
+            tic_entry_start(self, entry, true); /* re-key engines + relock (legacy semantics) */
         do
         {
             CW_msleep_interruptible(1);
@@ -617,7 +660,6 @@ bool SetSamplingRate(struct TManager* self, uint32_t samplingRate)
 //////////////////////////////////////////////////////////////////////////////////
 bool SetDSDSamplingRate(struct TManager* self, uint32_t samplingRate)
 {
-    int i = 0;
     uint64_t nbloop = 0;
     MTAL_DP("CManager::SetDSDSamplingRate(%u)\n", samplingRate);
 
@@ -639,14 +681,9 @@ bool SetDSDSamplingRate(struct TManager* self, uint32_t samplingRate)
 
     if(self->m_bIsStarted)
     {
-        for (i = 0; i < _MAX_NICS; i++)
-        {
-            if (self->m_Is_NIC_Active[i])
-            {
-                StartAudioFrameTICTimer(&self->m_PTP[i], get_frame_size(self), (IsDSDRate(self->m_SampleRate) ? 352800 : self->m_SampleRate));
-            }
-        }
-        start_clock_timer();
+        struct tic_timer_entry* entry = smp_load_acquire(&self->m_apChipEntry[0]);
+        if (entry)
+            tic_entry_start(self, entry, true); /* re-key engines + relock (legacy semantics) */
         do
         {
             CW_msleep_interruptible(1);
@@ -726,47 +763,259 @@ bool SetNumberOfOutputs(struct TManager* self, uint32_t NumberOfChannels)
 }
 
 //////////////////////////////////////////////////////////////////////////////////
-TClock_PTP* GetPTP(struct TManager* self, unsigned short ptp_idx)
+// W5: the (domain, tick_rate) timer registry
+//////////////////////////////////////////////////////////////////////////////////
+
+/* DSD chips publish their bit rate (e.g. 2,822,400) but tick in the
+ * 352.8k clock domain — the registry keys on the TICK rate (the W5 DSD
+ * unit fix; pre-W5 the SAC derivation wrongly scaled DSD by 8). */
+static uint32_t tick_rate_for_sample_rate(uint32_t sample_rate)
 {
-    if (ptp_idx < _MAX_NICS)
-    {
-        return &self->m_PTP[ptp_idx];
-    }
-    return NULL;
+    return IsDSDRate(sample_rate) ? 352800 : sample_rate;
 }
 
-//////////////////////////////////////////////////////////////////////////////////
-void Select_PTP_NIC(struct TManager* self)
+static void tic_entry_refresh_base_period(struct tic_timer_entry* entry)
 {
-    int i = 0;
+    set_base_period(&entry->timer, ((uint64_t)entry->frame_size * 1000000000ULL) / entry->tick_rate);
+}
+
+/* Start (or re-key) an entry's engines and arm its hrtimer.
+ * bResetPTPLock=true reproduces the legacy StartAudioFrameTICTimer
+ * semantics (manager start / global rate change: rate or frame size
+ * changed, so computation made during PTP locking is no longer valid).
+ * bResetPTPLock=false is the add-a-rate-to-a-live-domain path (W5
+ * decoupling): the servo's PTP lock — and therefore every other running
+ * engine on this domain — is left untouched; if the servo is already
+ * locked the engine phase-inits directly from the live offset. */
+static void tic_entry_start(struct TManager* self, struct tic_timer_entry* entry, bool bResetPTPLock)
+{
+    int i;
     for (i = 0; i < _MAX_NICS; i++)
     {
-        EPTPLockStatus lockStatus = GetLockStatus(&self->m_PTP[i]);
-        if (self->m_lastLockStatus[i] != lockStatus)
+        TClock_PTP* pServo = &self->m_PTP[i];
+        if (!self->m_Is_NIC_Active[i])
+            continue;
+        spin_lock((spinlock_t*)pServo->m_csPTPTime);
+        tic_engine_start(&entry->engine[i], entry->frame_size, entry->tick_rate);
+        if (!bResetPTPLock && pServo->m_usPTPLockCounter == 0)
+            tic_engine_phase_init_from_locked(&entry->engine[i]);
+        spin_unlock((spinlock_t*)pServo->m_csPTPTime);
+        if (bResetPTPLock)
+            ResetPTPLock(pServo, true);
+    }
+    tic_entry_refresh_base_period(entry);
+    start_clock_timer(&entry->timer);
+}
+
+/* Stop an entry: cancel its hrtimer, stop its engines. The ResetPTPLock
+ * mirrors the legacy StopAudioFrameTICTimer (note it resets ALL of the
+ * servo's engines — acceptable because today's only callers are the
+ * global stop/teardown paths; W10's selective RemovePCM quiesce will want
+ * a gentler variant). */
+static void tic_entry_stop(struct TManager* self, struct tic_timer_entry* entry)
+{
+    int i;
+    stop_clock_timer(&entry->timer);
+    for (i = 0; i < _MAX_NICS; i++)
+    {
+        tic_engine_stop(&entry->engine[i]);
+        ResetPTPLock(&self->m_PTP[i], true);
+    }
+}
+
+/* Find-or-create with chip refcounting. Netlink context only. */
+static struct tic_timer_entry* get_or_create_tic_entry(struct TManager* self, uint8_t domain, uint32_t sample_rate)
+{
+    uint32_t tick_rate = tick_rate_for_sample_rate(sample_rate);
+    struct tic_timer_entry* entry = NULL;
+    unsigned int t, nic;
+
+    for (t = 0; t < MAX_TIC_ENTRIES; t++)
+    {
+        struct tic_timer_entry* e = &self->m_TicTimers[t];
+        if (e->active && e->domain == domain && e->tick_rate == tick_rate)
         {
-            printk("PTP lock [%d] status changed from %d to %d\n", i, self->m_lastLockStatus[i], lockStatus);
-            self->m_lastLockStatus[i] = lockStatus;
+            e->chip_refcount++;
+            return e;
         }
     }
 
-    if (self->m_lastLockStatus[0] == PTPLS_LOCKED && GetPTPPriority(&self->m_PTP[0]) <= GetPTPPriority(&self->m_PTP[1]))
+    /* W5 step 2 interim gate: AudioFrameTIC is not yet rate-filtered
+     * (step 3), so a second live entry would double-pump every chip and
+     * stream once per cadence. Fail loud; step 3 lifts this. */
+    for (t = 0; t < MAX_TIC_ENTRIES; t++)
     {
-        self->m_Active_PTP_NIC_Idx = 0;
+        if (self->m_TicTimers[t].active)
+        {
+            MTAL_DP_ERR("get_or_create_tic_entry: tick rate %u (domain %u) refused — a %u entry exists and the tick path is not rate-filtered until W5 step 3\n",
+                        tick_rate, domain, self->m_TicTimers[t].tick_rate);
+            return NULL;
+        }
     }
-    else if (self->m_lastLockStatus[1] == PTPLS_LOCKED)
+
+    for (t = 0; t < MAX_TIC_ENTRIES; t++)
     {
-        self->m_Active_PTP_NIC_Idx = 1;
+        if (!self->m_TicTimers[t].active)
+        {
+            entry = &self->m_TicTimers[t];
+            break;
+        }
+    }
+    if (!entry)
+        return NULL;
+
+    entry->mgr = self;
+    entry->domain = domain;
+    entry->tick_rate = tick_rate;
+    entry->frame_size = compute_frame_size_for_rate(sample_rate, self->m_TICFrameSizeAt1FS, self->m_MaxFrameSize);
+    entry->chip_refcount = 1;
+    entry->active_nic = 0;
+    for (nic = 0; nic < _MAX_NICS; nic++)
+    {
+        tic_engine_init(&entry->engine[nic], &self->m_PTP[nic]);
+        clock_ptp_attach_engine(&self->m_PTP[nic], &entry->engine[nic]);
+    }
+    init_clock_timer(&entry->timer, entry);
+    tic_entry_refresh_base_period(entry);
+    /* publish before any chip maps to it */
+    smp_store_release(&entry->active, true);
+
+    /* Created onto a running manager (AddPCM at a new rate): start it
+     * WITHOUT resetting the domain's PTP lock — running engines on other
+     * entries must not glitch. (Unreachable until step 3 lifts the gate
+     * above; chip 0's entry is created before the manager starts.) */
+    if (self->m_bIsStarted)
+        tic_entry_start(self, entry, false);
+    return entry;
+}
+
+/* Drop a chip's reference; on the last one, quiesce and free the entry.
+ * Netlink/teardown context. NOTE: an RTP/tick-path reader that resolved
+ * this entry just before the final put can briefly hold a pointer to it —
+ * same exposure class as the known unload-with-streams UAF (W10 hardens
+ * the lifecycle; until then the W4 hygiene rule "remove streams before
+ * unload" covers the only caller paths). */
+static void put_tic_entry(struct TManager* self, struct tic_timer_entry* entry)
+{
+    int i;
+    if (!entry || entry->chip_refcount == 0)
+        return;
+    if (--entry->chip_refcount > 0)
+        return;
+    stop_clock_timer(&entry->timer);
+    for (i = 0; i < _MAX_NICS; i++)
+    {
+        tic_engine_stop(&entry->engine[i]);
+        clock_ptp_detach_engine(&self->m_PTP[i], &entry->engine[i]);
+        tic_engine_destroy(&entry->engine[i]);
+    }
+    smp_store_release(&entry->active, false);
+}
+
+/* Per-entry NIC selection — today's preference rule (priority-preferred
+ * NIC 0, else NIC 1, else default 0) with per-entry eligibility:
+ * eligible = servo PTP-locked AND this entry's engine on that NIC
+ * TIC-locked (tic_engine_lock_status is exactly that composite). Selection
+ * eligibility and the pump gate are the same predicate by construction.
+ * Single-writer: only this entry's timer callback calls this. */
+static void tic_entry_select_nic(struct TManager* self, struct tic_timer_entry* entry)
+{
+    bool elig0 = tic_engine_lock_status(&entry->engine[0]) == PTPLS_LOCKED;
+    bool elig1 = tic_engine_lock_status(&entry->engine[1]) == PTPLS_LOCKED;
+
+    if (elig0 && GetPTPPriority(&self->m_PTP[0]) <= GetPTPPriority(&self->m_PTP[1]))
+    {
+        WRITE_ONCE(entry->active_nic, 0);
+    }
+    else if (elig1)
+    {
+        WRITE_ONCE(entry->active_nic, 1);
     }
     else
     {
-        self->m_Active_PTP_NIC_Idx = 0;
+        WRITE_ONCE(entry->active_nic, 0);
     }
 }
 
-//////////////////////////////////////////////////////////////////////////////////
-unsigned short GetSelected_PTP_NIC(struct TManager* self)
+/* The per-(domain, rate) tick: today's t_clock_timer, parameterized by
+ * entry. Order preserved from the legacy callback: selection first (on
+ * lock state as of the previous tick), both engines advance, servo
+ * checks, both engines schedule, hrtimer follows the active engine, the
+ * standby engine is rephased to it (ST2022-7 slaving, per rate), then the
+ * audio pump for this entry. */
+void manager_entry_tick(struct tic_timer_entry* entry, uint64_t* pui64NextRTXClockTime, uint64_t ui64Now)
 {
-    return self->m_Active_PTP_NIC_Idx;
+    struct TManager* self = entry->mgr;
+    TTicEngineTickCtx ctx[_MAX_NICS];
+    uint64_t cand[_MAX_NICS];
+    unsigned short nic, active, standby;
+
+    tic_entry_select_nic(self, entry);
+
+    for (nic = 0; nic < _MAX_NICS; nic++)
+        tic_engine_tick_advance(&entry->engine[nic], &ctx[nic]);
+
+    for (nic = 0; nic < _MAX_NICS; nic++)
+    {
+        if (ctx[nic].bStarted)
+            clock_ptp_periodic_checks(&self->m_PTP[nic], ctx[nic].ui64CurrentRTXClockTime);
+    }
+
+    for (nic = 0; nic < _MAX_NICS; nic++)
+    {
+        /* Default one base period out: schedule leaves the candidate
+         * untouched for a not-started engine, and a zero/now value would
+         * busy-spin the hrtimer callback if selection defaults to a NIC
+         * whose engine isn't ticking (e.g. NIC-1-only configs before
+         * lock). */
+        cand[nic] = ui64Now + entry->timer.base_period_;
+        tic_engine_tick_schedule(&entry->engine[nic], &ctx[nic], &cand[nic]);
+    }
+
+    active = entry->active_nic; /* plain read: we are the only writer */
+    standby = (unsigned short)(active == 0 ? 1 : 0);
+
+    *pui64NextRTXClockTime = cand[active];
+    tic_engine_set_next_abs_time(&entry->engine[standby], cand[active]);
+
+    manager_audio_frame_tic(self, entry);
+}
+
+/* Forward decl (defined with the per-PCM tick-path helpers below). */
+static void* resolve_chip(struct TManager* self, uint32_t pcm_id, const struct ravenna_mgr_ops **out_frontend);
+
+static TTicEngine* active_engine_of(struct tic_timer_entry* entry)
+{
+    return &entry->engine[READ_ONCE(entry->active_nic)];
+}
+
+//////////////////////////////////////////////////////////////////////////////////
+/*
+ * W5: the per-chip clock handle — chip -> (domain, tick_rate) entry ->
+ * that entry's active-NIC engine. The SINGLE chokepoint that maps a
+ * pcm_id to the media clock that anchors it (Decision 9: W11 makes the
+ * entry lookup domain-aware here and nowhere else).
+ *
+ * Safe-fail mirrors the legacy get_clock_for_pcm: an unmapped pcm_id
+ * resolves to chip 0's entry (the legacy manager-wide clock).
+ */
+static TTicEngine* get_engine_for_pcm(struct TManager* self, uint32_t pcm_id)
+{
+    struct tic_timer_entry* entry = NULL;
+    if (pcm_id < MAX_PCMS)
+        entry = smp_load_acquire(&self->m_apChipEntry[pcm_id]);
+    if (!entry)
+        entry = smp_load_acquire(&self->m_apChipEntry[0]);
+    if (!entry)
+        return NULL;
+    return active_engine_of(entry);
+}
+
+/* Daemon-visible PTP status routes via chip 0's entry (W5 decision 5). */
+static unsigned short manager_status_nic(struct TManager* self)
+{
+    struct tic_timer_entry* entry = smp_load_acquire(&self->m_apChipEntry[0]);
+    return entry ? READ_ONCE(entry->active_nic) : 0;
 }
 
 //////////////////////////////////////////////////////////////////////////////////
@@ -1197,7 +1446,17 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
                     (TRTP_stream_info*)((char*)msg_rcv->data + sizeof(int32_t));
                 MTAL_DP_INFO("Add RTP stream pcm_id=%d, channels=%d\n",
                              pcm_id, rtp_stream_info_ptr->m_byNbOfChannels);
-                if (add_RTP_stream_(&self->m_RTP_streams_manager, rtp_stream_info_ptr, &stream_handle))
+                /* W5: fail-loud if the message's pcm_id prefix and the
+                 * embedded stream binding disagree (also makes the prefix
+                 * load-bearing — it was MTAL_DP_INFO-only, an unused
+                 * variable in release builds). */
+                if (pcm_id < 0 || (uint32_t)pcm_id != rtp_stream_info_ptr->m_uiPCMId)
+                {
+                    MTAL_DP_ERR("Add RTP stream: prefix pcm_id %d != stream m_uiPCMId %u\n",
+                                pcm_id, rtp_stream_info_ptr->m_uiPCMId);
+                    msg_reply.errCode = -EINVAL;
+                }
+                else if (add_RTP_stream_(&self->m_RTP_streams_manager, rtp_stream_info_ptr, &stream_handle))
                 {
                     MTAL_DP_INFO("self->m_RTP_streams_manager stream_handle = %llu\n", stream_handle);
 
@@ -1254,7 +1513,7 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             //MTAL_DP_INFO("Get PTP Config\n");
 
             TPTPConfig ptpConfig;
-            GetPTPConfig(&self->m_PTP[self->m_Active_PTP_NIC_Idx], &ptpConfig);
+            GetPTPConfig(&self->m_PTP[manager_status_nic(self)], &ptpConfig);
 
             msg_reply.errCode = 0;
             msg_reply.dataSize = sizeof(TPTPConfig);
@@ -1268,7 +1527,7 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             //MTAL_DP_INFO("Get PTP Status\n");
 
             TPTPStatus ptpStatus;
-             GetPTPStatus(&self->m_PTP[self->m_Active_PTP_NIC_Idx], &ptpStatus);
+            GetPTPStatus(&self->m_PTP[manager_status_nic(self)], &ptpStatus);
 
             msg_reply.errCode = 0;
             msg_reply.dataSize = sizeof(TPTPStatus);
@@ -1576,28 +1835,10 @@ EDispatchResult DispatchPacket(struct TManager* self, void* pBuffer, uint32_t pa
 uint64_t get_global_SAC(void* user)
 {
     struct TManager* self = (struct TManager*)user;
-    return get_ptp_global_SAC(&self->m_PTP[self->m_Active_PTP_NIC_Idx]);
-}
-
-/* Forward decl: defined with the other per-PCM tick-path helpers below. */
-static void* resolve_chip(struct TManager* self, uint32_t pcm_id, const struct ravenna_mgr_ops **out_frontend);
-
-//////////////////////////////////////////////////////////////////////////////////
-/*
- * Multi-rate Stage 3: domain-ready clock resolver.
- *
- * This is the SINGLE chokepoint that maps a pcm_id to the PTP clock that
- * anchors it, instead of scattering &m_PTP[m_Active_PTP_NIC_Idx] across the
- * per-PCM SAC code. Today every PCM is anchored to the one active clock of
- * the single PTP domain, so pcm_id is ignored. When multi-domain lands
- * (Stage 9), this is where pcm_id -> domain -> that domain's active clock
- * gets resolved, and it's the ONLY site that needs to change — the per-PCM
- * SAC callers below stay as-is.
- */
-static TClock_PTP* get_clock_for_pcm(struct TManager* self, uint32_t pcm_id)
-{
-    (void)pcm_id; /* single-domain: all PCMs share the active clock */
-    return &self->m_PTP[self->m_Active_PTP_NIC_Idx];
+    struct tic_timer_entry* entry = smp_load_acquire(&self->m_apChipEntry[0]);
+    if (!entry)
+        return 0;
+    return tic_engine_get_sac(active_engine_of(entry));
 }
 
 //////////////////////////////////////////////////////////////////////////////////
@@ -1632,16 +1873,25 @@ uint64_t get_global_SAC_for_pcm(void* user, uint32_t pcm_id)
     struct TManager* self = (struct TManager*)user;
     const struct ravenna_mgr_ops *frontend = NULL;
     void *chip = resolve_chip(self, pcm_id, &frontend);
-    TClock_PTP* clock = get_clock_for_pcm(self, pcm_id);
-    uint64_t clock_sac = get_ptp_global_SAC(clock);
+    /* W5 step 2: the clock is the chip's entry's active engine (chip-0
+     * entry as legacy safe-fail). The ratio scaling below is unchanged in
+     * this commit — with the single-entry gate it is exact identity for
+     * PCM rates and reproduces the known-wrong DSD x8 of the W2 stopgap;
+     * step 3 replaces it with tick-rate identity. */
+    TTicEngine* engine = get_engine_for_pcm(self, pcm_id);
+    uint64_t clock_sac;
     uint32_t clock_rate;
     uint32_t chip_rate;
     uint64_t whole, frac;
 
+    if (!engine)
+        return 0;
+    clock_sac = tic_engine_get_sac(engine);
+
     if (!chip || !frontend || !frontend->get_pcm_sample_rate)
         return clock_sac;
 
-    clock_rate = get_ptp_sampling_rate(clock);
+    clock_rate = tic_engine_get_rate(engine);
     chip_rate  = frontend->get_pcm_sample_rate(chip);
     if (clock_rate == 0 || chip_rate == 0 || chip_rate == clock_rate)
         return clock_sac;
@@ -1662,13 +1912,24 @@ uint64_t get_global_SAC_for_pcm(void* user, uint32_t pcm_id)
 uint64_t get_global_time(void* user)
 {
     struct TManager* self = (struct TManager*)user;
-    return get_ptp_global_time(&self->m_PTP[self->m_Active_PTP_NIC_Idx]);
+    struct tic_timer_entry* entry = smp_load_acquire(&self->m_apChipEntry[0]);
+    if (!entry)
+        return 0;
+    return tic_engine_get_time(active_engine_of(entry));
 }
 //////////////////////////////////////////////////////////////////////////////////
 void get_global_times(void* user, uint64_t* pui64GlobalSAC, uint64_t* pui64GlobalTime, uint64_t* pui64GlobalPerformanceCounter)
 {
     struct TManager* self = (struct TManager*)user;
-    return get_ptp_global_times(&self->m_PTP[self->m_Active_PTP_NIC_Idx], pui64GlobalSAC, pui64GlobalTime, pui64GlobalPerformanceCounter);
+    struct tic_timer_entry* entry = smp_load_acquire(&self->m_apChipEntry[0]);
+    if (!entry)
+    {
+        *pui64GlobalSAC = 0;
+        *pui64GlobalTime = 0;
+        *pui64GlobalPerformanceCounter = 0;
+        return;
+    }
+    tic_engine_get_times(active_engine_of(entry), pui64GlobalSAC, pui64GlobalTime, pui64GlobalPerformanceCounter);
 } // return the time when the audio frame TIC occured
 
 //////////////////////////////////////////////////////////////////////////////////
@@ -2047,13 +2308,16 @@ unsigned char get_live_out_mute_pattern_for_pcm(void* user, uint32_t pcm_id, uin
 //////////////////////////////////////////////////////////////////////////////////
 // Caudio_streamer_clock_PTP_callback
 //////////////////////////////////////////////////////////////////////////////////
-void AudioFrameTIC(void* user)
+/* W5: the audio pump, per (domain, rate) entry. Step 2 still pumps every
+ * chip and stream from the single permitted entry (step 3 adds the rate
+ * filter and lifts the single-entry gate). The gate is the per-entry
+ * predicate — this entry's active engine fully locked — so selection
+ * eligibility and pumpability are the same condition by construction. */
+static void manager_audio_frame_tic(struct TManager* self, struct tic_timer_entry* entry)
 {
-    struct TManager* self = (struct TManager*)user;
-
     prepare_buffer_lives(&self->m_RTP_streams_manager);
     
-    if (self->m_bIORunning && self->m_lastLockStatus[self->m_Active_PTP_NIC_Idx] == PTPLS_LOCKED)
+    if (self->m_bIORunning && tic_engine_lock_status(&entry->engine[entry->active_nic]) == PTPLS_LOCKED)
     {
         #ifdef MTTRANSPARENCY_CHECK
         {
@@ -2184,6 +2448,18 @@ void AudioFrameTIC(void* user)
     }
 }
 
+/* clock_ptp_ops-compatible legacy entry point. The ops-table member has
+ * been unused since the Linux port routed the pump through module_main
+ * (now through manager_entry_tick), but keep the contract honest: route
+ * via chip 0's entry. */
+void AudioFrameTIC(void* user)
+{
+    struct TManager* self = (struct TManager*)user;
+    struct tic_timer_entry* entry = smp_load_acquire(&self->m_apChipEntry[0]);
+    if (entry)
+        manager_audio_frame_tic(self, entry);
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Streams <> Ravenna Manager communication
 void Init_C_Callbacks(struct TManager* self)
@@ -2290,17 +2566,36 @@ int attach_alsa_driver(void* user, const struct ravenna_mgr_ops *ops, void *alsa
      * ensures that any reader who acquire-loads the chip slot and then
      * the chip's rate/frame_size sees a coherent pair.
      */
-    if (ops->set_pcm_sample_rate && ops->get_pcm_sample_rate)
     {
-        uint32_t chip_rate = ops->get_pcm_sample_rate(alsa_chip_pointer);
-        uint32_t effective_rate = chip_rate ? chip_rate : self->m_SampleRate;
-        uint32_t fsize = compute_frame_size_for_rate(
-            effective_rate,
-            self->m_TICFrameSizeAt1FS,
-            self->m_MaxFrameSize);
-        ops->set_pcm_sample_rate(alsa_chip_pointer, effective_rate, fsize);
-        MTAL_DP("attach_alsa_driver: pcm_id %d rate=%u frame_size=%u (chip-prestashed=%u)\n",
-                pcm_id, effective_rate, fsize, chip_rate);
+        uint32_t effective_rate = self->m_SampleRate;
+        struct tic_timer_entry* entry;
+        if (ops->set_pcm_sample_rate && ops->get_pcm_sample_rate)
+        {
+            uint32_t chip_rate = ops->get_pcm_sample_rate(alsa_chip_pointer);
+            uint32_t fsize;
+            if (chip_rate)
+                effective_rate = chip_rate;
+            fsize = compute_frame_size_for_rate(
+                effective_rate,
+                self->m_TICFrameSizeAt1FS,
+                self->m_MaxFrameSize);
+            ops->set_pcm_sample_rate(alsa_chip_pointer, effective_rate, fsize);
+            MTAL_DP("attach_alsa_driver: pcm_id %d rate=%u frame_size=%u (chip-prestashed=%u)\n",
+                    pcm_id, effective_rate, fsize, chip_rate);
+        }
+        /* W5: bind the chip to its (domain, tick_rate) timer entry — the
+         * per-chip clock handle. Domain is 0 until W11 (DeviceGroup.domain
+         * is planted fail-loud in W7). The map is published before the
+         * chip slot so a tick-path reader that acquires the chip pointer
+         * always finds the entry. */
+        entry = get_or_create_tic_entry(self, 0, effective_rate);
+        if (!entry)
+        {
+            MTAL_DP("attach_alsa_driver: pcm_id %d: no (domain, rate) timer entry for rate %u\n",
+                    pcm_id, effective_rate);
+            return -EINVAL;
+        }
+        smp_store_release(&self->m_apChipEntry[pcm_id], entry);
     }
     /* Publish the slot with release semantics so the hrtimer reader sees
      * the chip pointer only after the chip itself is fully constructed. */
@@ -2327,6 +2622,14 @@ void detach_alsa_driver(void* user, void *alsa_chip_pointer)
          * window where the reader's bound check passes against a stale
          * count but the slot has just been cleared. */
         smp_store_release(&self->m_apALSAChip[i], NULL);
+        /* W5: drop the chip's timer-entry reference (last chip at the
+         * rate frees the entry). Map cleared after the chip slot so no
+         * reader resolves a live chip to a vanished entry. */
+        {
+            struct tic_timer_entry* entry = self->m_apChipEntry[i];
+            smp_store_release(&self->m_apChipEntry[i], NULL);
+            put_tic_entry(self, entry);
+        }
         return;
     }
 }

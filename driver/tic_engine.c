@@ -241,6 +241,46 @@ void tic_engine_steer(TTicEngine* self, uint64_t ui64T1)
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+/* W5: phase-init for an engine started while its servo is already
+ * PTP-locked. The legacy path got its phase from the PTPLockCounter==1
+ * branch of ProcessT1 — which only runs during PTP lock acquisition — so a
+ * rate added to a live domain would otherwise free-run with arbitrary
+ * phase until convergence. Place the first tick just past the next frame
+ * boundary derived from the live RTX<->PTP offset (the same alignment math
+ * as the Q/R classification, inverted); the PI steering pulls in the
+ * residual (sub-period by construction) without touching the servo's PTP
+ * lock — running engines on the same domain are never disturbed.
+ * Caller holds the servo's m_csPTPTime. */
+void tic_engine_phase_init_from_locked(TTicEngine* self)
+{
+    struct TClock_PTP_s* pServo = self->m_pServo;
+    uint64_t ui64Now;
+    uint64_t ui64Samples;
+    uint32_t ui32R;
+    uint64_t ui64ToNextBoundary;
+
+    get_clock_time(&ui64Now);
+    ui64Now /= NS_2_REF_UNIT; // [100us]
+
+    ui64Samples = (uint64_t)((ui64Now - pServo->m_i64TIC_PTPToRTXClockOffset) * (self->m_ui32SamplingRate / 100) / 100);
+    ui32R = CW_ll_modulo(ui64Samples, self->m_ui32FrameSize);
+    ui64ToNextBoundary = ((uint64_t)(self->m_ui32FrameSize - ui32R) * 10000) / self->m_ui32SamplingRate; // [100us]
+
+    self->m_dTIC_CurrentPeriod = self->m_dTIC_BasePeriod;
+    self->m_dTIC_IGR = 0;
+    self->m_usTICLockCounter = TIC_LOCK_HYSTERESIS;
+
+    self->m_ui64TIC_LastRTXClockTime = ui64Now;
+    self->m_ui64TIC_LastRTXClockTimeAtT2 = ui64Now; /* sane until the next sync snapshot */
+
+    /* +5 periods of margin mirrors the prelock branch; the ~sub-period
+     * alignment error from the 100us grid is steered out by the PI loop
+     * while the engine is still gated off (not yet TIC-locked). */
+    self->m_ui64TIC_NextAbsoluteTime = ui64Now + ui64ToNextBoundary + 5 * (self->m_dTIC_BasePeriod / PS_2_REF_UNIT);
+    self->m_dTIC_NextAbsoluteTime_frac = 0;
+}
+
+///////////////////////////////////////////////////////////////////////////////
 static void computeNextAbsoluteTime(TTicEngine* self, uint32_t ui32FrameCount)
 {
     uint64_t ui64Period = self->m_dTIC_CurrentPeriod / PS_2_REF_UNIT; // [ps -> 100us]
