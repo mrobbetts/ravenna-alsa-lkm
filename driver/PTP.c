@@ -37,6 +37,7 @@
 
 #include "PTP.h"
 
+#include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/spinlock.h>
 #include <linux/slab.h>
@@ -57,12 +58,6 @@
 // PTP Domain
 #define PTPMASTER_ANNOUNCE_TIMEOUT	50000000 // [100ns]
 
-
-//////////////////////////////////////////////////////////////
-void get_ptp_global_times(TClock_PTP* self, uint64_t* pui64GlobalSAC, uint64_t* pui64GlobalTime, uint64_t* pui64GlobalPerformanceCounter) // get the time and the SAC atomically
-{
-    tic_engine_get_times(&self->m_TicEngine, pui64GlobalSAC, pui64GlobalTime, pui64GlobalPerformanceCounter);
-}
 
 ///////////////////////////////////////////////////////////////////////////////
 // Helpers
@@ -136,13 +131,12 @@ bool init_ptp(TClock_PTP* self, TEtherTubeNetfilter* pEth_netfilter, clock_ptp_o
 	self->m_ui64PTP_GMID = 0;
 	self->m_ui8PTPClockDomain = 0;
 
-	/* Multi-rate W5: all rate-keyed TIC state lives in the engine. Step 1:
-	 * one embedded engine, attached here — behaviorally identical to the
-	 * pre-extraction single-rate servo. Step 2 moves engine ownership into
-	 * the manager's (domain, rate) timer registry. */
-	tic_engine_init(&self->m_TicEngine, self);
-	self->m_apEngines[0] = &self->m_TicEngine;
-	self->m_uNumEngines = 1;
+	/* Multi-rate W5 step 2: engines are owned by the manager's
+	 * (domain, rate) timer-registry entries and arrive via
+	 * clock_ptp_attach_engine once a chip claims a rate on this domain. */
+	memset(self->m_apEngines, 0, sizeof(self->m_apEngines));
+	self->m_uNumEngines = 0;
+	self->m_lastReportedPTPLock = PTPLS_UNLOCKED;
 
     //////////////
 	self->m_pEth_netfilter = pEth_netfilter;
@@ -167,9 +161,10 @@ bool init_ptp(TClock_PTP* self, TEtherTubeNetfilter* pEth_netfilter, clock_ptp_o
 ///////////////////////////////////////////////////////////////////////////////
 void destroy_ptp(TClock_PTP* self)
 {
-	StopAudioFrameTICTimer(self);
-
-	tic_engine_destroy(&self->m_TicEngine);
+	/* Engines are owned (and destroyed) by the manager's timer-registry
+	 * entries, which the manager tears down — detaching them from this
+	 * servo — before destroy_ptp runs. */
+	ResetPTPLock(self, true);
 
     kfree(self->m_csPTPTime);
 
@@ -190,7 +185,8 @@ void ResetPTPLock(TClock_PTP* self, bool bUseMutex)
 		/* W5: PTP-level events legitimately disturb every rate — reset all
 		 * attached engines (IGR + TIC lock counter). */
 		for (e = 0; e < self->m_uNumEngines; e++)
-			tic_engine_reset(self->m_apEngines[e]);
+			if (self->m_apEngines[e])
+				tic_engine_reset(self->m_apEngines[e]);
 	}
 
 	if(bUseMutex)
@@ -215,7 +211,7 @@ static bool clock_ptp_has_started_engine(TClock_PTP* self)
 	unsigned int e;
 	for (e = 0; e < self->m_uNumEngines; e++)
 	{
-		if (self->m_apEngines[e]->m_bAudioFrameTICTimerStarted)
+		if (self->m_apEngines[e] && self->m_apEngines[e]->m_bAudioFrameTICTimerStarted)
 			return true;
 	}
 	return false;
@@ -427,7 +423,8 @@ EDispatchResult process_PTP_packet(TClock_PTP* self, TUDPPacketBase* pUDPPacketB
 						self->m_ui64T2 = ui64T2;
 						/* W5: snapshot each engine's last tick time at T2 */
 						for (e = 0; e < self->m_uNumEngines; e++)
-							tic_engine_snapshot_at_t2(self->m_apEngines[e]);
+							if (self->m_apEngines[e])
+								tic_engine_snapshot_at_t2(self->m_apEngines[e]);
 					}
 
                     spin_unlock((spinlock_t*)self->m_csPTPTime);
@@ -550,7 +547,8 @@ void ProcessT1(TClock_PTP* self, uint64_t ui64T1)
 					/* W5: initial period syntonization + tick phase placement
 					 * is rate-keyed — fan out to every attached engine. */
 					for (e = 0; e < self->m_uNumEngines; e++)
-						tic_engine_prelock_phase_init(self->m_apEngines[e], ui64T1, ui64DeltaT1);
+						if (self->m_apEngines[e])
+							tic_engine_prelock_phase_init(self->m_apEngines[e], ui64T1, ui64DeltaT1);
 				}
 			}
 		}
@@ -561,7 +559,8 @@ void ProcessT1(TClock_PTP* self, uint64_t ui64T1)
 
 			/* W5: frame alignment + PI steering is rate-keyed — fan out. */
 			for (e = 0; e < self->m_uNumEngines; e++)
-				tic_engine_steer(self->m_apEngines[e], ui64T1);
+				if (self->m_apEngines[e])
+					tic_engine_steer(self->m_apEngines[e], ui64T1);
 		}
 		spin_unlock((spinlock_t*)self->m_csPTPTime);
 	}
@@ -642,101 +641,129 @@ bool SendDelayReq(TClock_PTP* self, TPTPV2MsgFollowUpPacket* pPTPV2MsgFollowUpPa
 ///////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////
 
-void timerSetNextAbsoluteTime(TClock_PTP* self, uint64_t ui64NextAbsoluteTime)
+/* W5 step 2: the servo-level once-per-tick checks the old monolithic
+ * timerProcess ran between the engine advance/schedule halves. Called from
+ * each (domain, rate) entry's timer callback when that NIC's engine is
+ * ticking; the whole body runs under m_csPTPTime because several entry
+ * callbacks can reach it concurrently for the same servo (the old code had
+ * exactly one caller and could leave the gating reads unlocked). */
+void clock_ptp_periodic_checks(TClock_PTP* self, uint64_t ui64CurrentRTXClockTime)
 {
-	tic_engine_set_next_abs_time(&self->m_TicEngine, ui64NextAbsoluteTime);
-}
+	bool bLinkUp = IsLinkUp(self->m_pEth_netfilter);
 
-void timerProcess(TClock_PTP* self, uint64_t* pui64NextRTXClockTime, uint64_t ui64RTXClockTime)
-{
-	TTicEngineTickCtx ctx;
+	spin_lock((spinlock_t*)self->m_csPTPTime);
 
-	/* W5 step 1: single embedded engine. The advance/schedule split (with
-	 * the servo-level link/watchdog checks between them, exactly where the
-	 * old monolithic timerProcess ran them) is the shape the per-(domain,
-	 * rate) timer callbacks build on in step 2. */
-	tic_engine_tick_advance(&self->m_TicEngine, &ctx);
-
-	if (ctx.bStarted)
+	// Check the link status ("!= UNLOCKED" == "PTP counter is 0")
+	if(!bLinkUp && self->m_usPTPLockCounter == 0)
 	{
-		// Check the link status
-		if(!IsLinkUp(self->m_pEth_netfilter) && GetLockStatus(self) != PTPLS_UNLOCKED)
+		MTAL_DP("[%u] PTP detects that the link is down\n", self->m_pEth_netfilter->nic_id);
+		ResetPTPLock(self, false);
+	}
+
+	// PTP watch dog
+	{
+		uint64_t ui64WatchDogElapse = ui64CurrentRTXClockTime - self->m_ui64LastWatchDogTime;
+		if(ui64WatchDogElapse >= PTP_WATCHDOG_ELAPSE)
 		{
-			spin_lock((spinlock_t*)self->m_csPTPTime);
+			if(self->m_wLastWatchDogSyncSequenceId == self->m_wLastSyncSequenceId && self->m_usPTPLockCounter == 0)
 			{
-				MTAL_DP("[%u] PTP detects that the link is down\n", self->m_pEth_netfilter->nic_id);
+				printk("[%u] PTP Master sync timeout, resetting ...\n", self->m_pEth_netfilter->nic_id);
+				MTAL_DP("[%u] Didn't received PTP sync since 2s\n", self->m_pEth_netfilter->nic_id);
+				MTAL_DP("[%u] ui64WatchDogElapse = %llu = %llu - %llu\n", self->m_pEth_netfilter->nic_id, ui64WatchDogElapse, ui64CurrentRTXClockTime, self->m_ui64LastWatchDogTime);
 				ResetPTPLock(self, false);
 			}
-			spin_unlock((spinlock_t*)self->m_csPTPTime);
-		}
-
-		// PTP watch dog
-		{
-			uint64_t ui64WatchDogElapse = ctx.ui64CurrentRTXClockTime - self->m_ui64LastWatchDogTime;
-			if(ui64WatchDogElapse >= PTP_WATCHDOG_ELAPSE)
-			{
-				spin_lock((spinlock_t*)self->m_csPTPTime);
-				if(self->m_wLastWatchDogSyncSequenceId == self->m_wLastSyncSequenceId && GetLockStatus(self) != PTPLS_UNLOCKED)
-				{
-					printk("[%u] PTP Master sync timeout, resetting ...\n", self->m_pEth_netfilter->nic_id);
-					MTAL_DP("[%u] Didn't received PTP sync since 2s\n", self->m_pEth_netfilter->nic_id);
-					MTAL_DP("[%u] ui64WatchDogElapse = %llu = %llu - %llu\n", self->m_pEth_netfilter->nic_id, ui64WatchDogElapse, ctx.ui64CurrentRTXClockTime, self->m_ui64LastWatchDogTime);
-					ResetPTPLock(self, false);
-				}
-				spin_unlock((spinlock_t*)self->m_csPTPTime);
-				self->m_wLastWatchDogSyncSequenceId = self->m_wLastSyncSequenceId;
-				self->m_ui64LastWatchDogTime = ctx.ui64CurrentRTXClockTime;
-			}
+			self->m_wLastWatchDogSyncSequenceId = self->m_wLastSyncSequenceId;
+			self->m_ui64LastWatchDogTime = ui64CurrentRTXClockTime;
 		}
 	}
 
-	tic_engine_tick_schedule(&self->m_TicEngine, &ctx, pui64NextRTXClockTime);
-}
-
-///////////////////////////////////////////////////////////////////////////////
-bool StartAudioFrameTICTimer(TClock_PTP* self, uint32_t ulFrameSize, uint32_t ulSamplingRate)
-{
-	StopAudioFrameTICTimer(self);
-
-	// Atomicity
+	// PTP-lock transition report (replaces the print that lived in the
+	// deleted Select_PTP_NIC; PTP-level only — per-rate TIC transitions
+	// already print from tic_engine_steer)
 	{
-        spin_lock((spinlock_t*)self->m_csPTPTime);
-		tic_engine_start(&self->m_TicEngine, ulFrameSize, ulSamplingRate);
-		set_base_period(self->m_TicEngine.m_dTIC_BasePeriod/1000);
-		spin_unlock((spinlock_t*)self->m_csPTPTime);
+		EPTPLockStatus s = (self->m_usPTPLockCounter == 0) ? PTPLS_LOCKED : PTPLS_UNLOCKED;
+		if (s != self->m_lastReportedPTPLock)
+		{
+			printk("PTP lock [%u] status changed from %d to %d\n", self->m_pEth_netfilter->nic_id, self->m_lastReportedPTPLock, s);
+			self->m_lastReportedPTPLock = s;
+		}
 	}
-	MTAL_DP("[%u] StartAudioFrameTICTimer with...\n", self->m_pEth_netfilter->nic_id);
-	MTAL_DP("self->m_dTIC_BasePeriod = %llu	[ps]\n", self->m_TicEngine.m_dTIC_BasePeriod);
-	MTAL_DP("self->m_ui32FrameSize = %u self->m_ui32SamplingRate = %u\n", self->m_TicEngine.m_ui32FrameSize, self->m_TicEngine.m_ui32SamplingRate);
 
-	// samplingrate and/or framesize changed so computation made during PTP locking is no longer valid
-	ResetPTPLock(self, true);
-
-	return true;
+	spin_unlock((spinlock_t*)self->m_csPTPTime);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-bool StopAudioFrameTICTimer(TClock_PTP* self)
+/* W5: attach a registry entry's engine to this servo's fan-out list.
+ * Netlink context. The list is mutated under m_csPTPTime; lockless readers
+ * (packet gate, GetLockStatus) see the count via release/acquire and
+ * NULL-check the slots. */
+bool clock_ptp_attach_engine(TClock_PTP* self, TTicEngine* pEngine)
 {
-	unsigned int e;
-	for (e = 0; e < self->m_uNumEngines; e++)
-		tic_engine_stop(self->m_apEngines[e]);
+	unsigned int n;
+	bool bOk = false;
 
-    ResetPTPLock(self, true);
+	spin_lock((spinlock_t*)self->m_csPTPTime);
+	n = self->m_uNumEngines;
+	if (n < MAX_TIC_ENGINES_PER_SERVO)
+	{
+		self->m_apEngines[n] = pEngine;
+		/* count published after the slot so a lockless reader never
+		 * indexes an unwritten slot */
+		smp_store_release(&self->m_uNumEngines, n + 1);
+		bOk = true;
+	}
+	spin_unlock((spinlock_t*)self->m_csPTPTime);
 
-	return true;
+	if (!bOk)
+	{
+		MTAL_DP_ERR("[%u] clock_ptp_attach_engine: engine list full\n", self->m_pEth_netfilter->nic_id);
+	}
+	return bOk;
 }
 
-////////////////////////////////////////////////////////////////////
-bool IsAudioFrameTICDropped(TClock_PTP* self, bool bReset)
+///////////////////////////////////////////////////////////////////////////////
+void clock_ptp_detach_engine(TClock_PTP* self, TTicEngine* pEngine)
 {
-	return tic_engine_is_drop(&self->m_TicEngine, bReset);
+	unsigned int i, n;
+
+	spin_lock((spinlock_t*)self->m_csPTPTime);
+	n = self->m_uNumEngines;
+	for (i = 0; i < n; i++)
+	{
+		if (self->m_apEngines[i] != pEngine)
+			continue;
+		/* swap-with-last; a lockless reader racing this sees a valid
+		 * engine pointer or (with a stale count) NULL — both handled */
+		self->m_apEngines[i] = self->m_apEngines[n - 1];
+		smp_store_release(&self->m_uNumEngines, n - 1);
+		self->m_apEngines[n - 1] = NULL;
+		break;
+	}
+	spin_unlock((spinlock_t*)self->m_csPTPTime);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 EPTPLockStatus GetLockStatus(TClock_PTP* self)
 {
-	return tic_engine_lock_status(&self->m_TicEngine);
+	unsigned int e, n, started = 0;
+
+	if(self->m_usPTPLockCounter != 0)
+	{
+		return PTPLS_UNLOCKED;
+	}
+	/* PTP locked: LOCKED only once every started engine's TIC PLL has
+	 * converged (exactly the legacy composite when one engine exists). */
+	n = smp_load_acquire(&self->m_uNumEngines);
+	for (e = 0; e < n; e++)
+	{
+		TTicEngine* pEngine = self->m_apEngines[e];
+		if (!pEngine || !pEngine->m_bAudioFrameTICTimerStarted)
+			continue;
+		started++;
+		if (pEngine->m_usTICLockCounter != 0)
+			return PTPLS_LOCKING;
+	}
+	return started ? PTPLS_LOCKED : PTPLS_LOCKING;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -778,10 +805,21 @@ void GetPTPStatus(TClock_PTP* self, TPTPStatus* pPTPStatus)
     pPTPStatus->nPTPLockStatus = GetLockStatus(self);
     pPTPStatus->ui64GMID[0] = self->m_ui64PTPMaster_GMID;
     pPTPStatus->i32NetworkJitter = 0; // TODO
-	pPTPStatus->i32ClockJitter = self->m_TicEngine.m_maxClkJitter;
-
-	//MTAL_DP("[%u] CLK jitter = %u\n", self->m_pEth_netfilter->nic_id, self->m_maxClkJitter);
-	self->m_TicEngine.m_maxClkJitter = 0;
+	/* W5: report the max clock jitter across this servo's engines and
+	 * reset each (per-engine stats become daemon-visible in W7). */
+	{
+		unsigned int e, n = smp_load_acquire(&self->m_uNumEngines);
+		int32_t maxJitter = 0;
+		for (e = 0; e < n; e++)
+		{
+			TTicEngine* pEngine = self->m_apEngines[e];
+			if (!pEngine)
+				continue;
+			maxJitter = max(pEngine->m_maxClkJitter, maxJitter);
+			pEngine->m_maxClkJitter = 0;
+		}
+		pPTPStatus->i32ClockJitter = maxJitter;
+	}
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -848,22 +886,7 @@ void GetTICStats(TClock_PTP* self, TTICStats* pTICStats)
 	}
 }*/
 
-///////////////////////////////////////////////////////////////////////////////
-uint64_t get_ptp_global_SAC(TClock_PTP* self)
-{
-    return tic_engine_get_sac(&self->m_TicEngine);
-}
-
-///////////////////////////////////////////////////////////////////////////////
-uint64_t get_ptp_global_time(TClock_PTP* self)
-{
-    return tic_engine_get_time(&self->m_TicEngine);
-}
-
-///////////////////////////////////////////////////////////////////////////////
-/* Multi-rate Stage 3: the sampling rate this clock's SAC is counted at.
- * W5: delegates to the servo's single step-1 engine. */
-uint32_t get_ptp_sampling_rate(TClock_PTP* self)
-{
-    return tic_engine_get_rate(&self->m_TicEngine);
-}
+/* W5 step 2: get_ptp_global_SAC/time/times and get_ptp_sampling_rate are
+ * gone — the manager resolves chips to their (domain, rate) entry's active
+ * engine directly (get_engine_for_pcm / the chip-0 entry for legacy
+ * accessors). */

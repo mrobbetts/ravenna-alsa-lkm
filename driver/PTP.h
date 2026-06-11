@@ -108,13 +108,21 @@ typedef struct TClock_PTP_s
     uint64_t m_ui64PTPMaster_GMID;
     //######################################################
 
-    // Multi-rate W5: TIC engines disciplined by this servo. The servo's
-    // sync handler / ProcessT1 / ResetPTPLock fan out to every attached
-    // engine. Steering state inside the engines is protected by THIS
-    // servo's m_csPTPTime.
-    TTicEngine m_TicEngine; /* step 1: the single engine, embedded */
+    // Multi-rate W5: TIC engines disciplined by this servo. Engines are
+    // owned by the manager's (domain, rate) timer-registry entries and
+    // attached/detached here (step 2 — step 1 embedded a single engine).
+    // The servo's sync handler / ProcessT1 / ResetPTPLock fan out to every
+    // attached engine. Steering state inside the engines is protected by
+    // THIS servo's m_csPTPTime; the attach list is mutated under that lock
+    // and read locklessly by the packet gate / status helpers (count
+    // published with release, slots NULL-checked).
     TTicEngine* m_apEngines[MAX_TIC_ENGINES_PER_SERVO];
     unsigned int m_uNumEngines;
+
+    // servo-level PTP-lock transition reporting (the old composite
+    // "PTP lock [n] status changed" print lived in Select_PTP_NIC, which
+    // per-entry NIC selection deletes)
+    EPTPLockStatus m_lastReportedPTPLock;
 
 } TClock_PTP;
 
@@ -125,8 +133,6 @@ extern "C"
 {
 #endif // defined(__cplusplus) f10b pourra etre retire  +extern quand le port C sera termine
 
- void get_ptp_global_times(TClock_PTP* self, uint64_t* pui64GlobalSAC, uint64_t* pui64GlobalTime, uint64_t* pui64GlobalPerformanceCounter); // get the time and the SAC atomically
-
  bool init_ptp(TClock_PTP* self, TEtherTubeNetfilter* pEth_netfilter, clock_ptp_ops* audio_streamer_clock_PTP_callback_ptr);
  void destroy_ptp(TClock_PTP* self);
 
@@ -134,13 +140,22 @@ extern "C"
 
  EDispatchResult process_PTP_packet(TClock_PTP* self, TUDPPacketBase* pUDPPacketBase, uint32_t ui32PacketSize);
 
- bool StartAudioFrameTICTimer(TClock_PTP* self, uint32_t ui32FrameSize, uint32_t ui32SamplingRate);
- bool StopAudioFrameTICTimer(TClock_PTP* self);
- bool IsAudioFrameTICDropped(TClock_PTP* self, bool bReset);
+ /* W5: engine attach/detach (netlink context; takes m_csPTPTime). */
+ bool clock_ptp_attach_engine(TClock_PTP* self, TTicEngine* pEngine);
+ void clock_ptp_detach_engine(TClock_PTP* self, TTicEngine* pEngine);
 
- /* Composite (PTP + TIC) status of this servo's single step-1 engine.
-  * Step 2+ callers that care about a specific rate use
-  * tic_engine_lock_status() on that entry's engine directly. */
+ /* W5: the servo-level once-per-tick checks (link down, sync watchdog,
+  * lock-transition report) that the old monolithic timerProcess ran
+  * between the engine advance/schedule halves. Called from each entry's
+  * timer callback when that NIC's engine is started; internally
+  * self-gated, so multiple entries calling per tick is safe and cheap. */
+ void clock_ptp_periodic_checks(TClock_PTP* self, uint64_t ui64CurrentRTXClockTime);
+
+ /* Composite servo status: UNLOCKED = PTP lock not (yet) acquired;
+  * LOCKING = PTP locked but some started engine still TIC-converging
+  * (or no engine started yet); LOCKED = PTP locked and every started
+  * engine TIC-locked. With one started engine this is exactly the
+  * legacy composite. Per-rate callers use tic_engine_lock_status(). */
  EPTPLockStatus GetLockStatus(TClock_PTP* self);
 
  void SetPTPConfig(TClock_PTP* self, TPTPConfig* pPTPConfig);
@@ -148,11 +163,6 @@ extern "C"
 
  void GetPTPStatus(TClock_PTP* self, TPTPStatus* pPTPStatus);
  uint8_t GetPTPPriority(TClock_PTP* self);
-
- uint64_t get_ptp_global_SAC(TClock_PTP* self);
- uint64_t get_ptp_global_time(TClock_PTP* self);
- /* Multi-rate Stage 3: rate this clock's SAC is counted at (for per-PCM SAC scaling). */
- uint32_t get_ptp_sampling_rate(TClock_PTP* self);
 
  void ResetPTPLock(TClock_PTP* self, bool bUseMutex);
 
@@ -163,11 +173,6 @@ extern "C"
  void ProcessT1(TClock_PTP* self, uint64_t ui64T1); // from Sync or Follow_up
 
  bool SendDelayReq(TClock_PTP* self, TPTPV2MsgFollowUpPacket* pPTPV2MsgFollowUpPacket);
-
-// Timer
-// Audio TIC
- void timerSetNextAbsoluteTime(TClock_PTP* self, uint64_t ui64NextAbsoluteTime);
- void timerProcess(TClock_PTP* self, uint64_t* pui64NextRTXClockTime, uint64_t ui64RTXClockTime);
 
 
 #if defined(__cplusplus)

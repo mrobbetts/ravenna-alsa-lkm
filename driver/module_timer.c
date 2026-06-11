@@ -1,15 +1,17 @@
 /****************************************************************************
 *
 *  Module Name    : module_timer.c
-*  Version        : 
+*  Version        :
 *
 *  Abstract       : RAVENNA/AES67 ALSA LKM
 *
 *  Written by     : Baume Florian
 *  Date           : 15/04/2016
-*  Modified by    :
-*  Date           :
-*  Modification   :
+*  Modified by    : multi-pcm-stage1 fork
+*  Date           : 06/2026
+*  Modification   : multi-rate W5 — instance-based clock timers (one
+*                   hrtimer per (domain, rate) registry entry) replacing
+*                   the file-scope singleton
 *  Known problems : None
 *
 * Copyright(C) 2017 Merging Technologies
@@ -36,12 +38,6 @@
 #include "module_timer.h"
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0) && LINUX_VERSION_CODE < KERNEL_VERSION(6,15,0)
-
-struct tasklet_hrtimer {
-	struct hrtimer		timer;
-	struct tasklet_struct	tasklet;
-	enum hrtimer_restart	(*function)(struct hrtimer *);
-};
 
 static inline
 void tasklet_hrtimer_cancel(struct tasklet_hrtimer *ttimer)
@@ -86,28 +82,28 @@ void tasklet_hrtimer_start(struct tasklet_hrtimer *ttimer, ktime_t time,
 }
 #endif
 
-static uint64_t base_period_;
-static uint64_t max_period_allowed;
-static uint64_t min_period_allowed;
-static int stop_;
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6,15,0)
-static struct tasklet_hrtimer my_hrtimer_;
-#else
-static struct hrtimer my_hrtimer_;
-#endif
-
 static enum hrtimer_restart timer_callback(struct hrtimer *timer)
 {
     int ret_overrun;
     ktime_t period;
     uint64_t next_wakeup;
     uint64_t now;
+    struct clock_timer *ct;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,15,0)
+    {
+        struct tasklet_hrtimer *ttimer =
+            container_of(timer, struct tasklet_hrtimer, timer);
+        ct = container_of(ttimer, struct clock_timer, my_hrtimer_);
+    }
+#else
+    ct = container_of(timer, struct clock_timer, my_hrtimer_);
+#endif
 
     do
     {
         get_clock_time(&now);
-        t_clock_timer(&next_wakeup, now);
+        t_clock_timer_tick(ct->ctx, &next_wakeup, now);
         period = ktime_set(0, next_wakeup - now);
 
         if (now > next_wakeup)
@@ -115,9 +111,9 @@ static enum hrtimer_restart timer_callback(struct hrtimer *timer)
             //printk(KERN_INFO "Timer won't sleep, clock_timer is recall instantly\n");
             period = ktime_set(0, 0);
         }
-        else if (ktime_to_ns(period) > max_period_allowed || ktime_to_ns(period) < min_period_allowed)
+        else if (ktime_to_ns(period) > ct->max_period_allowed || ktime_to_ns(period) < ct->min_period_allowed)
         {
-            //printk(KERN_INFO "Timer period out of range: %lld [ms]. Target period = %lld\n", ktime_to_ns(period) / 1000000, base_period_ / 1000000);
+            //printk(KERN_INFO "Timer period out of range: %lld [ms]. Target period = %lld\n", ktime_to_ns(period) / 1000000, ct->base_period_ / 1000000);
             if (ktime_to_ns(period) > (unsigned long)5E9L)
             {
                 //printk(KERN_ERR "Timer period greater than 5s, set it to 1s!\n");
@@ -125,14 +121,13 @@ static enum hrtimer_restart timer_callback(struct hrtimer *timer)
             }
         }
 
-        if(stop_)
+        if(ct->stop_)
         {
             return HRTIMER_NORESTART;
         }
     }
     while (ktime_to_ns(period) == 0); // this able to be rarely true
 
-    ///ret_overrun = hrtimer_forward(timer, kt_now, period);
     ret_overrun = hrtimer_forward_now(timer, period);
     // comment it when running in VM
     /*if(ret_overrun > 1)
@@ -141,42 +136,36 @@ static enum hrtimer_restart timer_callback(struct hrtimer *timer)
 
 }
 
-int init_clock_timer(void)
+int init_clock_timer(struct clock_timer* ct, void* ctx)
 {
-    stop_ = 0;
+    ct->stop_ = 0;
+    ct->ctx = ctx;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6,15,0)
-    tasklet_hrtimer_init(&my_hrtimer_, timer_callback, CLOCK_MONOTONIC/*_RAW*/, HRTIMER_MODE_ABS);
+    tasklet_hrtimer_init(&ct->my_hrtimer_, timer_callback, CLOCK_MONOTONIC/*_RAW*/, HRTIMER_MODE_ABS);
 #else
-    hrtimer_setup(&my_hrtimer_, timer_callback, CLOCK_MONOTONIC/*_RAW*/, HRTIMER_MODE_ABS_SOFT);
+    hrtimer_setup(&ct->my_hrtimer_, timer_callback, CLOCK_MONOTONIC/*_RAW*/, HRTIMER_MODE_ABS_SOFT);
 #endif
-    //base_period_ = 100 * ((unsigned long)1E6L); // 100 ms
-    base_period_ = 1333333; // 1.3 ms
-    set_base_period(base_period_);
+    set_base_period(ct, 1333333); // 1.3 ms until the owning entry sets its real cadence
     return 0;
 }
 
-void kill_clock_timer(void)
+int start_clock_timer(struct clock_timer* ct)
 {
-    //stop_clock_timer(); //used when no daemon
-}
-
-int start_clock_timer(void)
-{
-    ktime_t period = ktime_set(0, base_period_);
+    ktime_t period = ktime_set(0, ct->base_period_);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6,15,0)
-    tasklet_hrtimer_start(&my_hrtimer_, period, HRTIMER_MODE_ABS);
+    tasklet_hrtimer_start(&ct->my_hrtimer_, period, HRTIMER_MODE_ABS);
 #else
-    hrtimer_start(&my_hrtimer_, period, HRTIMER_MODE_ABS_SOFT);
+    hrtimer_start(&ct->my_hrtimer_, period, HRTIMER_MODE_ABS_SOFT);
 #endif
     return 0;
 }
 
-void stop_clock_timer(void)
+void stop_clock_timer(struct clock_timer* ct)
 {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6,15,0)
-    tasklet_hrtimer_cancel(&my_hrtimer_);
+    tasklet_hrtimer_cancel(&ct->my_hrtimer_);
 #else
-    hrtimer_cancel(&my_hrtimer_);
+    hrtimer_cancel(&ct->my_hrtimer_);
 #endif
 }
 
@@ -185,16 +174,12 @@ void get_clock_time(uint64_t* clock_time)
     ktime_t kt_now;
     kt_now = ktime_get();
     *clock_time = (uint64_t)ktime_to_ns(kt_now);
-
-    // struct timespec monotime;
-    // getrawmonotonic(&monotime);
-    // *clock_time = monotime.tv_sec * 1000000000L + monotime.tv_nsec;
 }
 
-void set_base_period(uint64_t base_period)
+void set_base_period(struct clock_timer* ct, uint64_t base_period)
 {
-    base_period_ = base_period;
-    min_period_allowed = base_period_ / 7;
-    max_period_allowed = (base_period_ * 10) / 6;
-    printk(KERN_INFO "Base period set to %lld ns\n", base_period_);
+    ct->base_period_ = base_period;
+    ct->min_period_allowed = ct->base_period_ / 7;
+    ct->max_period_allowed = (ct->base_period_ * 10) / 6;
+    printk(KERN_INFO "Base period set to %lld ns\n", ct->base_period_);
 }
