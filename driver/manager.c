@@ -1546,17 +1546,49 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
                                 pcm_id, rtp_stream_info_ptr->m_uiPCMId);
                     msg_reply.errCode = -EINVAL;
                 }
-                else if (add_RTP_stream_(&self->m_RTP_streams_manager, rtp_stream_info_ptr, &stream_handle))
+                else
                 {
-                    MTAL_DP_INFO("self->m_RTP_streams_manager stream_handle = %llu\n", stream_handle);
+                    /* W6: fail-loud stream-rate vs chip-rate validation.
+                     * A mismatched stream used to produce silently garbled
+                     * audio (the 64-bit RTP stitch drifts immediately).
+                     * Compared in the tick-rate clock domain so DSD wire
+                     * streams (352.8k container) match a DSD chip
+                     * (2,822,400 published). A pcm with no live chip is
+                     * rejected too — binding to an empty slot was a
+                     * silently dead stream + slot leak (W3-C2 note).
+                     * Daemon-side mirror validation lands with the W7
+                     * per-group rates. */
+                    const struct ravenna_mgr_ops *frontend = smp_load_acquire(&self->m_alsa_driver_frontend);
+                    void* stream_chip = get_chip_by_pcm_id(self, pcm_id);
+                    uint32_t chip_rate = (stream_chip && frontend && frontend->get_pcm_sample_rate)
+                                       ? frontend->get_pcm_sample_rate(stream_chip) : 0;
+                    if (chip_rate == 0
+                        || tick_rate_for_sample_rate(rtp_stream_info_ptr->m_ui32SamplingRate)
+                           != tick_rate_for_sample_rate(chip_rate))
+                    {
+                        MTAL_DP_ERR("Add RTP stream: stream rate %u does not match pcm %d's configured rate %u (chip %s)\n",
+                                    rtp_stream_info_ptr->m_ui32SamplingRate, pcm_id, chip_rate,
+                                    stream_chip ? "live" : "absent");
+                        msg_reply.errCode = -EINVAL;
+                    }
+                    else if (add_RTP_stream_(&self->m_RTP_streams_manager, rtp_stream_info_ptr, &stream_handle))
+                    {
+                        MTAL_DP_INFO("self->m_RTP_streams_manager stream_handle = %llu\n", stream_handle);
 
-                    msg_reply.errCode = 0;
-                    msg_reply.dataSize = sizeof(uint64_t);
-                    msg_reply.data = &stream_handle;
-                    CW_netlink_send_reply_to_user_land(&msg_reply);
-                    return; // because stream_handle is outof the scope if send reply at the end of the function
+                        msg_reply.errCode = 0;
+                        msg_reply.dataSize = sizeof(uint64_t);
+                        msg_reply.data = &stream_handle;
+                        CW_netlink_send_reply_to_user_land(&msg_reply);
+                        return; // because stream_handle is outof the scope if send reply at the end of the function
+                    }
+                    else
+                    {
+                        /* W5 follow-up fix: this used to sit after the
+                         * whole if/else chain and OVERWROTE the -EINVAL
+                         * set by the validation branches with -401. */
+                        msg_reply.errCode = -401;
+                    }
                 }
-                msg_reply.errCode = -401;
             }
             break;
         }
