@@ -947,14 +947,20 @@ void prepare_buffer_lives(TRTP_streams_manager* self, uint8_t ui8Domain, uint32_
 		}
 		{
             unsigned short i;
-			All_LockSinkRPTStreams()
+			/* 2026-06-11 review fix: ReaderLeave on SOURCE streams must be
+			 * serialized by the SOURCE lock — the sink lock here (a C-port
+			 * slip) was latent while a single timer pumped single-threaded,
+			 * but with one pump per (domain, rate) cadence the mismatched
+			 * lock made the reader refcount a cross-CPU lost-update race
+			 * (stream destroy under a live reader). */
+			All_LockSourceRPTStreams()
 
             for (i = 0; i < usNumberOfRTPSourceStreams; i++)
             {
 				ReaderLeave(apRTPSourceStreams[i]);
             }
 
-			All_UnlockSinkRPTStreams()
+			All_UnlockSourceRPTStreams()
 		}
 	}
 	{

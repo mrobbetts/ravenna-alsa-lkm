@@ -32,6 +32,7 @@
 #pragma once
 
 #include <linux/types.h>
+#include <linux/spinlock.h>
 
 #include "MTAL_stdint.h"
 #include "audio_streamer_clock_PTP_defs.h"
@@ -103,7 +104,10 @@ typedef struct TTicEngine_s
     /* Stats */
     int32_t m_maxClkJitter;
 
-    void* m_csSAC_Time_Lock;
+    /* 2026-06-11 review fix: embedded, not kmalloc'd — engine creation
+     * moved onto the runtime AddPCM path where an unchecked GFP_ATOMIC
+     * allocation was an oops waiting for memory pressure. */
+    spinlock_t m_csSAC_Time_Lock;
 
 } TTicEngine;
 
