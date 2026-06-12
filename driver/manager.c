@@ -563,16 +563,27 @@ void UpdateFrameSize(struct TManager* self)
     }
 
     /* W5: chip 0's registry entry follows the manager-wide rate (its
-     * historical relationship). Engines pick the new values up via
-     * tic_entry_start on the start / rate-change paths; refreshing the
-     * metadata here keeps the registry key correct even while stopped
-     * (the daemon sets rate before AddPCM and before Start). */
+     * historical relationship) — re-key it; then refresh EVERY active
+     * entry's frame size from its own tick rate, because
+     * m_TICFrameSizeAt1FS / m_MaxFrameSize may be what changed here and
+     * those parameterize all cadences. (A DSD entry keys on 352800,
+     * which compute_frame_size_for_rate maps to the same nFS=8 frame as
+     * the DSD bit rate.) Engines pick new values up via tic_entry_start
+     * on the start / rate-change paths; callers guarantee IO is stopped. */
     {
-        struct tic_timer_entry* entry = smp_load_acquire(&self->m_apChipEntry[0]);
-        if (entry)
+        struct tic_timer_entry* entry0 = smp_load_acquire(&self->m_apChipEntry[0]);
+        unsigned int t;
+        if (entry0)
+            entry0->tick_rate = tick_rate_for_sample_rate(self->m_SampleRate);
+        for (t = 0; t < MAX_TIC_ENTRIES; t++)
         {
-            entry->tick_rate = tick_rate_for_sample_rate(self->m_SampleRate);
-            entry->frame_size = self->m_ui32FrameSize;
+            struct tic_timer_entry* entry = &self->m_TicTimers[t];
+            if (!entry->active)
+                continue;
+            entry->frame_size = compute_frame_size_for_rate(
+                entry->tick_rate,
+                self->m_TICFrameSizeAt1FS,
+                self->m_MaxFrameSize);
             tic_entry_refresh_base_period(entry);
         }
     }
@@ -629,6 +640,26 @@ bool SetSamplingRate(struct TManager* self, uint32_t samplingRate)
         return false; // not allowed. stop IO first
     }
 
+    /* W5 step 3: chip 0's entry re-keys to the new rate in
+     * UpdateFrameSize — refuse if another PCM group's entry already owns
+     * that tick cadence (registry keys must stay unique: two timers at
+     * one cadence would double-pump that rate's streams). W7's per-PCM
+     * rate plumbing supersedes this global-rate path. */
+    {
+        uint32_t new_tick_rate = tick_rate_for_sample_rate(samplingRate);
+        struct tic_timer_entry* entry0 = smp_load_acquire(&self->m_apChipEntry[0]);
+        unsigned int t;
+        for (t = 0; t < MAX_TIC_ENTRIES; t++)
+        {
+            struct tic_timer_entry* e = &self->m_TicTimers[t];
+            if (e->active && e != entry0 && e->domain == 0 && e->tick_rate == new_tick_rate)
+            {
+                MTAL_DP_ERR("CManager::SetSamplingRate(%u): tick rate %u already owned by another PCM group's entry\n", samplingRate, new_tick_rate);
+                return false;
+            }
+        }
+    }
+
 
     self->m_SampleRate = samplingRate;
     UpdateFrameSize(self);
@@ -670,6 +701,26 @@ bool SetDSDSamplingRate(struct TManager* self, uint32_t samplingRate)
     {
         MTAL_DP("CManager::SetDSDSamplingRate(%u) not allowed when IO are running\n", samplingRate);
         return false; // not allowed. stop IO first
+    }
+
+    /* W5 step 3: chip 0's entry re-keys to the new rate in
+     * UpdateFrameSize — refuse if another PCM group's entry already owns
+     * that tick cadence (registry keys must stay unique: two timers at
+     * one cadence would double-pump that rate's streams). W7's per-PCM
+     * rate plumbing supersedes this global-rate path. */
+    {
+        uint32_t new_tick_rate = tick_rate_for_sample_rate(samplingRate);
+        struct tic_timer_entry* entry0 = smp_load_acquire(&self->m_apChipEntry[0]);
+        unsigned int t;
+        for (t = 0; t < MAX_TIC_ENTRIES; t++)
+        {
+            struct tic_timer_entry* e = &self->m_TicTimers[t];
+            if (e->active && e != entry0 && e->domain == 0 && e->tick_rate == new_tick_rate)
+            {
+                MTAL_DP_ERR("CManager::SetSamplingRate(%u): tick rate %u already owned by another PCM group's entry\n", samplingRate, new_tick_rate);
+                return false;
+            }
+        }
     }
 
 
@@ -840,19 +891,11 @@ static struct tic_timer_entry* get_or_create_tic_entry(struct TManager* self, ui
         }
     }
 
-    /* W5 step 2 interim gate: AudioFrameTIC is not yet rate-filtered
-     * (step 3), so a second live entry would double-pump every chip and
-     * stream once per cadence. Fail loud; step 3 lifts this. */
-    for (t = 0; t < MAX_TIC_ENTRIES; t++)
-    {
-        if (self->m_TicTimers[t].active)
-        {
-            MTAL_DP_ERR("get_or_create_tic_entry: tick rate %u (domain %u) refused — a %u entry exists and the tick path is not rate-filtered until W5 step 3\n",
-                        tick_rate, domain, self->m_TicTimers[t].tick_rate);
-            return NULL;
-        }
-    }
-
+    /* Concurrent entries at distinct (domain, tick_rate) cadences are
+     * fully supported as of step 3: the pump is rate-filtered (chip-map
+     * identity + stream_on_tick), and a new entry created onto a running
+     * domain phase-inits from the live offset without touching the
+     * domain's PTP lock (running entries never glitch). */
     for (t = 0; t < MAX_TIC_ENTRIES; t++)
     {
         if (!self->m_TicTimers[t].active)
@@ -1843,71 +1886,47 @@ uint64_t get_global_SAC(void* user)
 
 //////////////////////////////////////////////////////////////////////////////////
 /*
- * Multi-rate Stage 3: per-PCM SAC.
+ * Multi-rate W5 (step 3): per-PCM SAC — the real per-rate media clock.
  *
- * Each chip's media clock is a sample counter at the chip's own rate,
- * locked to the shared PTP wall clock. We derive it by scaling the
- * anchoring clock's SAC by (chip_rate / clock_rate):
+ * Each chip's media clock IS its (domain, rate) entry's active engine:
+ * frame-quantized at the chip's tick rate, advancing by the chip's own
+ * frame size on its own tick. This replaces the W2 stopgap that ratio-
+ * scaled the manager clock's SAC — exact only at equal rates; at
+ * divergent ones it stepped 44/45-style, never by the chip's frame,
+ * breaking SendRTPAudioPackets' one-frame-per-call assumption and the
+ * mute path's frame-alignment invariant. Decision 1 ("no rate-conversion
+ * math on the hot path") holds again, in full.
  *
- *     chip_sac = clock_sac * chip_rate / clock_rate
+ * DSD: tick-rate identity. A DSD chip publishes its bit rate
+ * (2,822,400) but its entry — and therefore its SAC — lives in the
+ * 352.8k tick clock domain, so there is no x8 scaling (the W2
+ * stopgap's DSD bug, fixed by construction).
  *
- * Properties:
- *  - Exact identity when chip_rate == clock_rate (the single-rate case
- *    today), so this is a zero-behaviour-change refactor for chips at the
- *    manager rate.
- *  - Units-safe: clock_sac is already a sample count, so the ratio is
- *    dimensionless — no dependence on the PTP time-unit conventions.
- *  - Continuous across a rate change: clock_sac tracks the PTP wall clock,
- *    so re-deriving at a new chip_rate produces no timestamp discontinuity
- *    (this is what makes live SetPCMRate clean — Stage 5).
- *
- * Frame alignment is NOT applied here; callers (RTP_audio_stream.c) do
- * their own modulo-by-frame-size alignment as needed, exactly as they did
- * with the manager-wide SAC.
- *
- * Safe-fail: if the chip can't be resolved, or either rate is 0, fall back
- * to the unscaled clock SAC (i.e. the legacy manager-wide value).
+ * Safe-fail: an unmapped pcm_id resolves to chip 0's entry (the legacy
+ * manager-wide clock), 0 if no entry exists at all.
  */
 uint64_t get_global_SAC_for_pcm(void* user, uint32_t pcm_id)
 {
     struct TManager* self = (struct TManager*)user;
-    const struct ravenna_mgr_ops *frontend = NULL;
-    void *chip = resolve_chip(self, pcm_id, &frontend);
-    /* W5 step 2: the clock is the chip's entry's active engine (chip-0
-     * entry as legacy safe-fail). The ratio scaling below is unchanged in
-     * this commit — with the single-entry gate it is exact identity for
-     * PCM rates and reproduces the known-wrong DSD x8 of the W2 stopgap;
-     * step 3 replaces it with tick-rate identity. */
     TTicEngine* engine = get_engine_for_pcm(self, pcm_id);
-    uint64_t clock_sac;
-    uint32_t clock_rate;
-    uint32_t chip_rate;
-    uint64_t whole, frac;
-
     if (!engine)
         return 0;
-    clock_sac = tic_engine_get_sac(engine);
-
-    if (!chip || !frontend || !frontend->get_pcm_sample_rate)
-        return clock_sac;
-
-    clock_rate = tic_engine_get_rate(engine);
-    chip_rate  = frontend->get_pcm_sample_rate(chip);
-    if (clock_rate == 0 || chip_rate == 0 || chip_rate == clock_rate)
-        return clock_sac;
-
-    /*
-     * Overflow-safe clock_sac * chip_rate / clock_rate. Split into the
-     * whole-quotient and remainder parts so neither intermediate product
-     * overflows u64 for realistic SAC magnitudes and rates (<= 384 kHz):
-     *   - (clock_sac / clock_rate) * chip_rate : ~seconds * rate, well within u64
-     *   - (clock_sac % clock_rate) * chip_rate : remainder < clock_rate (<=384k)
-     *     times chip_rate (<=384k) < ~1.5e11, far below u64 max
-     */
-    whole = (clock_sac / clock_rate) * (uint64_t)chip_rate;
-    frac  = ((clock_sac % clock_rate) * (uint64_t)chip_rate) / clock_rate;
-    return whole + frac;
+    return tic_engine_get_sac(engine);
 }
+//////////////////////////////////////////////////////////////////////////////////
+/* W5 step 3: tick-rate (registry-key) resolution for the streams
+ * manager's pump filter. 0 = unmapped pcm (pumped by no cadence). */
+uint32_t get_tick_rate_for_pcm(void* user, uint32_t pcm_id)
+{
+    struct TManager* self = (struct TManager*)user;
+    struct tic_timer_entry* entry = NULL;
+    if (pcm_id < MAX_PCMS)
+        entry = smp_load_acquire(&self->m_apChipEntry[pcm_id]);
+    if (!entry)
+        return 0;
+    return entry->tick_rate;
+}
+
 //////////////////////////////////////////////////////////////////////////////////
 uint64_t get_global_time(void* user)
 {
@@ -2308,14 +2327,14 @@ unsigned char get_live_out_mute_pattern_for_pcm(void* user, uint32_t pcm_id, uin
 //////////////////////////////////////////////////////////////////////////////////
 // Caudio_streamer_clock_PTP_callback
 //////////////////////////////////////////////////////////////////////////////////
-/* W5: the audio pump, per (domain, rate) entry. Step 2 still pumps every
- * chip and stream from the single permitted entry (step 3 adds the rate
- * filter and lifts the single-entry gate). The gate is the per-entry
- * predicate — this entry's active engine fully locked — so selection
- * eligibility and pumpability are the same condition by construction. */
+/* W5: the audio pump, per (domain, rate) entry — services ONLY this
+ * entry's chips (chip-map identity) and streams (stream_on_tick via
+ * get_tick_rate_for_pcm), at this entry's cadence. Gated on the
+ * per-entry predicate — this entry's active engine fully locked — which
+ * is the same condition as NIC-selection eligibility by construction. */
 static void manager_audio_frame_tic(struct TManager* self, struct tic_timer_entry* entry)
 {
-    prepare_buffer_lives(&self->m_RTP_streams_manager);
+    prepare_buffer_lives(&self->m_RTP_streams_manager, entry->domain, entry->tick_rate);
     
     if (self->m_bIORunning && tic_engine_lock_status(&entry->engine[entry->active_nic]) == PTPLS_LOCKED)
     {
@@ -2344,7 +2363,7 @@ static void manager_audio_frame_tic(struct TManager* self, struct tic_timer_entr
             //memset(pfOutputBuffer, 0x58, sizeof(int32_t) * get_frame_size(self)); // 4 byte because streams are padded to word of 32bits
 
             /// write live outputs
-            frame_process_begin(&self->m_RTP_streams_manager);
+            frame_process_begin(&self->m_RTP_streams_manager, entry->domain, entry->tick_rate);
             frame_process_end(&self->m_RTP_streams_manager);
         }
         #elif defined(MT_TONE_TEST) || defined (MT_RAMP_TEST)
@@ -2352,7 +2371,7 @@ static void manager_audio_frame_tic(struct TManager* self, struct tic_timer_entr
             uint32_t ui32Offset = get_live_out_jitter_buffer_offset(self, get_global_SAC(self));
             uint32_t stepOut = get_audio_engine_sample_bytelength(self);
 
-            frame_process_begin(&self->m_RTP_streams_manager);
+            frame_process_begin(&self->m_RTP_streams_manager, entry->domain, entry->tick_rate);
 
             #if defined(MT_TONE_TEST)
             int* LUT = &sinebuf[0];
@@ -2419,7 +2438,7 @@ static void manager_audio_frame_tic(struct TManager* self, struct tic_timer_entr
         }
         #else
             /// write live outputs
-            frame_process_begin(&self->m_RTP_streams_manager);
+            frame_process_begin(&self->m_RTP_streams_manager, entry->domain, entry->tick_rate);
             {
                 /* Acquire-load frontend and count, then each slot, so we
                  * pair with smp_store_release in attach_alsa_driver and
@@ -2435,6 +2454,12 @@ static void manager_audio_frame_tic(struct TManager* self, struct tic_timer_entr
                     {
                         void *chip = smp_load_acquire(&self->m_apALSAChip[i]);
                         if (!chip)
+                            continue;
+                        /* W5 step 3: a chip ticks only at its own entry's
+                         * cadence. Entry identity via the chip map — exact
+                         * even if two entries were ever to share a tick
+                         * rate momentarily. */
+                        if (smp_load_acquire(&self->m_apChipEntry[i]) != entry)
                             continue;
                         if (frontend->get_io_state(chip, false))
                             frontend->pcm_interrupt(chip, 1);
@@ -2492,6 +2517,8 @@ void Init_C_Callbacks(struct TManager* self)
     self->m_c_callbacks.get_live_out_jitter_buffer_offset_for_pcm = &get_live_out_jitter_buffer_offset_for_pcm;
     self->m_c_callbacks.get_live_in_mute_pattern_for_pcm = &get_live_in_mute_pattern_for_pcm;
     self->m_c_callbacks.get_live_out_mute_pattern_for_pcm = &get_live_out_mute_pattern_for_pcm;
+    /* W5 step 3: per-(domain, rate) pump filter. */
+    self->m_c_callbacks.get_tick_rate_for_pcm = &get_tick_rate_for_pcm;
     //m_c_dispatch_callbacks.user = this;
     //m_c_dispatch_callbacks.DispatchPacket = &DispatchPacket;
     self->m_c_audio_streamer_clock_PTP_callback.user = self;
