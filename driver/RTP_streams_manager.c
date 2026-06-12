@@ -902,8 +902,23 @@ EDispatchResult process_UDP_packet(TRTP_streams_manager* self, unsigned char byN
 	return bProceeded ? DR_RTP_PACKET_USED : DR_PACKET_NOT_USED;
 }
 
+///////////////////////////////////////////////////////////////////////////
+/* Multi-rate W5 step 3: does this stream's pcm tick at the firing
+ * (domain, rate) cadence? A pcm that resolves to no registry entry
+ * (get_tick_rate_for_pcm == 0) is pumped by no cadence — the same fate
+ * the frame_size==0 safe-fail family already gives such streams, one
+ * step earlier. */
+static bool stream_on_tick(TRTP_streams_manager* self, TRTP_audio_stream* pRTPAudioStream, uint8_t ui8Domain, uint32_t ui32TickRate)
+{
+	(void)ui8Domain; /* single PTP domain until W11 (entries never share a tick_rate across domains today) */
+	if (!self->m_pManager || !self->m_pManager->get_tick_rate_for_pcm)
+		return true;
+	return self->m_pManager->get_tick_rate_for_pcm(self->m_pManager->user,
+		pRTPAudioStream->m_tRTPStream.m_RTP_stream_info.m_uiPCMId) == ui32TickRate;
+}
+
 //////////////////////////////////////////////////////////////
-void prepare_buffer_lives(TRTP_streams_manager* self)
+void prepare_buffer_lives(TRTP_streams_manager* self, uint8_t ui8Domain, uint32_t ui32TickRate)
 {
     unsigned short us;
 	{   // SOURCE
@@ -926,7 +941,8 @@ void prepare_buffer_lives(TRTP_streams_manager* self)
 		{
 			if(apRTPSourceStreams[us])
 			{
-                PrepareBufferLives(&apRTPSourceStreams[us]->m_RTPAudioStream);
+				if (stream_on_tick(self, &apRTPSourceStreams[us]->m_RTPAudioStream, ui8Domain, ui32TickRate))
+					PrepareBufferLives(&apRTPSourceStreams[us]->m_RTPAudioStream);
 			}
 		}
 		{
@@ -951,7 +967,8 @@ void prepare_buffer_lives(TRTP_streams_manager* self)
 		{
 			for (us = 0; us < self->m_ausNumberOfRTPSinkStreams[usNICId]; us++)
 			{
-				PrepareBufferLives(&self->m_apRTPSinkOrderedStreams[usNICId][us]->m_RTPAudioStream);
+				if (stream_on_tick(self, &self->m_apRTPSinkOrderedStreams[usNICId][us]->m_RTPAudioStream, ui8Domain, ui32TickRate))
+					PrepareBufferLives(&self->m_apRTPSinkOrderedStreams[usNICId][us]->m_RTPAudioStream);
 			}
 		}
 
@@ -960,7 +977,7 @@ void prepare_buffer_lives(TRTP_streams_manager* self)
 }
 
 ///////////////////////////////////////////////////////////////////////////
-void frame_process_begin(TRTP_streams_manager* self)
+void frame_process_begin(TRTP_streams_manager* self, uint8_t ui8Domain, uint32_t ui32TickRate)
 {
 	#ifdef UNDER_RTSS
 		if(self->m_RTPStreamsOutgoingThread.IsInitialized())
@@ -971,7 +988,7 @@ void frame_process_begin(TRTP_streams_manager* self)
 	#endif // UNDER_RTSS
 		{
 			//MTAL_DP("send_outgoing_packets(): called from current thread\n");
-			send_outgoing_packets(self);
+			send_outgoing_packets(self, ui8Domain, ui32TickRate);
 		}
 }
 
@@ -987,7 +1004,7 @@ void frame_process_end(TRTP_streams_manager* self)
 }
 
 ///////////////////////////////////////////////////////////////////////////
-void send_outgoing_packets(TRTP_streams_manager* self)
+void send_outgoing_packets(TRTP_streams_manager* self, uint8_t ui8Domain, uint32_t ui32TickRate)
 {
    // SOURCE
 	uint32_t ui32SourceStreamIdx;
@@ -1011,7 +1028,8 @@ void send_outgoing_packets(TRTP_streams_manager* self)
 	{
 		if(apRTPSourceStreams[ui32SourceStreamIdx])
 		{
-			SendRTPAudioPackets(&apRTPSourceStreams[ui32SourceStreamIdx]->m_RTPAudioStream);
+			if (stream_on_tick(self, &apRTPSourceStreams[ui32SourceStreamIdx]->m_RTPAudioStream, ui8Domain, ui32TickRate))
+				SendRTPAudioPackets(&apRTPSourceStreams[ui32SourceStreamIdx]->m_RTPAudioStream);
 			/*if (addr != apRTPSourceStreams[ui32SourceStreamIdx])
 			{
 				addr = apRTPSourceStreams[ui32SourceStreamIdx];

@@ -126,6 +126,13 @@ typedef struct
 	uint32_t (*get_live_out_jitter_buffer_offset_for_pcm)(void* self, uint32_t pcm_id, const uint64_t ui64CurrentSAC);
 	unsigned char (*get_live_in_mute_pattern_for_pcm)(void* self, uint32_t pcm_id, uint32_t ulChannelId);
 	unsigned char (*get_live_out_mute_pattern_for_pcm)(void* self, uint32_t pcm_id, uint32_t ulChannelId);
+	/* Multi-rate W5 step 3: the pcm's tick rate (its (domain, rate)
+	 * registry key — DSD pcms report the 352.8k tick-domain rate, not
+	 * the bit rate). 0 when the pcm_id resolves to no entry: such a
+	 * stream is pumped by no cadence (the frame_size==0 safe-fail
+	 * family, applied one step earlier). Consumed by the streams
+	 * manager's per-(domain, rate) pump filter. */
+	uint32_t (*get_tick_rate_for_pcm)(void* self, uint32_t pcm_id);
 } rtp_audio_stream_ops;
 
 /// Put functions to be called by PTP ato Manager
