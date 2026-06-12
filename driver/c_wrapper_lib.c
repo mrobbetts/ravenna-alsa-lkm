@@ -133,16 +133,17 @@ int CW_socket_tx_packet(void* skb, unsigned int data_len, const char* iface)
     struct net_device *dev = dev_get_by_name(&init_net, iface);
     int xmit_ret_code = 0;
 
-    if (data_len == 0)
-    {
-        return -10;
-    }
-
     if (dev == NULL)
     {
         dev_kfree_skb(skb_ptr);
         return -11;
-    } 
+    }
+
+    if (data_len == 0)
+    {
+        dev_put(dev);
+        return -10;
+    }
 
     skb_ptr->pkt_type = PACKET_OUTGOING;
     //skb->ip_summed = CHECKSUM_NONE; // do not change anything ?
