@@ -62,8 +62,9 @@ void tic_engine_init(TTicEngine* self, struct TClock_PTP_s* pServo)
 
     self->m_ui64TICSAC = 0;
 
-    /* armed via tic_engine_reset (ResetPTPLock) before the first start —
-     * matches the old zero-initialized-BSS state of m_usTICLockCounter */
+    /* armed via tic_engine_reset — by ResetPTPLock on the legacy start
+     * path, explicitly by tic_entry_start on the no-reset AddPCM path
+     * (2026-06-11 review fix) — before the engine can report locked */
     self->m_usTICLockCounter = 0;
 
     self->m_uiTIC_DropCounter = 0;
@@ -83,16 +84,15 @@ void tic_engine_init(TTicEngine* self, struct TClock_PTP_s* pServo)
 
     self->m_maxClkJitter = 0; // [us]
 
-    self->m_csSAC_Time_Lock = (void*)kmalloc(sizeof(spinlock_t), GFP_ATOMIC/*GFP_KERNEL*/);
-    memset(self->m_csSAC_Time_Lock, 0, sizeof(spinlock_t));
-    spin_lock_init((spinlock_t*)self->m_csSAC_Time_Lock);
+    spin_lock_init(&self->m_csSAC_Time_Lock);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 void tic_engine_destroy(TTicEngine* self)
 {
-    kfree(self->m_csSAC_Time_Lock);
-    self->m_csSAC_Time_Lock = NULL;
+    /* SAC lock is embedded (2026-06-11 review fix) — nothing to free.
+     * Kept as the symmetric teardown hook for the registry. */
+    (void)self;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -230,11 +230,16 @@ void tic_engine_steer(TTicEngine* self, uint64_t ui64T1)
             self->m_usTICLockCounter--;
             if (self->m_usTICLockCounter == 0)
             {
-                MTAL_DP("[%u] TIC locked\n", pServo->m_pEth_netfilter->nic_id);
+                /* printk (not MTAL_DP): the old composite lock-status
+                 * print made TIC transitions dmesg-visible; keep that
+                 * operational signal, now with per-rate identity. */
+                printk("[%u] TIC locked (rate %u)\n", pServo->m_pEth_netfilter->nic_id, self->m_ui32SamplingRate);
             }
         }
         else if (abs(dPhaseAdj) > 1000000)
         {
+            if (self->m_usTICLockCounter == 0)
+                printk("[%u] TIC lock lost (rate %u)\n", pServo->m_pEth_netfilter->nic_id, self->m_ui32SamplingRate);
             self->m_usTICLockCounter = TIC_LOCK_HYSTERESIS;
         }
     } while (0);
@@ -273,10 +278,21 @@ void tic_engine_phase_init_from_locked(TTicEngine* self)
     self->m_ui64TIC_LastRTXClockTime = ui64Now;
     self->m_ui64TIC_LastRTXClockTimeAtT2 = ui64Now; /* sane until the next sync snapshot */
 
-    /* +5 periods of margin mirrors the prelock branch; the ~sub-period
-     * alignment error from the 100us grid is steered out by the PI loop
-     * while the engine is still gated off (not yet TIC-locked). */
-    self->m_ui64TIC_NextAbsoluteTime = ui64Now + ui64ToNextBoundary + 5 * (self->m_dTIC_BasePeriod / PS_2_REF_UNIT);
+    /* 2026-06-11 review fix: seed the tick count from the live Q so a
+     * middle-band first tick (the 100us-grid sawtooth guarantees some at
+     * 44.1k) free-runs from the true count, not from 0 — otherwise the
+     * engine publishes a near-zero SAC until an edge-window tick snaps it
+     * by ~1e14 samples. */
+    self->m_ui64LastTIC_Count = ui64Samples / self->m_ui32FrameSize;
+
+    /* +5 periods of margin, multiply BEFORE the [ps -> 100us] divide
+     * exactly like the prelock branch (2026-06-11 review fix: the
+     * divide-first form truncated 10.884 -> 10 per period, landing the
+     * first tick 442us off the frame grid for the whole 44.1k family —
+     * outside the ±90.7us Q/R edge window; multiply-first leaves 42us,
+     * inside it). Residual error is steered out by the PI loop while the
+     * engine is still gated off (not yet TIC-locked). */
+    self->m_ui64TIC_NextAbsoluteTime = ui64Now + ui64ToNextBoundary + (5 * self->m_dTIC_BasePeriod) / PS_2_REF_UNIT;
     self->m_dTIC_NextAbsoluteTime_frac = 0;
 }
 
@@ -353,13 +369,13 @@ void tic_engine_tick_advance(TTicEngine* self, TTicEngineTickCtx* pCtx)
 
     self->m_ui64TICSAC = (ui64CurrentTICCount - 1) * self->m_ui32FrameSize;
     {
-        spin_lock((spinlock_t*)self->m_csSAC_Time_Lock);
+        spin_lock(&self->m_csSAC_Time_Lock);
         {
             self->m_ui64GlobalPerformanceCounter = MTAL_LK_GetCounterTime();
             self->m_ui64GlobalTime = ui64CurrentRTXClockTime;
             self->m_ui64GlobalSAC = self->m_ui64TICSAC;
         }
-        spin_unlock((spinlock_t*)self->m_csSAC_Time_Lock);
+        spin_unlock(&self->m_csSAC_Time_Lock);
     }
 
     pCtx->ui64CurrentTICCount = ui64CurrentTICCount;
@@ -471,13 +487,13 @@ uint64_t tic_engine_get_time(TTicEngine* self)
 ///////////////////////////////////////////////////////////////////////////////
 void tic_engine_get_times(TTicEngine* self, uint64_t* pui64GlobalSAC, uint64_t* pui64GlobalTime, uint64_t* pui64GlobalPerformanceCounter)
 {
-    spin_lock((spinlock_t*)self->m_csSAC_Time_Lock);
+    spin_lock(&self->m_csSAC_Time_Lock);
 
     *pui64GlobalSAC = self->m_ui64GlobalSAC;
     *pui64GlobalTime = self->m_ui64GlobalTime;
     *pui64GlobalPerformanceCounter = self->m_ui64GlobalPerformanceCounter;
 
-    spin_unlock((spinlock_t*)self->m_csSAC_Time_Lock);
+    spin_unlock(&self->m_csSAC_Time_Lock);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

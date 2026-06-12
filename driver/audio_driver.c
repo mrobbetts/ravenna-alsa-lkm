@@ -2544,7 +2544,17 @@ static int mr_alsa_audio_create_alsa_devices(   struct snd_card *card,
         uint32_t minPTPFrameSize, maxPTPFrameSize, idx;
 
         printk(KERN_INFO "Register ALSA driver into Ravenna Peer for pcm_id=%d...\n", device_idx);
-        chip->mr_alsa_audio_ops->register_alsa_driver(chip->ravenna_peer, &g_ravenna_manager_ops, (void*)chip, device_idx);
+        /* 2026-06-11 review fix: attach can now fail legitimately (no
+         * (domain, rate) timer entry). Swallowing it produced a
+         * "successful" PCM with no chip slot and no clock — silent dead
+         * audio (the trap would have armed for real when W11 multiplies
+         * the registry keyspace). */
+        err = chip->mr_alsa_audio_ops->register_alsa_driver(chip->ravenna_peer, &g_ravenna_manager_ops, (void*)chip, device_idx);
+        if (err < 0)
+        {
+            printk(KERN_ERR "register_alsa_driver failed for pcm_id=%d (err %d)\n", device_idx, err);
+            return err;
+        }
         chip->mr_alsa_audio_ops->get_nb_inputs(chip->ravenna_peer, &chip->current_nbinputs);
         chip->mr_alsa_audio_ops->get_nb_outputs(chip->ravenna_peer, &chip->current_nboutputs);
 
