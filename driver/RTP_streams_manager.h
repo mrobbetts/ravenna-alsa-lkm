@@ -103,13 +103,16 @@ int GetMinMaxSinksJitter(TRTP_streams_manager* self, TSinksJitter* pSinksJitter)
 
 // Process
 // following methods must be call by the AudioEngine thread
-void prepare_buffer_lives(TRTP_streams_manager* self);
-void frame_process_begin(TRTP_streams_manager* self);
+/* Multi-rate W5 step 3: the pump services one (domain, tick_rate)
+ * cadence per call — each timer-registry entry's tick passes its own
+ * key and only matching streams are prepared/sent. */
+void prepare_buffer_lives(TRTP_streams_manager* self, uint8_t ui8Domain, uint32_t ui32TickRate);
+void frame_process_begin(TRTP_streams_manager* self, uint8_t ui8Domain, uint32_t ui32TickRate);
 void frame_process_end(TRTP_streams_manager* self);
 #ifdef UNDER_RTSS
 	friend class CRTPStreamsOutgoingThread;
 #endif
-void send_outgoing_packets(TRTP_streams_manager* self);
+void send_outgoing_packets(TRTP_streams_manager* self, uint8_t ui8Domain, uint32_t ui32TickRate);
 
 
 

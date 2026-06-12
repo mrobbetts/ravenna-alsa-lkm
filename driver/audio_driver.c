@@ -662,6 +662,8 @@ static void mr_alsa_audio_unlock_capture_buffer(void *rawchip)
     }
 }
 
+static uint32_t mr_alsa_audio_get_pcm_frame_size(void *mr_alsa_audio_chip);
+
 /// Driven by PTP Timer's interrupts
 static int mr_alsa_audio_pcm_interrupt(void *rawchip, int direction)
 {
@@ -672,7 +674,12 @@ static int mr_alsa_audio_pcm_interrupt(void *rawchip, int direction)
         struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip*)rawchip;
         int do_period_elapsed = 0;
 
-        chip->mr_alsa_audio_ops->get_interrupts_frame_size(chip->ravenna_peer, &ptp_frame_size);
+        /* W5 step 3: this chip's OWN frame size — per-rate cadences mean
+         * the manager-wide value is wrong for any chip off the legacy
+         * rate (a 96k chip would copy half a tick's frames and drift).
+         * Acquire-load of the packed (rate, frame) pair published by
+         * attach_alsa_driver / set_pcm_sample_rate. */
+        ptp_frame_size = mr_alsa_audio_get_pcm_frame_size(chip);
 
         if (direction == 1) {
             /*
@@ -1738,8 +1745,10 @@ static int mr_alsa_audio_pcm_hw_params( struct snd_pcm_substream *substream,
         spin_lock_irq(&chip->lock);
     }
 
-    if(chip->ravenna_peer)
-        chip->mr_alsa_audio_ops->get_interrupts_frame_size(chip->ravenna_peer, &ptp_frame_size);
+    /* W5 step 3: per-chip frame size for the period-size sanity check
+     * (also always initialized — the old ops call left ptp_frame_size
+     * uninitialized when ravenna_peer was NULL). */
+    ptp_frame_size = mr_alsa_audio_get_pcm_frame_size(chip);
 
     if(periodSize != ptp_frame_size)
         printk(KERN_WARNING "mr_alsa_audio_pcm_hw_params : periodSize (%u) differs from ptp_frame_size (%u)\n", periodSize, ptp_frame_size);
