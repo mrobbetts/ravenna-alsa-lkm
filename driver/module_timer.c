@@ -121,7 +121,7 @@ static enum hrtimer_restart timer_callback(struct hrtimer *timer)
             }
         }
 
-        if(ct->stop_)
+        if(READ_ONCE(ct->stop_))
         {
             return HRTIMER_NORESTART;
         }
@@ -152,6 +152,7 @@ int init_clock_timer(struct clock_timer* ct, void* ctx)
 int start_clock_timer(struct clock_timer* ct)
 {
     ktime_t period = ktime_set(0, ct->base_period_);
+    WRITE_ONCE(ct->stop_, 0);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6,15,0)
     tasklet_hrtimer_start(&ct->my_hrtimer_, period, HRTIMER_MODE_ABS);
 #else
@@ -162,6 +163,13 @@ int start_clock_timer(struct clock_timer* ct)
 
 void stop_clock_timer(struct clock_timer* ct)
 {
+    /* 2026-06-11 review fix: the in-callback stop gate was dead code (no
+     * writer). On <6.15, tasklet_hrtimer_cancel runs a pending tasklet to
+     * completion — whose trampoline RE-ARMS the hrtimer via
+     * hrtimer_restart — so "stop" could return with the timer alive:
+     * fatal now that timers are per-entry and destructible. Setting
+     * stop_ first makes the callback return HRTIMER_NORESTART. */
+    WRITE_ONCE(ct->stop_, 1);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6,15,0)
     tasklet_hrtimer_cancel(&ct->my_hrtimer_);
 #else

@@ -649,6 +649,18 @@ bool SetSamplingRate(struct TManager* self, uint32_t samplingRate)
         uint32_t new_tick_rate = tick_rate_for_sample_rate(samplingRate);
         struct tic_timer_entry* entry0 = smp_load_acquire(&self->m_apChipEntry[0]);
         unsigned int t;
+        /* 2026-06-11 review fix (shared-entry re-key): chip 0's entry is
+         * shared by every same-rate chip; re-keying it in place would drag
+         * their clocks to the new cadence while their published rates and
+         * streams stay put — and a later AddPCM at the old rate would
+         * split the registry and wedge this path permanently. Re-rating a
+         * shared cadence is W10 SetPCMRate's job. */
+        if (entry0 && entry0->chip_refcount > 1 && entry0->tick_rate != new_tick_rate)
+        {
+            MTAL_DP_ERR("CManager::SetSamplingRate(%u): refused — chip 0's (domain, rate) entry is shared by %u chips\n",
+                        samplingRate, entry0->chip_refcount);
+            return false;
+        }
         for (t = 0; t < MAX_TIC_ENTRIES; t++)
         {
             struct tic_timer_entry* e = &self->m_TicTimers[t];
@@ -712,6 +724,18 @@ bool SetDSDSamplingRate(struct TManager* self, uint32_t samplingRate)
         uint32_t new_tick_rate = tick_rate_for_sample_rate(samplingRate);
         struct tic_timer_entry* entry0 = smp_load_acquire(&self->m_apChipEntry[0]);
         unsigned int t;
+        /* 2026-06-11 review fix (shared-entry re-key): chip 0's entry is
+         * shared by every same-rate chip; re-keying it in place would drag
+         * their clocks to the new cadence while their published rates and
+         * streams stay put — and a later AddPCM at the old rate would
+         * split the registry and wedge this path permanently. Re-rating a
+         * shared cadence is W10 SetPCMRate's job. */
+        if (entry0 && entry0->chip_refcount > 1 && entry0->tick_rate != new_tick_rate)
+        {
+            MTAL_DP_ERR("CManager::SetSamplingRate(%u): refused — chip 0's (domain, rate) entry is shared by %u chips\n",
+                        samplingRate, entry0->chip_refcount);
+            return false;
+        }
         for (t = 0; t < MAX_TIC_ENTRIES; t++)
         {
             struct tic_timer_entry* e = &self->m_TicTimers[t];
@@ -846,11 +870,22 @@ static void tic_entry_start(struct TManager* self, struct tic_timer_entry* entry
         TClock_PTP* pServo = &self->m_PTP[i];
         if (!self->m_Is_NIC_Active[i])
             continue;
-        spin_lock((spinlock_t*)pServo->m_csPTPTime);
+        spin_lock_bh((spinlock_t*)pServo->m_csPTPTime);
         tic_engine_start(&entry->engine[i], entry->frame_size, entry->tick_rate);
-        if (!bResetPTPLock && pServo->m_usPTPLockCounter == 0)
-            tic_engine_phase_init_from_locked(&entry->engine[i]);
-        spin_unlock((spinlock_t*)pServo->m_csPTPTime);
+        if (!bResetPTPLock)
+        {
+            /* 2026-06-11 review fix: ALWAYS arm the TIC-lock hysteresis on
+             * the no-reset path — an engine started mid-PTP-acquisition
+             * previously kept its zeroed counter and reported LOCKED with
+             * zero convergence syncs. Phase-init (which arms it too)
+             * additionally aligns the tick when the servo is already
+             * locked; otherwise the prelock fan-out will. */
+            if (pServo->m_usPTPLockCounter == 0)
+                tic_engine_phase_init_from_locked(&entry->engine[i]);
+            else
+                tic_engine_reset(&entry->engine[i]);
+        }
+        spin_unlock_bh((spinlock_t*)pServo->m_csPTPTime);
         if (bResetPTPLock)
             ResetPTPLock(pServo, true);
     }
@@ -916,7 +951,19 @@ static struct tic_timer_entry* get_or_create_tic_entry(struct TManager* self, ui
     for (nic = 0; nic < _MAX_NICS; nic++)
     {
         tic_engine_init(&entry->engine[nic], &self->m_PTP[nic]);
-        clock_ptp_attach_engine(&self->m_PTP[nic], &entry->engine[nic]);
+        /* 2026-06-11 review fix: attach can fail (engine list full once
+         * W11 multiplies the keyspace) — unwind, don't half-create. */
+        if (!clock_ptp_attach_engine(&self->m_PTP[nic], &entry->engine[nic]))
+        {
+            unsigned int u;
+            tic_engine_destroy(&entry->engine[nic]);
+            for (u = 0; u < nic; u++)
+            {
+                clock_ptp_detach_engine(&self->m_PTP[u], &entry->engine[u]);
+                tic_engine_destroy(&entry->engine[u]);
+            }
+            return NULL;
+        }
     }
     init_clock_timer(&entry->timer, entry);
     tic_entry_refresh_base_period(entry);

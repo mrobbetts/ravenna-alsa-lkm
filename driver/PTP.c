@@ -174,8 +174,12 @@ void destroy_ptp(TClock_PTP* self)
 ///////////////////////////////////////////////////////////////////////////////
 void ResetPTPLock(TClock_PTP* self, bool bUseMutex)
 {
+	/* _bh (2026-06-11 review fix): taken from process context (netlink
+	 * AddPCM/rate-change/teardown) against per-entry timer and netfilter
+	 * softirqs — a plain lock invites a same-CPU softirq-preempts-holder
+	 * lockup. Softirq callers nest local_bh_disable harmlessly. */
 	if(bUseMutex)
-		spin_lock((spinlock_t*)self->m_csPTPTime);
+		spin_lock_bh((spinlock_t*)self->m_csPTPTime);
 
 	{
 		unsigned int e;
@@ -190,7 +194,7 @@ void ResetPTPLock(TClock_PTP* self, bool bUseMutex)
 	}
 
 	if(bUseMutex)
-		spin_unlock((spinlock_t*)self->m_csPTPTime);
+		spin_unlock_bh((spinlock_t*)self->m_csPTPTime);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -208,8 +212,8 @@ void SetPTPMasterPortNumber(TClock_PTP* self, unsigned short const usPTPMasterPo
  * unlocked volatile read mirrors the old m_bAudioFrameTICTimerStarted gate. */
 static bool clock_ptp_has_started_engine(TClock_PTP* self)
 {
-	unsigned int e;
-	for (e = 0; e < self->m_uNumEngines; e++)
+	unsigned int e, n = smp_load_acquire(&self->m_uNumEngines);
+	for (e = 0; e < n; e++)
 	{
 		if (self->m_apEngines[e] && self->m_apEngines[e]->m_bAudioFrameTICTimerStarted)
 			return true;
@@ -702,7 +706,7 @@ bool clock_ptp_attach_engine(TClock_PTP* self, TTicEngine* pEngine)
 	unsigned int n;
 	bool bOk = false;
 
-	spin_lock((spinlock_t*)self->m_csPTPTime);
+	spin_lock_bh((spinlock_t*)self->m_csPTPTime);
 	n = self->m_uNumEngines;
 	if (n < MAX_TIC_ENGINES_PER_SERVO)
 	{
@@ -712,7 +716,7 @@ bool clock_ptp_attach_engine(TClock_PTP* self, TTicEngine* pEngine)
 		smp_store_release(&self->m_uNumEngines, n + 1);
 		bOk = true;
 	}
-	spin_unlock((spinlock_t*)self->m_csPTPTime);
+	spin_unlock_bh((spinlock_t*)self->m_csPTPTime);
 
 	if (!bOk)
 	{
@@ -726,7 +730,7 @@ void clock_ptp_detach_engine(TClock_PTP* self, TTicEngine* pEngine)
 {
 	unsigned int i, n;
 
-	spin_lock((spinlock_t*)self->m_csPTPTime);
+	spin_lock_bh((spinlock_t*)self->m_csPTPTime);
 	n = self->m_uNumEngines;
 	for (i = 0; i < n; i++)
 	{
@@ -739,7 +743,7 @@ void clock_ptp_detach_engine(TClock_PTP* self, TTicEngine* pEngine)
 		self->m_apEngines[n - 1] = NULL;
 		break;
 	}
-	spin_unlock((spinlock_t*)self->m_csPTPTime);
+	spin_unlock_bh((spinlock_t*)self->m_csPTPTime);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
