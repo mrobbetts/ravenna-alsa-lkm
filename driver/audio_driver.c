@@ -176,6 +176,18 @@ struct mr_alsa_audio_chip
      */
     uint64_t pcm_rate_and_frame;
 
+    /* W6: per-chip ALSA constraint state (Decision 7 — a chip advertises
+     * exactly its configured rate). Filled by set_pcm_sample_rate, the
+     * single rate-publish chokepoint (attach, chip-0 UpdateFrameSize,
+     * W10 SetPCMRate), always with IO quiesced; consumed at pcm_open.
+     * Replaces the global g_constraints_* arrays that every open of every
+     * chip used to rewrite in place (cross-chip race + wrong content for
+     * per-rate chips). */
+    unsigned int supported_rates[3];
+    struct snd_pcm_hw_constraint_list constraints_rates;
+    unsigned int supported_period_sizes[4];
+    struct snd_pcm_hw_constraint_list constraints_period_sizes;
+
     unsigned int current_rate;  /// updated on each alsa hw_params and prepare
     unsigned int current_dsd;   /// 0 for pcm, 1 for dsd64, 2 for dsd128, 4 for dsd256. updated on each alsa hw_params and prepare
 
@@ -429,7 +441,9 @@ static struct snd_kcontrol_new mr_alsa_audio_ctrl_output_switch = {
 };
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
-static uint32_t mr_alsa_audio_get_samplerate_factor(unsigned int rate)
+/* W6: only caller was pcm_open's manager-rate-derived frame size, replaced
+ * by the chip's own published frame. Kept for reference. */
+static uint32_t __maybe_unused mr_alsa_audio_get_samplerate_factor(unsigned int rate)
 {
     if(rate <= 48000)
         return 1;
@@ -624,6 +638,7 @@ static void mr_alsa_audio_unlock_capture_buffer(void *rawchip)
 }
 
 static uint32_t mr_alsa_audio_get_pcm_frame_size(void *mr_alsa_audio_chip);
+static uint32_t mr_alsa_audio_get_pcm_sample_rate(void *mr_alsa_audio_chip);
 
 /// Driven by PTP Timer's interrupts
 static int mr_alsa_audio_pcm_interrupt(void *rawchip, int direction)
@@ -844,8 +859,39 @@ static bool mr_alsa_audio_get_io_state(void *mr_alsa_audio_chip, bool is_playbac
 static void mr_alsa_audio_set_pcm_sample_rate(void *mr_alsa_audio_chip, uint32_t rate, uint32_t frame_size)
 {
     struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip *)mr_alsa_audio_chip;
+    uint32_t dsd_mode;
     if (!chip)
         return;
+    /* W6: refresh this chip's constraint lists alongside the rate
+     * publish. A PCM-rate chip advertises exactly its configured rate
+     * and its exact tick frame as the only period size; a DSD-rate chip
+     * advertises the DSD container rates (narrowed per format by
+     * hw_rule_rate_by_format) and the legacy scaled period sizes. */
+    dsd_mode = mr_alsa_audio_get_dsd_mode(rate);
+    if (dsd_mode != 0)
+    {
+        chip->supported_rates[0] = 88200;
+        chip->supported_rates[1] = 176400;
+        chip->supported_rates[2] = 352800;
+        chip->constraints_rates.count = 3;
+        chip->supported_period_sizes[0] = frame_size / 8;
+        chip->supported_period_sizes[1] = frame_size / 4;
+        chip->supported_period_sizes[2] = frame_size / 2;
+        chip->supported_period_sizes[3] = frame_size;
+        chip->constraints_period_sizes.count = 4;
+    }
+    else
+    {
+        chip->supported_rates[0] = rate;
+        chip->constraints_rates.count = 1;
+        chip->supported_period_sizes[0] = frame_size;
+        chip->constraints_period_sizes.count = 1;
+    }
+    chip->constraints_rates.list = chip->supported_rates;
+    chip->constraints_rates.mask = 0;
+    chip->constraints_period_sizes.list = chip->supported_period_sizes;
+    chip->constraints_period_sizes.mask = 0;
+
     /* F3: single release-store of the packed pair — readers can never
      * see a torn (rate, frame_size) combination. */
     smp_store_release(&chip->pcm_rate_and_frame,
@@ -975,27 +1021,21 @@ static int mr_alsa_audio_pcm_prepare(struct snd_pcm_substream *substream)
             return -EINVAL;
         }
         printk(KERN_DEBUG "mr_alsa_audio_pcm_prepare: rate=%d format=%d channels=%d period_size=%lu, nb periods=%u\n", runtime->rate, runtime->format, runtime->channels, runtime->period_size, runtime->periods);
-        chip->mr_alsa_audio_ops->get_sample_rate(chip->ravenna_peer, &chip->current_rate);
+        chip->current_rate = mr_alsa_audio_get_pcm_sample_rate(chip);
         chip->current_dsd = mr_alsa_audio_get_dsd_mode(chip->current_rate);
 
-        if(runtime_dsd_mode != 0)
+        /* W6: per-PCM rates are fixed at configuration — prepare() never
+         * re-rates anything anymore (the legacy path asked the daemon to
+         * re-rate the WHOLE card from any client open). The single-rate
+         * hw constraint makes a mismatch unreachable; this is a fail-loud
+         * backstop. DSD entry is config-driven post-W6 (AddPCM at the DSD
+         * rate; SetPCMRate/REST at W10/W12). */
+        if(runtime_dsd_mode != 0 ? (runtime_dsd_mode != chip->current_dsd) : (chip->current_rate != runtime->rate))
         {
-            if(runtime_dsd_mode != chip->current_dsd)
-            {
-                chip->mr_alsa_audio_ops->stop_interrupts(chip->ravenna_peer, chip, substream->stream == SNDRV_PCM_STREAM_PLAYBACK);
-                spin_unlock_irq(&chip->lock);
-                err = chip->mr_alsa_audio_ops->set_sample_rate(chip->ravenna_peer, runtime_dsd_rate);
-                spin_lock_irq(&chip->lock);
-            }
-        }
-        else if(chip->current_rate != runtime->rate)
-        {
-            chip->mr_alsa_audio_ops->stop_interrupts(chip->ravenna_peer, chip, substream->stream == SNDRV_PCM_STREAM_PLAYBACK);
-            //printk("\n### mr_alsa_audio_pcm_prepare: mr_alsa_audio_ops->set_sample_rate to %u\n", runtime->rate);
+            printk(KERN_ERR "mr_alsa_audio_pcm_prepare: requested rate %u (dsd_mode %u) does not match this pcm's configured rate %u (dsd %u) — per-PCM rates are fixed\n",
+                   runtime->rate, runtime_dsd_mode, chip->current_rate, chip->current_dsd);
             spin_unlock_irq(&chip->lock);
-            err = chip->mr_alsa_audio_ops->set_sample_rate(chip->ravenna_peer, runtime->rate);
-            spin_lock_irq(&chip->lock);
-            //printk("### mr_alsa_audio_pcm_prepare: mr_alsa_audio_ops->set_sample_rate returned %d\n\n", err);
+            return -EINVAL;
         }
 
         /// Number of channels
@@ -1442,22 +1482,20 @@ static int mr_alsa_audio_pcm_hw_params( struct snd_pcm_substream *substream,
         playback_mute_detected = false;
     #endif
 
-    if(dsd_mode != 0)
+    /* W6: per-PCM rates are fixed at configuration (Decision 7). The
+     * legacy path here asked the daemon to re-rate the WHOLE card (global
+     * SetSamplingRate round-trip) from any unprivileged client open —
+     * under per-rate timer entries that is exactly the shared-entry
+     * re-key hazard. The single-rate hw constraint makes a mismatched
+     * negotiation unreachable; fail-loud backstop only. */
+    chip->current_rate = mr_alsa_audio_get_pcm_sample_rate(chip);
+    chip->current_dsd = mr_alsa_audio_get_dsd_mode(chip->current_rate);
+    if(dsd_mode != 0 ? (dsd_mode != chip->current_dsd) : (rate != chip->current_rate))
     {
-        if(dsd_mode != chip->current_dsd)
-        {
-            chip->mr_alsa_audio_ops->stop_interrupts(chip->ravenna_peer, chip, substream->stream == SNDRV_PCM_STREAM_PLAYBACK);
-            spin_unlock_irq(&chip->lock);
-            err = chip->mr_alsa_audio_ops->set_sample_rate(chip->ravenna_peer, dsd_rate);
-            spin_lock_irq(&chip->lock);
-        }
-    }
-    else if(rate != chip->current_rate)
-    {
-        chip->mr_alsa_audio_ops->stop_interrupts(chip->ravenna_peer, chip, substream->stream == SNDRV_PCM_STREAM_PLAYBACK);
+        printk(KERN_ERR "mr_alsa_audio_pcm_hw_params: requested rate %u (dsd_mode %u) does not match this pcm's configured rate %u (dsd %u) — per-PCM rates are fixed\n",
+               rate, dsd_mode, chip->current_rate, chip->current_dsd);
         spin_unlock_irq(&chip->lock);
-        err = chip->mr_alsa_audio_ops->set_sample_rate(chip->ravenna_peer, rate);
-        spin_lock_irq(&chip->lock);
+        return -EINVAL;
     }
 
     /* W5 step 3: per-chip frame size for the period-size sanity check
@@ -1542,21 +1580,39 @@ static int mr_alsa_audio_pcm_hw_free(struct snd_pcm_substream *substream)
 
 
 
-/// Ravenna supports unconventional ALSA sampling rates (8FS values are beyond max standard 192000Hz rate)
-/// We use a PCM constraint to specify those additional values
-static unsigned int g_supported_rates[] = {44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000};
-static struct snd_pcm_hw_constraint_list g_constraints_rates = {
-                .count = ARRAY_SIZE(g_supported_rates),
-                .list = g_supported_rates,
-                .mask = 0,
-};
+/* W6: the rate / period-size constraint lists are per chip
+ * (chip->constraints_rates / chip->constraints_period_sizes, filled by
+ * set_pcm_sample_rate) — the old g_constraints_* globals were rewritten
+ * in place by every open of every chip and advertised all 8 Ravenna
+ * rates on every PCM. */
 
-static unsigned int g_supported_period_sizes[] = {MR_ALSA_NB_FRAMES_PER_PERIOD_AT_1FS, MR_ALSA_NB_FRAMES_PER_PERIOD_AT_1FS * 2, MR_ALSA_NB_FRAMES_PER_PERIOD_AT_1FS * 4, MR_ALSA_NB_FRAMES_PER_PERIOD_AT_1FS * 8};
-static struct snd_pcm_hw_constraint_list g_constraints_period_sizes = {
-                .count = ARRAY_SIZE(g_supported_period_sizes),
-                .list = g_supported_period_sizes,
-                .mask = 0,
-};
+/* DSD formats are advertised only on DSD-configured chips (W6). */
+#ifdef SNDRV_PCM_FMTBIT_DSD_U8
+#define MR_DSD_FMT_U8 SNDRV_PCM_FMTBIT_DSD_U8
+#else
+#define MR_DSD_FMT_U8 0
+#endif
+#ifdef SNDRV_PCM_FMTBIT_DSD_U16_BE
+#define MR_DSD_FMT_U16_BE SNDRV_PCM_FMTBIT_DSD_U16_BE
+#else
+#define MR_DSD_FMT_U16_BE 0
+#endif
+#ifdef SNDRV_PCM_FMTBIT_DSD_U16_LE
+#define MR_DSD_FMT_U16_LE SNDRV_PCM_FMTBIT_DSD_U16_LE
+#else
+#define MR_DSD_FMT_U16_LE 0
+#endif
+#ifdef SNDRV_PCM_FMTBIT_DSD_U32_BE
+#define MR_DSD_FMT_U32_BE SNDRV_PCM_FMTBIT_DSD_U32_BE
+#else
+#define MR_DSD_FMT_U32_BE 0
+#endif
+#ifdef SNDRV_PCM_FMTBIT_DSD_U32_LE
+#define MR_DSD_FMT_U32_LE SNDRV_PCM_FMTBIT_DSD_U32_LE
+#else
+#define MR_DSD_FMT_U32_LE 0
+#endif
+#define MR_ALSA_DSD_FMTBITS (MR_DSD_FMT_U8 | MR_DSD_FMT_U16_BE | MR_DSD_FMT_U16_LE | MR_DSD_FMT_U32_BE | MR_DSD_FMT_U32_LE)
 
 static int mr_alsa_audio_hw_rule_rate_by_format( struct snd_pcm_hw_params *params,
                                              struct snd_pcm_hw_rule *rule)
@@ -1745,7 +1801,7 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
     int ret = 0;
     struct mr_alsa_audio_chip *chip = snd_pcm_substream_chip(substream);
     struct snd_pcm_runtime *runtime = substream->runtime;
-    uint32_t minPTPFrameSize, maxPTPFrameSize, ptp_frame_size, idx;
+    uint32_t minPTPFrameSize, maxPTPFrameSize, ptp_frame_size;
     //uint32_t period_time_us_min, period_time_us_max;
     size_t period_bytes_min, period_bytes_max;
     unsigned int periods_min, periods_max;
@@ -1757,10 +1813,12 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
     //period_time_us_max = 1 + (minPTPFrameSize * 1000000) / 44100;
 
     printk(KERN_DEBUG "entering mr_alsa_audio_pcm_open (substream name=%s #%d) ...\n", substream->name, substream->number);
-    chip->mr_alsa_audio_ops->get_sample_rate(chip->ravenna_peer, &chip->current_rate);
+    /* W6: this chip's OWN configured rate and tick frame govern the
+     * open — the manager-wide rate is meaningless under per-PCM rates. */
+    chip->current_rate = mr_alsa_audio_get_pcm_sample_rate(chip);
     chip->current_dsd = mr_alsa_audio_get_dsd_mode(chip->current_rate);
 
-    ptp_frame_size = min(maxPTPFrameSize, minPTPFrameSize * mr_alsa_audio_get_samplerate_factor(chip->current_rate));
+    ptp_frame_size = mr_alsa_audio_get_pcm_frame_size(chip);
 
     if(substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
     {
@@ -1769,14 +1827,29 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
         struct snd_mask fmt_mask;
         unsigned int k;
         int err = 0;
+        /* W6: customize a LOCAL copy of the template — the old code
+         * rewrote the shared static per open (cross-chip race) and
+         * advertised the full rate span on every chip. */
+        struct snd_pcm_hardware hw = mr_alsa_audio_pcm_hardware_playback;
+        if (chip->current_dsd == 0)
+            hw.formats &= ~(u64)MR_ALSA_DSD_FMTBITS;
+        if (chip->current_dsd != 0)
+        {
+            hw.rate_min = 88200;   /* DSD container rates */
+            hw.rate_max = 352800;
+        }
+        else
+        {
+            hw.rate_min = hw.rate_max = chip->current_rate;
+        }
         t.min = UINT_MAX;
         t.max = 0;
         t.openmin = 0;
         t.openmax = 0;
         t.empty = 1;
         snd_mask_none(&fmt_mask);
-        fmt_mask.bits[0] = (u_int32_t)mr_alsa_audio_pcm_hardware_playback.formats;
-        fmt_mask.bits[1] = (u_int32_t)(mr_alsa_audio_pcm_hardware_playback.formats >> 32);
+        fmt_mask.bits[0] = (u_int32_t)hw.formats;
+        fmt_mask.bits[1] = (u_int32_t)(hw.formats >> 32);
         for (k = 0; k <= SNDRV_PCM_FORMAT_LAST; ++k)
         {
             int bits;
@@ -1793,20 +1866,20 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
 
         printk("mr_alsa_audio_pcm_open: playback format nb bits range: [%u, %u]\n", t.min, t.max);
 
-        period_bytes_min = minPTPFrameSize * mr_alsa_audio_pcm_hardware_playback.channels_min * (t.min >> 3); // amount of data in bytes for min channels, smallest sample size in bytes, minimum period size
-        period_bytes_max = maxPTPFrameSize * mr_alsa_audio_pcm_hardware_playback.channels_max * (t.max >> 3); // amount of data in bytes for max channels, largest sample size in bytes, maximum period size
+        period_bytes_min = minPTPFrameSize * hw.channels_min * (t.min >> 3); // amount of data in bytes for min channels, smallest sample size in bytes, minimum period size
+        period_bytes_max = maxPTPFrameSize * hw.channels_max * (t.max >> 3); // amount of data in bytes for max channels, largest sample size in bytes, maximum period size
         periods_min = 2;
         periods_max = MR_ALSA_RINGBUFFER_NB_FRAMES / maxPTPFrameSize;
 
-        mr_alsa_audio_pcm_hardware_playback.period_bytes_min = period_bytes_min;
-        mr_alsa_audio_pcm_hardware_playback.period_bytes_max = period_bytes_max;
-        mr_alsa_audio_pcm_hardware_playback.periods_min = periods_min;
-        mr_alsa_audio_pcm_hardware_playback.periods_max = periods_max;
+        hw.period_bytes_min = period_bytes_min;
+        hw.period_bytes_max = period_bytes_max;
+        hw.periods_min = periods_min;
+        hw.periods_max = periods_max;
 
         printk("mr_alsa_audio_pcm_open: playback period size range: [%zu, %zu], periods range: [%u, %u]\n",
               period_bytes_min, period_bytes_max, periods_min, periods_max);
 
-        runtime->hw = mr_alsa_audio_pcm_hardware_playback;
+        runtime->hw = hw;
 
         // TODO
         /*if (chip->capture_substream == NULL)
@@ -1845,14 +1918,27 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
         struct snd_interval t;
         struct snd_mask fmt_mask;
         unsigned int k;
+        /* W6: local template copy (see playback). */
+        struct snd_pcm_hardware hw = mr_alsa_audio_pcm_hardware_capture;
+        if (chip->current_dsd == 0)
+            hw.formats &= ~(u64)MR_ALSA_DSD_FMTBITS;
+        if (chip->current_dsd != 0)
+        {
+            hw.rate_min = 88200;   /* DSD container rates */
+            hw.rate_max = 352800;
+        }
+        else
+        {
+            hw.rate_min = hw.rate_max = chip->current_rate;
+        }
         t.min = UINT_MAX;
         t.max = 0;
         t.openmin = 0;
         t.openmax = 0;
         t.empty = 1;
         snd_mask_none(&fmt_mask);
-        fmt_mask.bits[0] = (u_int32_t)mr_alsa_audio_pcm_hardware_capture.formats;
-        fmt_mask.bits[1] = (u_int32_t)(mr_alsa_audio_pcm_hardware_capture.formats >> 32);
+        fmt_mask.bits[0] = (u_int32_t)hw.formats;
+        fmt_mask.bits[1] = (u_int32_t)(hw.formats >> 32);
         for (k = 0; k <= SNDRV_PCM_FORMAT_LAST; ++k)
         {
             int bits;
@@ -1868,20 +1954,20 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
         }
         printk("mr_alsa_audio_pcm_open: capture format nb bits range: [%u, %u]\n", t.min, t.max);
 
-        period_bytes_min = minPTPFrameSize * mr_alsa_audio_pcm_hardware_capture.channels_min * (t.min >> 3); // amount of data in bytes for min channels, smallest sample size in bytes, minimum period size
-        period_bytes_max = maxPTPFrameSize * mr_alsa_audio_pcm_hardware_capture.channels_max * (t.max >> 3); // amount of data in bytes for max channels, largest sample size in bytes, maximum period size
+        period_bytes_min = minPTPFrameSize * hw.channels_min * (t.min >> 3); // amount of data in bytes for min channels, smallest sample size in bytes, minimum period size
+        period_bytes_max = maxPTPFrameSize * hw.channels_max * (t.max >> 3); // amount of data in bytes for max channels, largest sample size in bytes, maximum period size
         periods_min = 2;
         periods_max = MR_ALSA_RINGBUFFER_NB_FRAMES / maxPTPFrameSize;
 
         printk("mr_alsa_audio_pcm_open: capture period size range: [%zu, %zu], periods range: [%u, %u]\n",
               period_bytes_min, period_bytes_max, periods_min, periods_max);
 
-        mr_alsa_audio_pcm_hardware_capture.period_bytes_min = period_bytes_min;
-        mr_alsa_audio_pcm_hardware_capture.period_bytes_max = period_bytes_max;
-        mr_alsa_audio_pcm_hardware_capture.periods_min = periods_min;
-        mr_alsa_audio_pcm_hardware_capture.periods_max = periods_max;
+        hw.period_bytes_min = period_bytes_min;
+        hw.period_bytes_max = period_bytes_max;
+        hw.periods_min = periods_min;
+        hw.periods_max = periods_max;
 
-        runtime->hw = mr_alsa_audio_pcm_hardware_capture;
+        runtime->hw = hw;
         chip->capture_pid = current->pid;
         chip->capture_substream = substream;
 
@@ -1896,7 +1982,7 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
     /// Sample rate supported list:
     ret = snd_pcm_hw_constraint_list(   runtime, 0,
                                         SNDRV_PCM_HW_PARAM_RATE,
-                                        &g_constraints_rates);
+                                        &chip->constraints_rates);
     if(ret < 0)
     {
         printk("mr_alsa_audio_pcm_open: Unsupported sample rate (%u Hz)\n", runtime->rate);
@@ -1908,17 +1994,12 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
                         mr_alsa_audio_hw_rule_rate_by_format, chip,
                         SNDRV_PCM_HW_PARAM_FORMAT, -1);
 
-    ///Periods
-
-    /// Update the Period Sizes Static array accordingly
-    for(idx = 0; idx < ARRAY_SIZE(g_supported_period_sizes); ++idx)
-    {
-        g_supported_period_sizes[idx] = min(minPTPFrameSize << idx, maxPTPFrameSize);
-    }
+    ///Periods (W6: per-chip list, filled at rate publish — no per-open
+    /// rewrite of shared state)
 
     ret = snd_pcm_hw_constraint_list(  runtime, 0,
                                        SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
-                                       &g_constraints_period_sizes);
+                                       &chip->constraints_period_sizes);
 
     /// rules Period Size by Rate
     snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
@@ -1928,7 +2009,7 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
     printk("Current PTPFrame Size = %u, minPTPFrameSize = %u, maxPTPFrameSize = %u\n", 
         ptp_frame_size, minPTPFrameSize, maxPTPFrameSize);
 
-    snd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_SIZE, minPTPFrameSize);
+    snd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_SIZE, ptp_frame_size);
 
 #if 0
     ///rules Nb Periods by Rate
@@ -2264,8 +2345,6 @@ static int mr_alsa_audio_create_alsa_devices(   struct snd_card *card,
     /// sets callbacks for Ravenna Manager
     if(chip->ravenna_peer && chip->mr_alsa_audio_ops)
     {
-        uint32_t minPTPFrameSize, idx;
-
         printk(KERN_INFO "Register ALSA driver into Ravenna Peer for pcm_id=%d...\n", device_idx);
         /* 2026-06-11 review fix: attach can now fail legitimately (no
          * (domain, rate) timer entry). Swallowing it produced a
@@ -2281,12 +2360,9 @@ static int mr_alsa_audio_create_alsa_devices(   struct snd_card *card,
         chip->mr_alsa_audio_ops->get_nb_inputs(chip->ravenna_peer, &chip->current_nbinputs);
         chip->mr_alsa_audio_ops->get_nb_outputs(chip->ravenna_peer, &chip->current_nboutputs);
 
-        /// Update the Period Sizes Static array accordingly
-        chip->mr_alsa_audio_ops->get_min_interrupts_frame_size(chip->ravenna_peer, &minPTPFrameSize);
-        for(idx = 0; idx < ARRAY_SIZE(g_supported_period_sizes); ++idx)
-        {
-            g_supported_period_sizes[idx] = (minPTPFrameSize << idx);
-        }
+        /* W6: per-chip period-size constraints were filled by
+         * set_pcm_sample_rate during register_alsa_driver above — the
+         * global array refresh is gone. */
     }
     else
     {
