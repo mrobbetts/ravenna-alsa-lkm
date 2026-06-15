@@ -188,6 +188,11 @@ struct mr_alsa_audio_chip
     unsigned int supported_period_sizes[4];
     struct snd_pcm_hw_constraint_list constraints_period_sizes;
 
+    /* W7: ALSA device name from AddPCM (group name); empty ⇒ CARD_NAME.
+     * Sized to MT_ALSA_PCM_NAME_MAXLEN (common/MT_ALSA_message_defs.h);
+     * kept in lockstep by hand. Set before the chip is published. */
+    char pcm_name[32];
+
     unsigned int current_rate;  /// updated on each alsa hw_params and prepare
     unsigned int current_dsd;   /// 0 for pcm, 1 for dsd64, 2 for dsd128, 4 for dsd256. updated on each alsa hw_params and prepare
 
@@ -2233,7 +2238,12 @@ static int mr_alsa_audio_create_pcm(struct snd_card *card,
 
     chip->pcm = pcm;
     pcm->private_data = chip;
-    strcpy(pcm->name, CARD_NAME);
+    /* W7: per-PCM device name (aplay -l) when the daemon supplied one via
+     * AddPCM; otherwise the historical CARD_NAME. */
+    if (chip->pcm_name[0])
+        snprintf(pcm->name, sizeof(pcm->name), "%s %s", CARD_NAME, chip->pcm_name);
+    else
+        strcpy(pcm->name, CARD_NAME);
 
     snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &mr_alsa_audio_pcm_playback_ops);
     snd_pcm_add_chmap_ctls(pcm, SNDRV_PCM_STREAM_PLAYBACK, mr_alsa_audio_nadac_playback_ch_map, 8, 0, NULL);
@@ -2532,7 +2542,7 @@ _err:
  * the chip into g_extra_chips before checking the error and let cleanup
  * happen at module unload via mr_alsa_audio_card_free.
  */
-int mr_alsa_audio_add_pcm(int pcm_id, uint32_t sample_rate)
+int mr_alsa_audio_add_pcm(int pcm_id, uint32_t sample_rate, const char *name)
 {
     struct mr_alsa_audio_chip *chip;
     int err;
@@ -2600,6 +2610,12 @@ int mr_alsa_audio_add_pcm(int pcm_id, uint32_t sample_rate)
     /* F3 packed pair: rate in the high 32 bits; frame_size 0 until
      * attach_alsa_driver derives and publishes it. */
     chip->pcm_rate_and_frame = ((uint64_t)sample_rate << 32);
+    /* W7: ALSA device name, set before chip_create publishes the chip. */
+    if (name)
+    {
+        strncpy(chip->pcm_name, name, sizeof(chip->pcm_name) - 1);
+        chip->pcm_name[sizeof(chip->pcm_name) - 1] = '\0';
+    }
     err = mr_alsa_audio_chip_create(g_card, chip, g_ravenna_peer,
                                     g_mr_alsa_audio_ops, pcm_id);
     if (err < 0)

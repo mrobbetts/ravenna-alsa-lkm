@@ -105,15 +105,19 @@ enum MT_ALSA_msg_id
 
 /*
  * Argument struct for MT_ALSA_Msg_AddPCM.
- * Sample rate is included for forward compatibility with Stage 2 (per-PCM
- * rates); in Stage 1 the driver requires it to equal the manager-wide rate.
+ * sample_rate is the per-PCM rate (W2/W5; honoured per-chip since W5).
+ * W7: `name` is the ALSA device name for this PCM (aplay -l); empty ⇒ the
+ * kernel default (CARD_NAME). Fixed-size to keep the struct POD and the
+ * daemon/kernel sizeof() size-check valid across the netlink boundary.
  */
+#define MT_ALSA_PCM_NAME_MAXLEN 32
 struct MT_ALSA_AddPCM_args
 {
     int32_t  pcm_id;
     uint32_t sample_rate;
     uint32_t num_inputs;
     uint32_t num_outputs;
+    char     name[MT_ALSA_PCM_NAME_MAXLEN];
 };
 
 struct MT_ALSA_msg
