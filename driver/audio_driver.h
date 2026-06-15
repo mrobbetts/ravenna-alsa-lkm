@@ -143,7 +143,9 @@ extern void mr_alsa_audio_card_exit(void);
  * (manager's attach_alsa_driver stores it at m_apALSAChip[pcm_id]
  * indexed by id, not insertion order).
  */
-extern int mr_alsa_audio_add_pcm(int pcm_id, uint32_t sample_rate);
+/* W7: `name` becomes the ALSA device name (aplay -l); NULL or "" ⇒ the
+ * historical CARD_NAME. */
+extern int mr_alsa_audio_add_pcm(int pcm_id, uint32_t sample_rate, const char *name);
 
 #if	defined(__cplusplus)
 }
