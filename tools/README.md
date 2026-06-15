@@ -30,3 +30,11 @@ no CPU isolation): +9.0 ppm, residual p95 = 75 us, 12/4601 outliers.
 Tuning knobs to evaluate against this baseline: dedicated CPUs for the
 timer softirqs (isolcpus/nohz_full + IRQ affinity), threadirqs, disabling
 deep C-states on the isolated cores.
+
+## rtp-rate-check.py (run anywhere)
+
+Per-SSRC RTP cadence/rate check for the W7 divergent-rate milestone. Reads
+tshark field output and reports, per stream: packet rate, RTP-timestamp step
+distribution (must be a constant = frame size; a 44/45 split is the SAC-scaling
+bug), and effective media-clock rate (≈ the sample rate, PTP-locked). See the
+header for the exact tshark capture command. Stdlib only.
