@@ -1792,8 +1792,11 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
                 else
                 {
                     int err;
+                    /* W7: ensure the name is NUL-terminated before use —
+                     * it crossed the netlink boundary as a fixed array. */
+                    args->name[sizeof(args->name) - 1] = '\0';
                     effective_rate = args->sample_rate ? args->sample_rate : self->m_SampleRate;
-                    err = mr_alsa_audio_add_pcm(args->pcm_id, effective_rate);
+                    err = mr_alsa_audio_add_pcm(args->pcm_id, effective_rate, args->name);
                     msg_reply.errCode = err;
                 }
             }
