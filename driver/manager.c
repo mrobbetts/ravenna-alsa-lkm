@@ -850,7 +850,8 @@ static uint32_t tick_rate_for_sample_rate(uint32_t sample_rate)
 
 static void tic_entry_refresh_base_period(struct tic_timer_entry* entry)
 {
-    set_base_period(&entry->timer, ((uint64_t)entry->frame_size * 1000000000ULL) / entry->tick_rate);
+    /* W5 + upstream 367c166: frame*1e9/rate, via the shared per-ct helper. */
+    update_base_period(&entry->timer, entry->frame_size, entry->tick_rate);
 }
 
 /* Start (or re-key) an entry's engines and arm its hrtimer.
@@ -964,7 +965,19 @@ static struct tic_timer_entry* get_or_create_tic_entry(struct TManager* self, ui
             return NULL;
         }
     }
-    init_clock_timer(&entry->timer, entry);
+    /* review hardening: init_clock_timer can now reject a bad
+     * audio_cpu_affinity module param (-EINVAL, 367c166's CPU-pin). Unwind
+     * the attached engines and fail rather than arm an unvalidated timer. */
+    if (init_clock_timer(&entry->timer, entry) != 0)
+    {
+        unsigned int u;
+        for (u = 0; u < _MAX_NICS; u++)
+        {
+            clock_ptp_detach_engine(&self->m_PTP[u], &entry->engine[u]);
+            tic_engine_destroy(&entry->engine[u]);
+        }
+        return NULL;
+    }
     tic_entry_refresh_base_period(entry);
     /* publish before any chip maps to it */
     smp_store_release(&entry->active, true);
@@ -1057,7 +1070,7 @@ void manager_entry_tick(struct tic_timer_entry* entry, uint64_t* pui64NextRTXClo
          * busy-spin the hrtimer callback if selection defaults to a NIC
          * whose engine isn't ticking (e.g. NIC-1-only configs before
          * lock). */
-        cand[nic] = ui64Now + entry->timer.base_period_;
+        cand[nic] = ui64Now + READ_ONCE(entry->timer.base_period_);
         tic_engine_tick_schedule(&entry->engine[nic], &ctx[nic], &cand[nic]);
     }
 
