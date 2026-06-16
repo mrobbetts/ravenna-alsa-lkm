@@ -1257,14 +1257,17 @@ static int mr_alsa_audio_pcm_prepare(struct snd_pcm_substream *substream)
     }
     spin_unlock_irq(&chip->lock);
 
-    /* These calls are outside the spinlock because they may call printk
-     * (update_base_period -> set_base_period) or potentially sleep
-     * (set_jitter_buffer_depth — future implementation). */
+    /* set_jitter_buffer_depth is outside the spinlock because it may
+     * potentially sleep (future implementation). The per-entry timer base
+     * period is owned by the manager's (domain,rate) registry (W5) and set
+     * when the entry is keyed (tic_entry_refresh_base_period) — not from the
+     * ALSA prepare path, which has no handle on the entry's clock_timer.
+     * Upstream 367c166's single-timer update_base_period() call here is
+     * therefore dropped. */
     if (chip->ravenna_peer && runtime) {
         uint32_t current_ptp_frame_size;
         chip->mr_alsa_audio_ops->get_interrupts_frame_size(
             chip->ravenna_peer, &current_ptp_frame_size);
-        update_base_period(current_ptp_frame_size, runtime->rate);
 
         if (chip->mr_alsa_audio_ops->set_jitter_buffer_depth) {
             chip->mr_alsa_audio_ops->set_jitter_buffer_depth(
