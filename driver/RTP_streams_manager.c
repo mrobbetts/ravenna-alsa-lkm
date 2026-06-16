@@ -51,6 +51,18 @@
 #define RTCP_ENABLED			1
 #define RTCP_COUNTDOWN_INIT		125 //750	// ~ 1s
 
+/* Multi-rate W8 bring-up: log the per-PCM stream tally on each add so the
+ * index can be eyeballed on the bench (grep dmesg for "W8 pcm-index"). Set to
+ * 0 to quiet once verified — it does not gate count_RTP_streams_for_pcm(),
+ * which is the real API consumed by W9/W10. */
+#define MULTIPCM_W8_TALLY_LOG	1
+
+#if MULTIPCM_W8_TALLY_LOG
+/* defined after add_RTP_stream_ (next to count_RTP_streams_for_pcm); forward
+ * declared here so the add paths can log the per-PCM tally. */
+static void multipcm_w8_log_tally(TRTP_streams_manager* self, const char* szOp, uint32_t ui32PCMId);
+#endif
+
 
 //#define All_LockSinkRPTStreams() spin_lock_irqsave((spinlock_t*)self->m_csSourceRTPStreams, flags);
 //#define All_UnlockSinkRPTStreams() spin_unlock_irqrestore((spinlock_t*)self->m_csSourceRTPStreams, flags);
@@ -320,6 +332,10 @@ int add_RTP_stream_(TRTP_streams_manager* self, TRTP_stream_info* pRTPStreamInfo
         } while (0);
 
 		All_UnlockSourceRPTStreams()
+#if MULTIPCM_W8_TALLY_LOG
+        if (ret)
+            multipcm_w8_log_tally(self, "add-source", pRTPStreamInfo->m_uiPCMId);
+#endif
         return ret;
 	}
 	else
@@ -376,6 +392,10 @@ int add_RTP_stream_(TRTP_streams_manager* self, TRTP_stream_info* pRTPStreamInfo
         } while (0);
 
 		All_UnlockSinkRPTStreams()
+#if MULTIPCM_W8_TALLY_LOG
+        if (ret)
+            multipcm_w8_log_tally(self, "add-sink", pRTPStreamInfo->m_uiPCMId);
+#endif
         return ret;
 	}
 	return 1;
@@ -530,6 +550,128 @@ void remove_all_RTP_streams(TRTP_streams_manager* self)
 		All_UnlockSinkRPTStreams()
 	}
 }
+
+////////////////////////////////////////////////////////////////////
+/* Multi-rate W8 (option A): per-PCM stream index by filtered scan of the
+ * existing ordered arrays — no separate per-PCM pointer table. Counts the live
+ * source + sink stream legs tagged with m_uiPCMId == ui32PCMId.
+ *
+ * ST2022-7 note: a redundant stream contributes one leg per NIC and is counted
+ * once per leg, exactly as m_usNumberOfRTPSourceStreams / m_ausNumberOfRTPSink-
+ * Streams count legs — so the W8 tally below stays balanced.
+ *
+ * Source then sink lock, released between (never nested — the lock macros each
+ * declare their own `flags`, so the two scans MUST live in separate blocks).
+ * Must not be called with either lock already held. */
+unsigned int count_RTP_streams_for_pcm(TRTP_streams_manager* self, uint32_t ui32PCMId)
+{
+	unsigned int uiCount = 0;
+	unsigned short us;
+	unsigned short usNICId;
+
+	{   // SOURCE
+		All_LockSourceRPTStreams()
+		for (us = 0; us < self->m_usNumberOfRTPSourceStreams; us++)
+		{
+			TRTP_audio_stream_handler* pHandler = self->m_apRTPSourceOrderedStreams[us];
+			if (pHandler &&
+			    pHandler->m_RTPAudioStream.m_tRTPStream.m_RTP_stream_info.m_uiPCMId == ui32PCMId)
+			{
+				uiCount++;
+			}
+		}
+		All_UnlockSourceRPTStreams()
+	}
+
+	{   // SINK
+		All_LockSinkRPTStreams()
+		for (usNICId = 0; usNICId < self->m_usNumberOfNICS; ++usNICId)
+		{
+			for (us = 0; us < self->m_ausNumberOfRTPSinkStreams[usNICId]; us++)
+			{
+				TRTP_audio_stream_handler* pHandler = self->m_apRTPSinkOrderedStreams[usNICId][us];
+				if (pHandler &&
+				    pHandler->m_RTPAudioStream.m_tRTPStream.m_RTP_stream_info.m_uiPCMId == ui32PCMId)
+				{
+					uiCount++;
+				}
+			}
+		}
+		All_UnlockSinkRPTStreams()
+	}
+
+	return uiCount;
+}
+
+#if MULTIPCM_W8_TALLY_LOG
+////////////////////////////////////////////////////////////////////
+/* W8 verification: after a stream is added, log the affected PCM's live count
+ * and cross-check two INDEPENDENT totals — (A) the leg counters maintained by
+ * add/remove, against (B) the total reconstructed by summing the per-PCM index.
+ * A and B must agree; a MISMATCH means the ordered arrays and the counters have
+ * desynced. That is exactly the regression W9/W10's per-PCM mutation paths must
+ * not introduce, so this guard earns its keep beyond W8. Self-contained: the
+ * partition's upper bound is the highest m_uiPCMId actually present, so this TU
+ * needs no MAX_PCMS (which lives in the higher-level manager.h). Config-time
+ * only — never on the tick path. */
+static void multipcm_w8_log_tally(TRTP_streams_manager* self, const char* szOp, uint32_t ui32PCMId)
+{
+	unsigned int uiMaintainedTotal;   /* A: leg counters maintained by add/remove */
+	unsigned int uiPartitionSum = 0;  /* B: total reconstructed from the per-PCM index */
+	uint32_t ui32MaxPcm = 0;
+	bool bAny = false;
+	unsigned short us;
+	unsigned short usNICId;
+	uint32_t pcm;
+
+	/* A: the independently-maintained leg counters (source + per-NIC sink). */
+	uiMaintainedTotal = self->m_usNumberOfRTPSourceStreams;
+	for (usNICId = 0; usNICId < self->m_usNumberOfNICS; ++usNICId)
+		uiMaintainedTotal += self->m_ausNumberOfRTPSinkStreams[usNICId];
+
+	/* Highest pcm_id currently present — the partition's upper bound. */
+	{   // SOURCE
+		All_LockSourceRPTStreams()
+		for (us = 0; us < self->m_usNumberOfRTPSourceStreams; us++)
+		{
+			TRTP_audio_stream_handler* pHandler = self->m_apRTPSourceOrderedStreams[us];
+			if (pHandler)
+			{
+				uint32_t p = pHandler->m_RTPAudioStream.m_tRTPStream.m_RTP_stream_info.m_uiPCMId;
+				if (!bAny || p > ui32MaxPcm) { ui32MaxPcm = p; bAny = true; }
+			}
+		}
+		All_UnlockSourceRPTStreams()
+	}
+	{   // SINK
+		All_LockSinkRPTStreams()
+		for (usNICId = 0; usNICId < self->m_usNumberOfNICS; ++usNICId)
+		{
+			for (us = 0; us < self->m_ausNumberOfRTPSinkStreams[usNICId]; us++)
+			{
+				TRTP_audio_stream_handler* pHandler = self->m_apRTPSinkOrderedStreams[usNICId][us];
+				if (pHandler)
+				{
+					uint32_t p = pHandler->m_RTPAudioStream.m_tRTPStream.m_RTP_stream_info.m_uiPCMId;
+					if (!bAny || p > ui32MaxPcm) { ui32MaxPcm = p; bAny = true; }
+				}
+			}
+		}
+		All_UnlockSinkRPTStreams()
+	}
+
+	/* B: reconstruct the total from the per-PCM index (count_ skips NULL slots).
+	 * Summing 0..max covers every leg, since no leg has a higher pcm_id. */
+	if (bAny)
+		for (pcm = 0; pcm <= ui32MaxPcm; pcm++)
+			uiPartitionSum += count_RTP_streams_for_pcm(self, pcm);
+
+	printk("W8 pcm-index [%s]: pcm %u now has %u stream(s); index-sum=%u maintained-total=%u %s\n",
+	       szOp, ui32PCMId, count_RTP_streams_for_pcm(self, ui32PCMId),
+	       uiPartitionSum, uiMaintainedTotal,
+	       (uiPartitionSum == uiMaintainedTotal) ? "OK" : "MISMATCH(!)");
+}
+#endif // MULTIPCM_W8_TALLY_LOG
 
 ////////////////////////////////////////////////////////////////////
 int update_RTP_stream_name(TRTP_streams_manager* self, const TRTP_stream_update_name* pRTP_stream_update_name)
