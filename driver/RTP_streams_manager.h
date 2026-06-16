@@ -96,6 +96,13 @@ int get_RTPStream_status_(TRTP_streams_manager* self, uint64_t hRTPStream, TRTP_
  * already held. */
 unsigned int count_RTP_streams_for_pcm(TRTP_streams_manager* self, uint32_t ui32PCMId);
 
+/* Multi-rate W9 (per-PCM Reset): drain every source + sink stream tagged with
+ * ui32PCMId, leaving other PCMs' streams running. Built on the W8 index + the
+ * existing single-remove path (collect-then-remove). Returns the count removed.
+ * Same lock contract as count_RTP_streams_for_pcm — takes the stream locks
+ * itself; must not be called with either already held. */
+unsigned int remove_RTP_streams_for_pcm(TRTP_streams_manager* self, uint32_t ui32PCMId);
+
 void attached_stream(TRTP_streams_manager* self, TRTP_stream* pRTPStream);
 void detached_stream(TRTP_streams_manager* self, TRTP_stream* pRTPStream);
 
