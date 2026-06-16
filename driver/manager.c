@@ -1202,11 +1202,10 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
         }
         case MT_ALSA_Msg_Reset:
         {
-            /* Payload (Stage 1+): int32_t pcm_id. Streams ARE tagged with
-             * m_uiPCMId now (see RTP_stream_info.h), but the kernel-side
-             * stream container doesn't yet have a per-pcm_id iteration
-             * helper, so this handler still wipes all streams regardless
-             * of pcm_id. Per-pcm_id reset is a Stage 2/3 follow-up. */
+            /* Payload: int32_t pcm_id. W9 convention: pcm_id < 0 drains ALL
+             * streams (the init-time clean slate the daemon sends at startup);
+             * pcm_id in [0, MAX_PCMS) drains only that PCM's streams via the W8
+             * per-PCM index, leaving every other PCM's streams running. */
             MTAL_DP("CManager::OnNewMessage MT_ALSA_Msg_Reset..\n");
             if (msg_rcv->dataSize != sizeof(int32_t))
             {
@@ -1216,8 +1215,26 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             }
             else
             {
-                remove_all_RTP_streams(&self->m_RTP_streams_manager);
-                msg_reply.errCode = 0;
+                int32_t pcm_id = *(int32_t*)msg_rcv->data;
+                if (pcm_id < 0)
+                {
+                    remove_all_RTP_streams(&self->m_RTP_streams_manager);
+                    msg_reply.errCode = 0;
+                }
+                else if (pcm_id < MAX_PCMS)
+                {
+                    unsigned int removed = remove_RTP_streams_for_pcm(
+                        &self->m_RTP_streams_manager, (uint32_t)pcm_id);
+                    printk("W9 reset: drained %u stream(s) of pcm %d\n",
+                           removed, pcm_id);
+                    msg_reply.errCode = 0;
+                }
+                else
+                {
+                    MTAL_DP_ERR("MT_ALSA_Msg_Reset: pcm_id %d out of range [0,%d)\n",
+                                pcm_id, MAX_PCMS);
+                    msg_reply.errCode = -315;
+                }
             }
             break;
         }

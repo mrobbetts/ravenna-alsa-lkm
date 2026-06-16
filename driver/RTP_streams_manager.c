@@ -674,6 +674,94 @@ static void multipcm_w8_log_tally(TRTP_streams_manager* self, const char* szOp, 
 #endif // MULTIPCM_W8_TALLY_LOG
 
 ////////////////////////////////////////////////////////////////////
+/* W9 helper: handle of the first live source-or-sink stream tagged ui32PCMId,
+ * or 0 if none. Locked scan (source then sink, in separate blocks for the
+ * per-macro `flags`). The drain below re-calls this after each removal so the
+ * ordered-array shift never trips a remove-while-iterating skip. */
+static uint64_t first_RTP_stream_handle_for_pcm(TRTP_streams_manager* self, uint32_t ui32PCMId)
+{
+	uint64_t hFound = 0;
+	unsigned short us;
+	unsigned short usNICId;
+
+	{   // SOURCE
+		All_LockSourceRPTStreams()
+		for (us = 0; us < self->m_usNumberOfRTPSourceStreams; us++)
+		{
+			TRTP_audio_stream_handler* pHandler = self->m_apRTPSourceOrderedStreams[us];
+			if (pHandler &&
+			    pHandler->m_RTPAudioStream.m_tRTPStream.m_RTP_stream_info.m_uiPCMId == ui32PCMId)
+			{
+				hFound = (uint64_t)(size_t)&pHandler->m_RTPAudioStream;
+				break;
+			}
+		}
+		All_UnlockSourceRPTStreams()
+	}
+	if (hFound)
+		return hFound;
+
+	{   // SINK
+		All_LockSinkRPTStreams()
+		for (usNICId = 0; usNICId < self->m_usNumberOfNICS && !hFound; ++usNICId)
+		{
+			for (us = 0; us < self->m_ausNumberOfRTPSinkStreams[usNICId]; us++)
+			{
+				TRTP_audio_stream_handler* pHandler = self->m_apRTPSinkOrderedStreams[usNICId][us];
+				if (pHandler &&
+				    pHandler->m_RTPAudioStream.m_tRTPStream.m_RTP_stream_info.m_uiPCMId == ui32PCMId)
+				{
+					hFound = (uint64_t)(size_t)&pHandler->m_RTPAudioStream;
+					break;
+				}
+			}
+		}
+		All_UnlockSinkRPTStreams()
+	}
+	return hFound;
+}
+
+////////////////////////////////////////////////////////////////////
+/* W9 (per-PCM Reset): drain every source + sink stream tagged with ui32PCMId,
+ * leaving other PCMs' streams running. Collect-then-remove via the existing
+ * single-remove path — find the first matching stream, remove it by handle
+ * (which does the ordered-array shift, backing-store release, reader-count
+ * discipline and ST2022-7 detach), repeat until none remain. O(n^2) in the
+ * PCM's stream count, but n <= 64 and config-time only. Returns the number
+ * removed. Takes the stream locks itself (never held across the find/remove
+ * boundary) — must not be called with either already held. */
+unsigned int remove_RTP_streams_for_pcm(TRTP_streams_manager* self, uint32_t ui32PCMId)
+{
+	unsigned int uiRemoved = 0;
+	unsigned int uiGuard = 0;
+	/* Backstop: each successful remove drops one stream, so this can never run
+	 * more times than the backing arrays can hold. Guards an unexpected remove
+	 * no-op from turning the re-find loop infinite. */
+	const unsigned int uiMaxIters =
+		(unsigned int)(MAX_SOURCE_STREAMS * _MAX_NICS * 2)
+		+ (unsigned int)(MAX_SINK_STREAMS * _MAX_NICS * 2);
+	uint64_t h;
+
+	while ((h = first_RTP_stream_handle_for_pcm(self, ui32PCMId)) != 0)
+	{
+		if (!remove_RTP_stream_(self, h))
+		{
+			MTAL_DP("remove_RTP_streams_for_pcm: remove of a pcm %u stream failed; aborting drain after %u\n",
+			        ui32PCMId, uiRemoved);
+			break;
+		}
+		uiRemoved++;
+		if (++uiGuard >= uiMaxIters)
+		{
+			MTAL_DP("remove_RTP_streams_for_pcm: iteration guard hit for pcm %u (removed %u)\n",
+			        ui32PCMId, uiRemoved);
+			break;
+		}
+	}
+	return uiRemoved;
+}
+
+////////////////////////////////////////////////////////////////////
 int update_RTP_stream_name(TRTP_streams_manager* self, const TRTP_stream_update_name* pRTP_stream_update_name)
 {
     unsigned short us;
