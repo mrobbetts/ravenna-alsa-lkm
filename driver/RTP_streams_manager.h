@@ -87,6 +87,15 @@ void remove_all_RTP_streams(TRTP_streams_manager* self);
 int update_RTP_stream_name(TRTP_streams_manager* self, const TRTP_stream_update_name* pRTP_stream_update_name);
 int get_RTPStream_status_(TRTP_streams_manager* self, uint64_t hRTPStream, TRTP_stream_status* pstream_status);
 
+/* Multi-rate W8 (per-PCM stream indexing, option A): how many live source +
+ * sink stream legs are tagged with m_uiPCMId == ui32PCMId. A filtered scan of
+ * the existing ordered arrays — no separate per-PCM pointer table. The walk is
+ * O(n<=64 per direction) and is meant for the reconfigure paths (W9 per-PCM
+ * Reset, W10 RemovePCM drain), never the tick path. Takes the source then the
+ * sink lock (released between, never nested); must not be called with either
+ * already held. */
+unsigned int count_RTP_streams_for_pcm(TRTP_streams_manager* self, uint32_t ui32PCMId);
+
 void attached_stream(TRTP_streams_manager* self, TRTP_stream* pRTPStream);
 void detached_stream(TRTP_streams_manager* self, TRTP_stream* pRTPStream);
 
