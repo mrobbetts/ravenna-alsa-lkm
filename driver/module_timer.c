@@ -260,8 +260,25 @@ void get_clock_time(uint64_t* clock_time)
     *clock_time = (uint64_t)ktime_to_ns(kt_now);
 }
 
+/* W9 robustness (2026-06-16): hard bounds on the tick period so a degenerate
+ * frame/rate — from a buggy or ABI-mismatched daemon — can never produce a
+ * sub-100us "fire immediately forever" timer that storms a CPU. 100us sits
+ * safely below the smallest VALID tick (48 frames @ 384k = 125us), so it never
+ * clamps a legitimate cadence; the 5s ceiling matches the existing arm-time
+ * guard. Defense in depth: update_base_period rejects degenerate inputs up
+ * front, set_base_period floors as a backstop so the derived min/max window
+ * can never be poisoned by a bad base. */
+#define MR_TIC_MIN_PERIOD_NS   100000ULL       /* 100 us */
+#define MR_TIC_MAX_PERIOD_NS   5000000000ULL   /* 5 s    */
+#define MR_TIC_MAX_SANE_RATE   1000000U        /* 1 MHz; valid tick rates top out at 384k */
+#define MR_TIC_MAX_SANE_FRAME  8192U           /* generous; real max_tic_frame_size <= 1024 */
+
 void set_base_period(struct clock_timer* ct, uint64_t base_period)
 {
+    if (base_period < MR_TIC_MIN_PERIOD_NS)
+        base_period = MR_TIC_MIN_PERIOD_NS;
+    else if (base_period > MR_TIC_MAX_PERIOD_NS)
+        base_period = MR_TIC_MAX_PERIOD_NS;
     WRITE_ONCE(ct->base_period_, base_period);
     WRITE_ONCE(ct->min_period_allowed, base_period / 7);
     WRITE_ONCE(ct->max_period_allowed, (base_period * 10) / 6);
@@ -271,8 +288,13 @@ void set_base_period(struct clock_timer* ct, uint64_t base_period)
 void update_base_period(struct clock_timer* ct, uint32_t tic_frame_size, uint32_t sample_rate)
 {
     uint64_t period_ns;
-    if (sample_rate == 0)
+    if (sample_rate == 0 || sample_rate > MR_TIC_MAX_SANE_RATE ||
+        tic_frame_size == 0 || tic_frame_size > MR_TIC_MAX_SANE_FRAME)
+    {
+        printk(KERN_WARNING "update_base_period: refusing degenerate frame=%u rate=%u (period unchanged)\n",
+               tic_frame_size, sample_rate);
         return;
+    }
     period_ns = ((uint64_t)tic_frame_size * 1000000000ULL) / sample_rate;
     set_base_period(ct, period_ns);
 }
