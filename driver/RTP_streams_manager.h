@@ -82,7 +82,7 @@ void destroy_(TRTP_streams_manager* self);
 EDispatchResult process_UDP_packet(TRTP_streams_manager* self, unsigned char byNICId, TUDPPacketBase* pUDPPacketBase, uint32_t packetsize);
 
 int add_RTP_stream_(TRTP_streams_manager* self, TRTP_stream_info* pRTPStreamInfo, uint64_t* phRTPStream);
-int remove_RTP_stream_(TRTP_streams_manager* self, uint64_t hRTPStream);
+int remove_RTP_stream_(TRTP_streams_manager* self, uint64_t hRTPStream, bool bLogPcmIndex);
 void remove_all_RTP_streams(TRTP_streams_manager* self);
 int update_RTP_stream_name(TRTP_streams_manager* self, const TRTP_stream_update_name* pRTP_stream_update_name);
 int get_RTPStream_status_(TRTP_streams_manager* self, uint64_t hRTPStream, TRTP_stream_status* pstream_status);

@@ -402,11 +402,17 @@ int add_RTP_stream_(TRTP_streams_manager* self, TRTP_stream_info* pRTPStreamInfo
 }
 
 ////////////////////////////////////////////////////////////////////
-int remove_RTP_stream_(TRTP_streams_manager* self, uint64_t hRTPStream)
+int remove_RTP_stream_(TRTP_streams_manager* self, uint64_t hRTPStream, bool bLogPcmIndex)
 {
     int ret = 0;
     unsigned short us;
 	unsigned short usNICId;
+#if MULTIPCM_W8_TALLY_LOG
+	uint32_t uiRemovedPcmId = 0;
+	bool bHaveRemovedPcm = false;
+#else
+	(void)bLogPcmIndex;
+#endif
 	{   // SOURCE
 		All_LockSourceRPTStreams()
 
@@ -416,6 +422,10 @@ int remove_RTP_stream_(TRTP_streams_manager* self, uint64_t hRTPStream)
             if(&self->m_apRTPSourceOrderedStreams[us]->m_RTPAudioStream == (TRTP_audio_stream*)(size_t)hRTPStream)
             {
                 unsigned short i;
+#if MULTIPCM_W8_TALLY_LOG
+                uiRemovedPcmId = self->m_apRTPSourceOrderedStreams[us]->m_RTPAudioStream.m_tRTPStream.m_RTP_stream_info.m_uiPCMId;
+                bHaveRemovedPcm = true;
+#endif
                 self->m_usNumberOfRTPSourceStreams--;
                 // move next elements to remove the hole if any
                 for(; us < self->m_usNumberOfRTPSourceStreams; us++)
@@ -449,6 +459,10 @@ int remove_RTP_stream_(TRTP_streams_manager* self, uint64_t hRTPStream)
         } while (0);
 
 		All_UnlockSourceRPTStreams()
+#if MULTIPCM_W8_TALLY_LOG
+		if (ret && bLogPcmIndex && bHaveRemovedPcm)
+			multipcm_w8_log_tally(self, "remove-source", uiRemovedPcmId);
+#endif
 		if (ret)
         	return ret;
 	}
@@ -464,6 +478,10 @@ int remove_RTP_stream_(TRTP_streams_manager* self, uint64_t hRTPStream)
 					if (&self->m_apRTPSinkOrderedStreams[usNICId][us]->m_RTPAudioStream == (TRTP_audio_stream*)(size_t)hRTPStream)
 					{
 						unsigned short i;
+#if MULTIPCM_W8_TALLY_LOG
+						uiRemovedPcmId = self->m_apRTPSinkOrderedStreams[usNICId][us]->m_RTPAudioStream.m_tRTPStream.m_RTP_stream_info.m_uiPCMId;
+						bHaveRemovedPcm = true;
+#endif
 						self->m_ausNumberOfRTPSinkStreams[usNICId]--;
 						// move next elements to remove the hole if any
 						for (; us < self->m_ausNumberOfRTPSinkStreams[usNICId]; us++)
@@ -504,6 +522,10 @@ int remove_RTP_stream_(TRTP_streams_manager* self, uint64_t hRTPStream)
 		} while (0);
 
 		All_UnlockSinkRPTStreams()
+#if MULTIPCM_W8_TALLY_LOG
+		if (ret && bLogPcmIndex && bHaveRemovedPcm)
+			multipcm_w8_log_tally(self, "remove-sink", uiRemovedPcmId);
+#endif
 		if (ret)
 			return ret;
 	}
@@ -744,7 +766,7 @@ unsigned int remove_RTP_streams_for_pcm(TRTP_streams_manager* self, uint32_t ui3
 
 	while ((h = first_RTP_stream_handle_for_pcm(self, ui32PCMId)) != 0)
 	{
-		if (!remove_RTP_stream_(self, h))
+		if (!remove_RTP_stream_(self, h, false))
 		{
 			MTAL_DP("remove_RTP_streams_for_pcm: remove of a pcm %u stream failed; aborting drain after %u\n",
 			        ui32PCMId, uiRemoved);
