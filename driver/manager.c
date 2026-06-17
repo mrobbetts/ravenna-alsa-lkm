@@ -1902,10 +1902,17 @@ bool GetHALToTICDelta(struct TManager* self, THALToTICDelta* pHALToTICDelta)
 
 
 //////////////////////////////////////////////////////////////////////////////////
+/* Bound the _bh lock-hold when wiping a ring. Zeroing a multi-MB buffer under a
+ * single lock keeps softirqs disabled for the whole memset and stalls the tick
+ * (the latency residue of the 2c98043 deadlock fix). Wipe in 64 KiB chunks,
+ * dropping the lock between them. */
+#define MR_ALSA_MUTE_CHUNK_INTS 16384u
+
 void MuteInputBuffer(struct TManager* self, void* alsa_chip_pointer)
 {
     int32_t* inputBuffer = nullptr;
-    uint32_t bufferLength;
+    uint32_t bufferLength, total_ints, done, chunk_ints;
+    int mute_pattern;
 
     if (!alsa_chip_pointer || !self->m_alsa_driver_frontend)
         return;
@@ -1917,29 +1924,47 @@ void MuteInputBuffer(struct TManager* self, void* alsa_chip_pointer)
         return;
     }
 
-    self->m_alsa_driver_frontend->lock_capture_buffer(alsa_chip_pointer);
-    inputBuffer = (int32_t*)(self->m_alsa_driver_frontend->get_capture_buffer(alsa_chip_pointer));
-    if(inputBuffer == nullptr)
-    {
-        MTAL_DP("CManager::MuteInputBuffer failed: No ALSA capture buffer available\n");
-        self->m_alsa_driver_frontend->unlock_capture_buffer(alsa_chip_pointer);
-        return;
-    }
-
     /* m_NumberOfInputs is the manager-wide channel count; per-chip counts
      * land in W9. Every chip's ring shares the same per-channel layout and
      * MR_ALSA_NB_CHANNELS_MAX capacity, so this bound is safe for all
      * chips and mirrors the legacy chip-0 coverage. */
-    memset(inputBuffer, get_live_in_mute_pattern(self, 0), sizeof(int32_t) * bufferLength * self->m_NumberOfInputs);
+    total_ints = bufferLength * self->m_NumberOfInputs;
+    mute_pattern = get_live_in_mute_pattern(self, 0);
 
-    self->m_alsa_driver_frontend->unlock_capture_buffer(alsa_chip_pointer);
+    /* Drop the lock between chunks ONLY when this chip's capture IO is stopped
+     * (stop / rate-change): then the tick isn't writing the ring concurrently,
+     * so chunking can't clobber live audio and the end state (a fully zeroed
+     * ring) is identical. On the start path the IO flag is already set, so the
+     * tick may write live audio in parallel -> wipe atomically (one lock hold)
+     * to preserve exact behaviour. The full fix that removes the process-context
+     * ring writer entirely is the mute-as-flag reshaping (R1). */
+    chunk_ints = self->m_alsa_driver_frontend->get_io_state(alsa_chip_pointer, false)
+                 ? total_ints : MR_ALSA_MUTE_CHUNK_INTS;
+
+    done = 0;
+    while (done < total_ints)
+    {
+        uint32_t n = (total_ints - done < chunk_ints) ? (total_ints - done) : chunk_ints;
+        self->m_alsa_driver_frontend->lock_capture_buffer(alsa_chip_pointer);
+        inputBuffer = (int32_t*)(self->m_alsa_driver_frontend->get_capture_buffer(alsa_chip_pointer));
+        if(inputBuffer == nullptr)
+        {
+            MTAL_DP("CManager::MuteInputBuffer failed: No ALSA capture buffer available\n");
+            self->m_alsa_driver_frontend->unlock_capture_buffer(alsa_chip_pointer);
+            return;
+        }
+        memset(inputBuffer + done, mute_pattern, sizeof(int32_t) * n);
+        self->m_alsa_driver_frontend->unlock_capture_buffer(alsa_chip_pointer);
+        done += n;
+    }
 }
 
 //////////////////////////////////////////////////////////////////////////////////
 void MuteOutputBuffer(struct TManager* self, void* alsa_chip_pointer)
 {
     int32_t* outputBuffer = nullptr;
-    uint32_t bufferLength;
+    uint32_t bufferLength, total_ints, done, chunk_ints;
+    int mute_pattern;
 
     if (!alsa_chip_pointer || !self->m_alsa_driver_frontend)
         return;
@@ -1951,20 +1976,32 @@ void MuteOutputBuffer(struct TManager* self, void* alsa_chip_pointer)
         return;
     }
 
-    self->m_alsa_driver_frontend->lock_playback_buffer(alsa_chip_pointer);
-    outputBuffer = (int32_t*)(self->m_alsa_driver_frontend->get_playback_buffer(alsa_chip_pointer));
-    if(outputBuffer == nullptr)
-    {
-        MTAL_DP("CManager::MuteOutputBuffer failed: No ALSA playback buffer available\n");
-        self->m_alsa_driver_frontend->unlock_playback_buffer(alsa_chip_pointer);
-        return;
-    }
-
     /* See MuteInputBuffer: manager-wide channel count is safe for all
      * chips until per-chip counts land in W9. */
-    memset(outputBuffer, get_live_out_mute_pattern(self, 0), sizeof(int32_t) * bufferLength * self->m_NumberOfOutputs);
+    total_ints = bufferLength * self->m_NumberOfOutputs;
+    mute_pattern = get_live_out_mute_pattern(self, 0);
 
-    self->m_alsa_driver_frontend->unlock_playback_buffer(alsa_chip_pointer);
+    /* See MuteInputBuffer: chunk only on the stop/quiesced path (playback IO
+     * off -> no concurrent tick writer); wipe atomically on the start path. */
+    chunk_ints = self->m_alsa_driver_frontend->get_io_state(alsa_chip_pointer, true)
+                 ? total_ints : MR_ALSA_MUTE_CHUNK_INTS;
+
+    done = 0;
+    while (done < total_ints)
+    {
+        uint32_t n = (total_ints - done < chunk_ints) ? (total_ints - done) : chunk_ints;
+        self->m_alsa_driver_frontend->lock_playback_buffer(alsa_chip_pointer);
+        outputBuffer = (int32_t*)(self->m_alsa_driver_frontend->get_playback_buffer(alsa_chip_pointer));
+        if(outputBuffer == nullptr)
+        {
+            MTAL_DP("CManager::MuteOutputBuffer failed: No ALSA playback buffer available\n");
+            self->m_alsa_driver_frontend->unlock_playback_buffer(alsa_chip_pointer);
+            return;
+        }
+        memset(outputBuffer + done, mute_pattern, sizeof(int32_t) * n);
+        self->m_alsa_driver_frontend->unlock_playback_buffer(alsa_chip_pointer);
+        done += n;
+    }
 }
 
 //////////////////////////////////////////////////////////////////////////////////
