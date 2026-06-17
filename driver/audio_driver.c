@@ -2410,7 +2410,16 @@ static int mr_alsa_audio_create_controls(   struct snd_card *card,
                                             struct mr_alsa_audio_chip *chip)
 {
     int err = 0;
-    spin_lock_irq(&chip->lock);
+    /* No lock here. This runs during card creation, before snd_card_register
+     * (deferred-register), so no userspace control .get/.put can race these
+     * field inits. The previous spin_lock_irq was both unnecessary and unsafe:
+     * get_master_{volume,switch}_value do a netlink round-trip to the daemon
+     * that *sleeps* (wait_event_interruptible_timeout), and snd_ctl_add
+     * allocates — sleeping under spin_lock_irq is "scheduling while atomic".
+     * It was masked while chips were created at probe (the daemon wasn't
+     * connected yet, so the K2U query short-circuited on daemon_pid_ == -1);
+     * W10 multi-card creates chips after the daemon's Hello, so the query now
+     * genuinely waits and tripped the BUG. */
     chip->mr_alsa_audio_ops->get_master_volume_value(chip->ravenna_peer, (int)SNDRV_PCM_STREAM_PLAYBACK, &chip->current_playback_volume);
     chip->playback_volume_control = snd_ctl_new1(&mr_alsa_audio_ctrl_output_gain, chip);
     err = snd_ctl_add(card, chip->playback_volume_control);
@@ -2425,7 +2434,6 @@ static int mr_alsa_audio_create_controls(   struct snd_card *card,
         chip->playback_switch_control = snd_ctl_new1(&mr_alsa_audio_ctrl_output_switch, chip);
         err = snd_ctl_add(card, chip->playback_switch_control);
     }
-    spin_unlock_irq(&chip->lock);
     return err;
 }
 
@@ -2906,6 +2914,21 @@ int mr_alsa_audio_remove_card(int card_handle)
     return 0;
 }
 
+/* W10 multi-card: tear down every card this module created — the clean-slate
+ * primitive. Used at module unload (chip_remove) and when a daemon session
+ * resets everything (MT_ALSA_Msg_Reset with pcm_id < 0), so a restarting
+ * daemon always (re)declares its cards onto an empty module rather than
+ * colliding with the previous session's cards. teardown_card detaches each
+ * chip from the manager before snd_card_free, so a concurrent tick never
+ * resolves a freed chip. Empty slots are skipped, so this is a safe no-op on
+ * a fresh module. */
+void mr_alsa_audio_remove_all_cards(void)
+{
+    int i;
+    for (i = 0; i < MR_ALSA_MAX_CARDS; ++i)
+        mr_alsa_audio_teardown_card(&g_cards[i]);
+}
+
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
 static int mr_alsa_audio_chip_remove(struct platform_device *devptr)
@@ -2913,11 +2936,8 @@ static int mr_alsa_audio_chip_remove(struct platform_device *devptr)
 static void mr_alsa_audio_chip_remove(struct platform_device *devptr)
 #endif
 {
-    int i;
     (void)devptr;
-    /* W10 multi-card: tear down every card this module created. */
-    for (i = 0; i < MR_ALSA_MAX_CARDS; ++i)
-        mr_alsa_audio_teardown_card(&g_cards[i]);
+    mr_alsa_audio_remove_all_cards();
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
     return 0;
 #endif

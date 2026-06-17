@@ -151,6 +151,10 @@ extern int mr_alsa_audio_add_card(int card_handle, const char *id, uint8_t domai
 extern int mr_alsa_audio_add_pcm_to_card(int card_handle, int global_pcm_id, uint32_t sample_rate, const char *name);
 extern int mr_alsa_audio_register_card(int card_handle);
 extern int mr_alsa_audio_remove_card(int card_handle);
+/* Tear down ALL cards (clean slate). Called at module unload and from the
+ * manager's full Reset (MT_ALSA_Msg_Reset, pcm_id < 0) so a restarting daemon
+ * redeclares onto an empty module. Safe no-op when no cards exist. */
+extern void mr_alsa_audio_remove_all_cards(void);
 
 #if	defined(__cplusplus)
 }
