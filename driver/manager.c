@@ -1202,10 +1202,13 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
         }
         case MT_ALSA_Msg_Reset:
         {
-            /* Payload: int32_t pcm_id. W9 convention: pcm_id < 0 drains ALL
-             * streams (the init-time clean slate the daemon sends at startup);
-             * pcm_id in [0, MAX_PCMS) drains only that PCM's streams via the W8
-             * per-PCM index, leaving every other PCM's streams running. */
+            /* Payload: int32_t pcm_id. W9 convention: pcm_id < 0 is the
+             * init-time clean slate the daemon sends at startup — drains ALL
+             * streams AND tears down ALL cards (W10), so a restart redeclares
+             * its cards onto an empty module instead of colliding with the
+             * previous session's cards (AddCard -EEXIST). pcm_id in
+             * [0, MAX_PCMS) drains only that PCM's streams via the W8 per-PCM
+             * index, leaving every other PCM's streams and all cards intact. */
             MTAL_DP("CManager::OnNewMessage MT_ALSA_Msg_Reset..\n");
             if (msg_rcv->dataSize != sizeof(int32_t))
             {
@@ -1218,7 +1221,11 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
                 int32_t pcm_id = *(int32_t*)msg_rcv->data;
                 if (pcm_id < 0)
                 {
+                    /* Streams first, then cards, so no stream outlives the
+                     * chip it referenced (teardown_card additionally detaches
+                     * each chip from the manager before freeing it). */
                     remove_all_RTP_streams(&self->m_RTP_streams_manager);
+                    mr_alsa_audio_remove_all_cards();
                     msg_reply.errCode = 0;
                 }
                 else if (pcm_id < MAX_PCMS)
