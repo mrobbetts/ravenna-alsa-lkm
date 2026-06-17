@@ -100,8 +100,6 @@ MODULE_PARM_DESC(jitter_buffer_multiplier,
 #define SUB_ALLOC_REMOVED 3
 #define SUB_ALLOC_NOT_FOUND 4
 
-static struct snd_pcm_substream* g_substream_alloctable[MR_ALSA_SUBSTREAM_MAX];
-
 static struct platform_device *g_device;
 static struct snd_card *g_card; /* the single card; PCMs 0..N-1 attach here */
 /* Extra chips (PCMs 1..MAX_PCMS-1) created via mr_alsa_audio_add_pcm().
@@ -232,7 +230,14 @@ struct mr_alsa_audio_chip
 
     struct snd_card *card;  /* one card */
     struct snd_pcm *pcm;    /* has one pcm */
-    
+
+    /* Multi-rate / W10: the manager's GLOBAL pcm_id for this chip (its slot in
+     * m_apALSAChip[]). Equals the per-card ALSA device index (chip->pcm->device)
+     * under single-card, but DIVERGES under multi-card (every card has a device
+     * 0). The manager-facing *_for_pcm callbacks key on THIS, never on the
+     * per-card device index. Set at chip_create from device_idx. */
+    int global_pcm_id;
+
     atomic_t dma_playback_offset;
     atomic_t dma_capture_offset;
 
@@ -1202,9 +1207,11 @@ static int mr_alsa_audio_pcm_prepare(struct snd_pcm_substream *substream)
         else if(substream->stream == SNDRV_PCM_STREAM_CAPTURE)
         {
             uint32_t offset = 0;
-            /* 2026-06-09 review fix: per-PCM offset — this chip's ring and
-             * SAC, not chip 0's (chip->pcm->device == pcm_id). */
-            chip->mr_alsa_audio_ops->get_input_jitter_buffer_offset_for_pcm(chip->ravenna_peer, (uint32_t)chip->pcm->device, &offset);
+            /* 2026-06-09 review fix: per-PCM offset — this chip's ring and SAC,
+             * not chip 0's. W10: key on the manager's GLOBAL pcm_id
+             * (chip->global_pcm_id), not the per-card ALSA device index — they
+             * coincide under single-card but diverge under multi-card. */
+            chip->mr_alsa_audio_ops->get_input_jitter_buffer_offset_for_pcm(chip->ravenna_peer, (uint32_t)chip->global_pcm_id, &offset);
             
             printk(KERN_DEBUG "mr_alsa_audio_pcm_prepare for capture stream\n");
             if(chip->ravenna_peer)
@@ -2515,12 +2522,6 @@ static int mr_alsa_audio_create_pcm(struct snd_card *card,
     snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE,  &mr_alsa_audio_pcm_capture_ops);
     pcm->info_flags = SNDRV_PCM_INFO_JOINT_DUPLEX;
 
-    /* g_substream_alloctable is a module-global; only zero it for the
-     * first (default) PCM at probe time. Re-clearing it from each AddPCM
-     * call would wipe state belonging to earlier PCMs. */
-    if (device_idx == 0)
-        memset(g_substream_alloctable, 0, sizeof(g_substream_alloctable));
-
     err = mr_alsa_audio_preallocate_memory(chip);
     if (err < 0)
     {
@@ -2666,6 +2667,7 @@ static int mr_alsa_audio_chip_create(   struct snd_card *card,
     chip->card = card;
     chip->ravenna_peer = ravenna_peer;
     chip->mr_alsa_audio_ops = ops;
+    chip->global_pcm_id = device_idx; /* manager's global pcm_id — see struct comment */
 
     dev_dbg(card->dev, "create alsa devices.\n");
     ret = mr_alsa_audio_create_alsa_devices(card, chip, device_idx);
