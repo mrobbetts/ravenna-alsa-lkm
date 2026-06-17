@@ -1826,16 +1826,48 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
                      * it crossed the netlink boundary as a fixed array. */
                     args->name[sizeof(args->name) - 1] = '\0';
                     effective_rate = args->sample_rate ? args->sample_rate : self->m_SampleRate;
-                    err = mr_alsa_audio_add_pcm(args->pcm_id, effective_rate, args->name);
+                    err = mr_alsa_audio_add_pcm_to_card(args->card_handle, args->pcm_id, effective_rate, args->name);
                     msg_reply.errCode = err;
                 }
             }
             break;
         case MT_ALSA_Msg_RemovePCM:
-            /* Stage 3 will wire this up via REST. Stage 1 declines. */
-            MTAL_DP_ERR("MT_ALSA_Msg_RemovePCM not supported in Stage 1\n");
+            /* Legacy per-PCM remove; superseded by RemoveCard (W10 multi-card). */
+            MTAL_DP_ERR("MT_ALSA_Msg_RemovePCM not supported (use RemoveCard)\n");
             msg_reply.errCode = -ENOSYS;
             break;
+        case MT_ALSA_Msg_AddCard:
+        {
+            if (msg_rcv->dataSize != sizeof(struct MT_ALSA_AddCard_args))
+            {
+                MTAL_DP_ERR("MT_ALSA_Msg_AddCard invalid data size (got %d, expected %zu)\n",
+                            msg_rcv->dataSize, sizeof(struct MT_ALSA_AddCard_args));
+                msg_reply.errCode = -315;
+            }
+            else
+            {
+                struct MT_ALSA_AddCard_args* a = (struct MT_ALSA_AddCard_args*)msg_rcv->data;
+                a->id[sizeof(a->id) - 1] = '\0';
+                msg_reply.errCode = mr_alsa_audio_add_card(a->card_handle, a->id, a->domain);
+            }
+            break;
+        }
+        case MT_ALSA_Msg_RegisterCard:
+        {
+            if (msg_rcv->dataSize != sizeof(int32_t))
+                msg_reply.errCode = -315;
+            else
+                msg_reply.errCode = mr_alsa_audio_register_card(*(int32_t*)msg_rcv->data);
+            break;
+        }
+        case MT_ALSA_Msg_RemoveCard:
+        {
+            if (msg_rcv->dataSize != sizeof(int32_t))
+                msg_reply.errCode = -315;
+            else
+                msg_reply.errCode = mr_alsa_audio_remove_card(*(int32_t*)msg_rcv->data);
+            break;
+        }
         default:
             msg_reply.errCode = -314;
     }

@@ -132,26 +132,13 @@ extern void mr_alsa_audio_card_exit(void);
  * Each card costs one system-wide SNDRV_CARDS slot (cap 32). The GLOBAL pcm_id
  * space (manager m_apALSAChip[]) stays MAX_PCMS, shared across all cards. */
 #define MR_ALSA_MAX_CARDS 4
-/* Multi-PCM: create an additional PCM (hw:RAVENNA,pcm_id) on the card
- * created at probe. pcm_id must be in [1, MAX_PCMS-1]; 0 is the default
- * PCM created at probe.
- *
- * sample_rate is the per-chip rate (Stage 2). Pass a non-zero value from
- * the supported rate set to lock this chip at that rate; pass 0 to
- * inherit the manager-wide rate. The chip's pcm_sample_rate /
- * pcm_frame_size are published with smp_store_release before
- * register_alsa_driver runs, so the moment the manager's chip slot
- * becomes visible to tick-path readers, the chip's rate is too.
- *
- * Returns 0 on success or a negative errno. The new chip auto-attaches
- * into the manager via the existing register_alsa_driver callback
- * (manager's attach_alsa_driver stores it at m_apALSAChip[pcm_id]
- * indexed by id, not insertion order).
- */
-/* W7: `name` becomes the ALSA device name (aplay -l); NULL or "" ⇒ the
- * historical CARD_NAME. */
-extern int mr_alsa_audio_add_pcm(int pcm_id, uint32_t sample_rate, const char *name);
-
+/* add_pcm_to_card's sample_rate is the per-chip rate (W2/W5). Pass a non-zero
+ * value from the supported rate set to lock this chip at that rate; pass 0 to
+ * inherit the manager-wide rate. The chip's (pcm_sample_rate, pcm_frame_size)
+ * pair is published before register_alsa_driver runs, so the moment the
+ * manager's chip slot becomes visible to tick-path readers, the chip's rate is
+ * too. The chip auto-attaches into the manager via the register_alsa_driver
+ * callback (attach_alsa_driver stores it at m_apALSAChip[global_pcm_id]). */
 /* W10 multi-card lifecycle. The daemon drives bringup/teardown as:
  *   add_card(handle, id, domain)                    -> snd_card_new (UNregistered)
  *   add_pcm_to_card(handle, global_pcm_id, rate, name) x N   (deferred-register)
