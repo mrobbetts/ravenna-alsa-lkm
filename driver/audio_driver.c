@@ -2786,7 +2786,7 @@ int mr_alsa_audio_add_card(int card_handle, const char *id, uint8_t domain)
     struct snd_card *card;
     struct mr_alsa_card *mc;
     int err;
-    (void)domain; /* card-level PTP clock domain; pinned 0 until W11 */
+    /* domain is the card-level PTP clock domain; pinned 0 until W11 (logged below). */
     if (card_handle < 0 || card_handle >= MR_ALSA_MAX_CARDS)
     {
         printk(KERN_ERR "mr_alsa_audio_add_card: handle %d out of range [0..%d)\n",
@@ -2817,6 +2817,8 @@ int mr_alsa_audio_add_card(int card_handle, const char *id, uint8_t domain)
     mc->card = card;
     mc->chip_count = 0;
     mc->registered = false;
+    dev_info(&g_device->dev, "mr_alsa_audio_add_card: card %d (%s) created, domain %u\n",
+             card_handle, card->id, domain);
     return 0;
 }
 
@@ -2915,6 +2917,8 @@ static void mr_alsa_audio_teardown_card(struct mr_alsa_card *mc)
     for (i = 0; i < mc->chip_count; ++i)
         if (mc->chips[i] && g_mr_alsa_audio_ops && g_mr_alsa_audio_ops->unregister_alsa_driver)
             g_mr_alsa_audio_ops->unregister_alsa_driver(g_ravenna_peer, mc->chips[i]);
+    dev_info(&g_device->dev, "mr_alsa_audio_teardown_card: card %d (%s) torn down (%u pcm)\n",
+             (int)(mc - g_cards), mc->card->id, mc->chip_count);
     snd_card_free(mc->card);
 }
 

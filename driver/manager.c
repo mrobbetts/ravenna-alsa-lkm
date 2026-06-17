@@ -1639,7 +1639,7 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             {
                 uint64_t* rtp_stream_handle_ptr = (uint64_t*)msg_rcv->data;
                 MTAL_DP_INFO("remove_RTP_stream stream_handle = %llu\n", *rtp_stream_handle_ptr);
-                if (!remove_RTP_stream_(&self->m_RTP_streams_manager, *rtp_stream_handle_ptr))
+                if (!remove_RTP_stream_(&self->m_RTP_streams_manager, *rtp_stream_handle_ptr, true))
                     msg_reply.errCode = -401;
                 else
                     msg_reply.errCode = 0;
