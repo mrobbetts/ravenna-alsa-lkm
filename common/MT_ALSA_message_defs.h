@@ -99,8 +99,16 @@ enum MT_ALSA_msg_id
     MT_ALSA_Msg_GetPTPConfig,             //    U2K One output: TPTPConfig
     MT_ALSA_Msg_GetPTPStatus,             //    U2K One output: TPTPStatus
     /* multi-rate Stage 1 additions; appended to preserve wire-protocol values */
-    MT_ALSA_Msg_AddPCM,                   //    U2K Input: struct MT_ALSA_AddPCM_args. Creates hw:RAVENNA,pcm_id
-    MT_ALSA_Msg_RemovePCM                 //    U2K Input: int32_t pcm_id (refuses pcm_id == 0)
+    MT_ALSA_Msg_AddPCM,                   //    U2K Input: struct MT_ALSA_AddPCM_args. Adds a PCM device to a card
+    MT_ALSA_Msg_RemovePCM,                //    U2K Input: int32_t pcm_id (legacy; superseded by RemoveCard)
+    /* W10 multi-card: cards are created/destroyed live (snd-usb-audio style).
+     * AddCard makes an UNregistered snd_card; AddPCM adds its device(s);
+     * RegisterCard commits (snd_card_register) so all of a card's PCMs appear
+     * together (PA/PW enumerate a card's PCMs once); RemoveCard tears one card
+     * down. Appended to preserve existing wire-protocol values. */
+    MT_ALSA_Msg_AddCard,                  //    U2K Input: struct MT_ALSA_AddCard_args
+    MT_ALSA_Msg_RegisterCard,             //    U2K Input: int32_t card_handle
+    MT_ALSA_Msg_RemoveCard                //    U2K Input: int32_t card_handle
 };
 
 /*
@@ -113,11 +121,24 @@ enum MT_ALSA_msg_id
 #define MT_ALSA_PCM_NAME_MAXLEN 32
 struct MT_ALSA_AddPCM_args
 {
-    int32_t  pcm_id;
+    int32_t  card_handle;   /* W10 multi-card: which card this PCM device joins */
+    int32_t  pcm_id;        /* the GLOBAL pcm_id (manager m_apALSAChip[] slot) */
     uint32_t sample_rate;
     uint32_t num_inputs;
     uint32_t num_outputs;
     char     name[MT_ALSA_PCM_NAME_MAXLEN];
+};
+
+/* W10 multi-card: argument struct for MT_ALSA_Msg_AddCard. Creates an
+ * UNregistered snd_card; `id` becomes the ALSA card id (hw:<id>); `domain` is
+ * the card's PTP clock domain (pinned 0 until W11). The PCMs are added with
+ * MT_ALSA_Msg_AddPCM (carrying this card_handle), then MT_ALSA_Msg_RegisterCard
+ * commits the card. */
+struct MT_ALSA_AddCard_args
+{
+    int32_t  card_handle;   /* daemon-assigned card index [0, MR_ALSA_MAX_CARDS) */
+    uint8_t  domain;
+    char     id[MT_ALSA_PCM_NAME_MAXLEN];
 };
 
 struct MT_ALSA_msg

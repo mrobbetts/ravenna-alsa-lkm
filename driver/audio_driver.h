@@ -127,6 +127,11 @@ extern void mr_alsa_audio_card_exit(void);
  * drift again (the 8→16 bump originally missed this constant, capping
  * AddPCM at id 7 while everything else accepted 15). */
 #define MR_ALSA_MAX_EXTRA_PCMS 15
+/* W10 multi-card: the module owns up to MR_ALSA_MAX_CARDS independent ALSA
+ * cards (~ one per logical device / PTP clock domain), created/destroyed live.
+ * Each card costs one system-wide SNDRV_CARDS slot (cap 32). The GLOBAL pcm_id
+ * space (manager m_apALSAChip[]) stays MAX_PCMS, shared across all cards. */
+#define MR_ALSA_MAX_CARDS 4
 /* Multi-PCM: create an additional PCM (hw:RAVENNA,pcm_id) on the card
  * created at probe. pcm_id must be in [1, MAX_PCMS-1]; 0 is the default
  * PCM created at probe.
@@ -146,6 +151,19 @@ extern void mr_alsa_audio_card_exit(void);
 /* W7: `name` becomes the ALSA device name (aplay -l); NULL or "" ⇒ the
  * historical CARD_NAME. */
 extern int mr_alsa_audio_add_pcm(int pcm_id, uint32_t sample_rate, const char *name);
+
+/* W10 multi-card lifecycle. The daemon drives bringup/teardown as:
+ *   add_card(handle, id, domain)                    -> snd_card_new (UNregistered)
+ *   add_pcm_to_card(handle, global_pcm_id, rate, name) x N   (deferred-register)
+ *   register_card(handle)                           -> snd_card_register (all PCMs visible)
+ * and remove_card(handle) -> snd_card_disconnect + snd_card_free.
+ * card_handle is a daemon-assigned index in [0, MR_ALSA_MAX_CARDS); global_pcm_id
+ * is the manager's m_apALSAChip[] slot (distinct from the per-card ALSA device
+ * index). All return 0 or a negative errno. */
+extern int mr_alsa_audio_add_card(int card_handle, const char *id, uint8_t domain);
+extern int mr_alsa_audio_add_pcm_to_card(int card_handle, int global_pcm_id, uint32_t sample_rate, const char *name);
+extern int mr_alsa_audio_register_card(int card_handle);
+extern int mr_alsa_audio_remove_card(int card_handle);
 
 #if	defined(__cplusplus)
 }
