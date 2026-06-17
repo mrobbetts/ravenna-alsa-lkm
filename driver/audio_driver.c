@@ -101,16 +101,31 @@ MODULE_PARM_DESC(jitter_buffer_multiplier,
 #define SUB_ALLOC_NOT_FOUND 4
 
 static struct platform_device *g_device;
-static struct snd_card *g_card; /* the single card; PCMs 0..N-1 attach here */
-/* Extra chips (PCMs 1..MAX_PCMS-1) created via mr_alsa_audio_add_pcm().
- * PCM 0's chip is card->private_data and is freed by mr_alsa_audio_card_free.
- * Extra chips are kzalloc'd and freed in mr_alsa_audio_card_free below.
- * MR_ALSA_MAX_EXTRA_PCMS now lives in audio_driver.h, pinned to
- * MAX_PCMS - 1 by a _Static_assert in manager.h. */
-static struct mr_alsa_audio_chip *g_extra_chips[MR_ALSA_MAX_EXTRA_PCMS];
-static int g_extra_chip_count;
 static void *g_ravenna_peer;
 static struct alsa_ops *g_mr_alsa_audio_ops;
+
+/* W10 multi-card: the module owns up to MR_ALSA_MAX_CARDS independent ALSA
+ * cards, created/destroyed live (snd-usb-audio style). Each card owns its chips
+ * (PCM devices) and frees only its own via its private_free. The manager stays
+ * card-agnostic — it indexes chips by GLOBAL pcm_id (m_apALSAChip[]); the
+ * per-card device index (chips[] below, 0..N) is a separate space. */
+struct mr_alsa_card {
+    struct snd_card *card;
+    struct mr_alsa_audio_chip *chips[MR_ALSA_MAX_EXTRA_PCMS + 1]; /* by per-card device idx */
+    unsigned int chip_count;
+    bool registered;
+};
+static struct mr_alsa_card g_cards[MR_ALSA_MAX_CARDS];
+
+/* the g_cards[] slot owning a snd_card (used by the per-card private_free). */
+static struct mr_alsa_card *mr_alsa_card_of(struct snd_card *card)
+{
+    int i;
+    for (i = 0; i < MR_ALSA_MAX_CARDS; ++i)
+        if (g_cards[i].card == card)
+            return &g_cards[i];
+    return NULL;
+}
 
 
 static int mr_alsa_audio_pcm_capture_copy_internal( struct snd_pcm_substream *substream,
@@ -2378,7 +2393,7 @@ static struct snd_pcm_ops mr_alsa_audio_pcm_capture_ops = {
 
 /* prototypes */
 static int mr_alsa_audio_create_alsa_devices(struct snd_card *card,
-                     struct mr_alsa_audio_chip *chip, int device_idx);
+                     struct mr_alsa_audio_chip *chip, int device_idx, int global_pcm_id);
 static int mr_alsa_audio_create_pcm(struct snd_card *card,
                 struct mr_alsa_audio_chip *chip, int device_idx);
 
@@ -2565,7 +2580,8 @@ static int mr_alsa_audio_create_pcm(struct snd_card *card,
 
 static int mr_alsa_audio_create_alsa_devices(   struct snd_card *card,
                                                 struct mr_alsa_audio_chip *chip,
-                                                int device_idx)
+                                                int device_idx,
+                                                int global_pcm_id)
 {
     int err;
     err = mr_alsa_audio_create_pcm(card, chip, device_idx); // will also allocate the capture and playback buffers once for all
@@ -2621,16 +2637,16 @@ static int mr_alsa_audio_create_alsa_devices(   struct snd_card *card,
     /// sets callbacks for Ravenna Manager
     if(chip->ravenna_peer && chip->mr_alsa_audio_ops)
     {
-        printk(KERN_INFO "Register ALSA driver into Ravenna Peer for pcm_id=%d...\n", device_idx);
+        printk(KERN_INFO "Register ALSA driver into Ravenna Peer for pcm_id=%d...\n", global_pcm_id);
         /* 2026-06-11 review fix: attach can now fail legitimately (no
          * (domain, rate) timer entry). Swallowing it produced a
          * "successful" PCM with no chip slot and no clock — silent dead
          * audio (the trap would have armed for real when W11 multiplies
          * the registry keyspace). */
-        err = chip->mr_alsa_audio_ops->register_alsa_driver(chip->ravenna_peer, &g_ravenna_manager_ops, (void*)chip, device_idx);
+        err = chip->mr_alsa_audio_ops->register_alsa_driver(chip->ravenna_peer, &g_ravenna_manager_ops, (void*)chip, global_pcm_id);
         if (err < 0)
         {
-            printk(KERN_ERR "register_alsa_driver failed for pcm_id=%d (err %d)\n", device_idx, err);
+            printk(KERN_ERR "register_alsa_driver failed for pcm_id=%d (err %d)\n", global_pcm_id, err);
             return err;
         }
         chip->mr_alsa_audio_ops->get_nb_inputs(chip->ravenna_peer, &chip->current_nbinputs);
@@ -2659,7 +2675,8 @@ static int mr_alsa_audio_chip_create(   struct snd_card *card,
                                         struct mr_alsa_audio_chip *chip,
                                         void *ravenna_peer,
                                         struct alsa_ops *ops,
-                                        int device_idx)
+                                        int device_idx,
+                                        int global_pcm_id)
 {
 
     int ret = 0;
@@ -2667,10 +2684,10 @@ static int mr_alsa_audio_chip_create(   struct snd_card *card,
     chip->card = card;
     chip->ravenna_peer = ravenna_peer;
     chip->mr_alsa_audio_ops = ops;
-    chip->global_pcm_id = device_idx; /* manager's global pcm_id — see struct comment */
+    chip->global_pcm_id = global_pcm_id; /* manager's global pcm_id — see struct comment */
 
     dev_dbg(card->dev, "create alsa devices.\n");
-    ret = mr_alsa_audio_create_alsa_devices(card, chip, device_idx);
+    ret = mr_alsa_audio_create_alsa_devices(card, chip, device_idx, global_pcm_id);
     if(ret < 0)
     {
         printk(KERN_ERR "mr_alsa_audio_create_alsa_devices failed.. \n");
@@ -2696,223 +2713,196 @@ static int mr_alsa_audio_chip_free(struct mr_alsa_audio_chip* chip)
  */
 static void mr_alsa_audio_card_free(struct snd_card *card)
 {
-    struct mr_alsa_audio_chip *chip = card->private_data;
-    int i;
-    /* Free extra chips first (their substreams have already been torn
-     * down by snd_device_free_all; we just reclaim our buffer + struct). */
-    for (i = 0; i < g_extra_chip_count; ++i)
+    struct mr_alsa_card *mc = mr_alsa_card_of(card);
+    unsigned int i;
+    if (!mc)
+        return;
+    /* W10 multi-card: the chips were already detached from the manager
+     * (m_apALSAChip[] slot cleared, timer refcount released) by the teardown
+     * path BEFORE snd_card_free — so the manager never resolves a freed chip.
+     * Here we only reclaim each chip's buffers + struct. Their substreams are
+     * gone (snd_device_free_all ran), so chip->pcm is dangling — never deref it. */
+    for (i = 0; i < mc->chip_count; ++i)
     {
-        if (!g_extra_chips[i])
+        if (!mc->chips[i])
             continue;
-        mr_alsa_audio_chip_free(g_extra_chips[i]);
-        kfree(g_extra_chips[i]);
-        g_extra_chips[i] = NULL;
+        mr_alsa_audio_chip_free(mc->chips[i]);
+        kfree(mc->chips[i]);
+        mc->chips[i] = NULL;
     }
-    g_extra_chip_count = 0;
-    if (chip)
-        mr_alsa_audio_chip_free(chip);
-    g_card = NULL;
+    mc->chip_count = 0;
+    mc->card = NULL;
+    mc->registered = false;
 }
 
 
 /// probe callback
-/// This is the constructor for platform device (callback provided to and called by platform_driver_register())
-/// Stage 1 multi-PCM: creates the card and PCM 0 (the default PCM, hw:RAVENNA,0).
-/// Additional PCMs (hw:RAVENNA,1..N-1) are created dynamically on demand from
-/// MT_ALSA_Msg_AddPCM via mr_alsa_audio_add_pcm() — same code path Stage 3 will
-/// reuse for REST-driven add/remove.
+/// This is the constructor for the platform device (callback provided to and called by platform_driver_register()).
+/// W10 multi-card: no cards are created here. The daemon drives card/PCM bringup
+/// on demand (AddCard -> AddPCM x N -> RegisterCard); probe only validates that
+/// the module is enabled, leaving the platform device as the lifecycle anchor.
 static int mr_alsa_audio_chip_probe(struct platform_device *devptr)
 {
-    struct mr_alsa_audio_chip *chip = NULL;
-    struct snd_card *card;
-    int err;
-
+    /* W10 multi-card: cards are created on demand by the daemon (AddCard),
+     * not at probe. The platform device is only the module's lifecycle anchor
+     * (the parent for each card's snd_card_new). */
+    (void)devptr;
     if (!enable)
         return -ENOENT;
-
-    // Create a card instance
-    // use snd_card_new in Kernel v3.15 and higher
-    #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,15,0)
-    err = snd_card_new(&devptr->dev, index, id, THIS_MODULE, sizeof(struct mr_alsa_audio_chip), &card);
-    #else
-    err = snd_card_create(index, id, THIS_MODULE, sizeof(struct mr_alsa_audio_chip), &card);
-    #endif // LINUX_VERSION_CODE
-    if (err < 0)
-    {
-        dev_err(&devptr->dev, "cannot create alsa card.\n");
-        return err;
-    }
-
-    chip = card->private_data;
-    card->private_free = mr_alsa_audio_card_free;
-    chip->dev = devptr;
-
-    // create the private chip struct for PCM 0
-    err = mr_alsa_audio_chip_create(card, chip, g_ravenna_peer, g_mr_alsa_audio_ops, 0);
-    if(err < 0)
-        goto _err;
-
-    // driver ID and name strings
-    strscpy(card->driver, SND_MR_ALSA_AUDIO_DRIVER, sizeof(card->driver));
-    strscpy(card->shortname, CARD_NAME, sizeof(card->shortname));
-    strlcat(card->longname, card->shortname, sizeof(card->longname));
-
-
-    // register the device struct
-    // ..so that it stores the PCI's device pointer to the card. This will be referred by ALSA core functions later when the devices are registered.
-    // In the case of non-PCI, pass the proper device struct pointer of the BUS instead. (In the case of legacy ISA without PnP, you don't have to do anything.)
-    snd_card_set_dev(card, &devptr->dev);
-
-       // register the card instance
-    err = snd_card_register(card);
-    if (err < 0)
-    {
-        dev_err(&devptr->dev, "cannot register " CARD_NAME " card\n");
-        printk(KERN_ERR "snd_card_register failed..\n");
-        goto _err_card_destroy;
-    }
-    else
-    {
-        dev_info(&devptr->dev, "mr_alsa_audio snd_card_register successful\n");
-    }
-
-    // set the platform driver data
-    platform_set_drvdata(devptr, card);
-    g_card = card;
-
-
-_err_card_destroy:
-    if(err != 0)
-        snd_card_free(card);
-_err:
-    if(err != 0)
-        printk(KERN_ERR "mr_alsa_audio_chip_probe failed...\n");
-    return err;
+    return 0;
 }
 
-/* Public entry point: create an additional PCM on the registered card.
- * Called from manager.c when MT_ALSA_Msg_AddPCM is received from the daemon.
- * The new chip is kzalloc'd, snd_pcm_new'd + snd_device_register'd onto
- * the live card, and self-registers into the manager's m_apALSAChip[]
- * array via the register_alsa_driver callback inside chip_create.
- *
- * Concurrency: this runs in netlink-RX context, concurrent with userspace
- * potentially opening *other* PCMs on the same card. The ALSA core takes
- * register_mutex internally for the snd_device_register path, and the
- * manager's chip-array publish uses smp_store_release/smp_load_acquire to
- * pair with the hrtimer's softirq-context reads.
- *
- * Failure handling: once snd_pcm_new succeeds, the PCM is on card->devices
- * with private_data pointing at our chip. We MUST keep the chip alive
- * until snd_card_free runs, even on subsequent failure, otherwise the
- * core's snd_device_free_all would dereference a freed chip. So we record
- * the chip into g_extra_chips before checking the error and let cleanup
- * happen at module unload via mr_alsa_audio_card_free.
+/* W10 multi-card lifecycle (daemon-driven; see audio_driver.h):
+ *   add_card -> add_pcm_to_card x N -> register_card   (bringup / reconfigure)
+ *   remove_card                                         (teardown)
+ * A card's PCMs are all created BEFORE its snd_card_register (deferred-register),
+ * so a card always appears to userspace with its full PCM set (PA/PW enumerate
+ * a card's PCMs once, at card-detect). card_handle indexes g_cards[];
+ * global_pcm_id is the manager's m_apALSAChip[] slot (distinct from the per-card
+ * ALSA device index assigned 0..N within the card).
  */
-int mr_alsa_audio_add_pcm(int pcm_id, uint32_t sample_rate, const char *name)
+int mr_alsa_audio_add_card(int card_handle, const char *id, uint8_t domain)
 {
-    struct mr_alsa_audio_chip *chip;
+    struct snd_card *card;
+    struct mr_alsa_card *mc;
     int err;
-    int slot;
-    if (!g_card)
+    (void)domain; /* card-level PTP clock domain; pinned 0 until W11 */
+    if (card_handle < 0 || card_handle >= MR_ALSA_MAX_CARDS)
     {
-        printk(KERN_ERR "mr_alsa_audio_add_pcm: card not registered yet\n");
-        return -ENODEV;
-    }
-    if (pcm_id < 1 || pcm_id > MR_ALSA_MAX_EXTRA_PCMS)
-    {
-        printk(KERN_ERR "mr_alsa_audio_add_pcm: pcm_id %d out of range [1..%d]\n",
-               pcm_id, MR_ALSA_MAX_EXTRA_PCMS);
+        printk(KERN_ERR "mr_alsa_audio_add_card: handle %d out of range [0..%d)\n",
+               card_handle, MR_ALSA_MAX_CARDS);
         return -EINVAL;
     }
-    slot = pcm_id - 1;
-    if (g_extra_chips[slot])
+    mc = &g_cards[card_handle];
+    if (mc->card)
     {
-        /* Idempotent re-add (2026-06-10 hardware-test fix): the daemon
-         * re-pushes its full device_groups config on EVERY restart, but
-         * chips persist in the module across daemon restarts (RemovePCM
-         * lands in W10). Same pcm_id at the same rate is therefore a
-         * normal occurrence — succeed as a no-op so a daemon restart
-         * over a live module doesn't fail fatally. A DIFFERENT rate
-         * still refuses loudly: re-rating an existing PCM is W10's
-         * SetPCMRate, not AddPCM. */
-        uint32_t existing_rate =
-            (uint32_t)(g_extra_chips[slot]->pcm_rate_and_frame >> 32);
-        if (existing_rate == sample_rate)
-        {
-            printk(KERN_INFO "mr_alsa_audio_add_pcm: pcm_id %d already exists at rate %u; idempotent success\n",
-                   pcm_id, sample_rate);
-            return 0;
-        }
-        printk(KERN_ERR "mr_alsa_audio_add_pcm: pcm_id %d already exists at rate %u (requested %u); use SetPCMRate (W10) to re-rate\n",
-               pcm_id, existing_rate, sample_rate);
+        printk(KERN_ERR "mr_alsa_audio_add_card: handle %d already in use\n", card_handle);
         return -EEXIST;
     }
+    /* extra_size 0: private_data unused (private_free finds the card via
+     * mr_alsa_card_of); index -1 auto-allocates a free system card slot. */
+    err = snd_card_new(&g_device->dev, -1, (id && id[0]) ? id : NULL,
+                       THIS_MODULE, 0, &card);
+    if (err < 0)
+    {
+        printk(KERN_ERR "mr_alsa_audio_add_card: snd_card_new(handle=%d) failed: %d\n",
+               card_handle, err);
+        return err;
+    }
+    card->private_free = mr_alsa_audio_card_free;
+    strscpy(card->driver, SND_MR_ALSA_AUDIO_DRIVER, sizeof(card->driver));
+    strscpy(card->shortname, (id && id[0]) ? id : CARD_NAME, sizeof(card->shortname));
+    strlcat(card->longname, card->shortname, sizeof(card->longname));
+    snd_card_set_dev(card, &g_device->dev);
+    mc->card = card;
+    mc->chip_count = 0;
+    mc->registered = false;
+    return 0;
+}
+
+int mr_alsa_audio_add_pcm_to_card(int card_handle, int global_pcm_id,
+                                  uint32_t sample_rate, const char *name)
+{
+    struct mr_alsa_card *mc;
+    struct mr_alsa_audio_chip *chip;
+    int device_idx, err;
+    if (card_handle < 0 || card_handle >= MR_ALSA_MAX_CARDS || !g_cards[card_handle].card)
+    {
+        printk(KERN_ERR "mr_alsa_audio_add_pcm_to_card: invalid card handle %d\n", card_handle);
+        return -EINVAL;
+    }
+    mc = &g_cards[card_handle];
+    if (mc->registered)
+    {
+        printk(KERN_ERR "mr_alsa_audio_add_pcm_to_card: card %d already registered; PCMs must be added before RegisterCard\n",
+               card_handle);
+        return -EINVAL;
+    }
+    if (mc->chip_count >= ARRAY_SIZE(mc->chips))
+    {
+        printk(KERN_ERR "mr_alsa_audio_add_pcm_to_card: card %d is full\n", card_handle);
+        return -ENOSPC;
+    }
+    device_idx = (int)mc->chip_count;
     chip = kzalloc(sizeof(*chip), GFP_KERNEL);
     if (!chip)
         return -ENOMEM;
     chip->dev = g_device;
-    /*
-     * Multi-rate Stage 2: stash the configured rate on the chip BEFORE
-     * chip_create runs register_alsa_driver. attach_alsa_driver in the
-     * manager reads this via ops->get_pcm_sample_rate, derives
-     * frame_size from it (with the manager's m_TICFrameSizeAt1FS), and
-     * publishes both fields via ops->set_pcm_sample_rate BEFORE the
-     * smp_store_release on the chip-slot pointer. So the first tick-
-     * path reader that acquire-loads the chip slot sees a coherent
-     * (rate, frame_size) pair on the chip.
-     *
-     * A plain assignment here (not smp_store_release) is fine because
-     * nothing reads the chip yet — it isn't in any published data
-     * structure until attach_alsa_driver runs.
-     *
-     * pcm_frame_size starts at 0 and is filled in by attach_alsa_driver
-     * via the ops vtable. A reader that somehow saw the chip before
-     * attach finished (impossible by construction — chip_create is
-     * single-threaded with respect to itself, and attach happens inside
-     * it) would observe frame_size=0, which is the safe-fail value the
-     * tick-path callbacks already handle (length=0 short-circuits the
-     * stream loops).
-     */
-    /* F3 packed pair: rate in the high 32 bits; frame_size 0 until
-     * attach_alsa_driver derives and publishes it. */
+    /* F3 packed pair: rate high 32 bits, frame_size 0 until attach derives it.
+     * Stashed before chip_create runs register_alsa_driver -> attach (which
+     * reads it and publishes the coherent (rate, frame_size) pair on the chip
+     * before the manager's slot becomes visible to tick-path readers). */
     chip->pcm_rate_and_frame = ((uint64_t)sample_rate << 32);
-    /* W7: ALSA device name, set before chip_create publishes the chip. */
     if (name)
     {
         strncpy(chip->pcm_name, name, sizeof(chip->pcm_name) - 1);
         chip->pcm_name[sizeof(chip->pcm_name) - 1] = '\0';
     }
-    err = mr_alsa_audio_chip_create(g_card, chip, g_ravenna_peer,
-                                    g_mr_alsa_audio_ops, pcm_id);
+    err = mr_alsa_audio_chip_create(mc->card, chip, g_ravenna_peer,
+                                    g_mr_alsa_audio_ops, device_idx, global_pcm_id);
+    /* Record the chip in the card's list whether create succeeded or not: once
+     * chip_create ran, snd_pcm_new may have published it via private_data, so it
+     * must live until card_free. On failure also unhook it from the manager
+     * (no-op if attach didn't run). */
+    mc->chips[device_idx] = chip;
+    mc->chip_count = device_idx + 1;
     if (err < 0)
     {
-        printk(KERN_ERR "mr_alsa_audio_add_pcm: chip_create(pcm_id=%d) failed: %d\n",
-               pcm_id, err);
-        /* mr_alsa_audio_chip_create may have already called register_alsa_driver
-         * (= manager's attach_alsa_driver) before the failing step, which stored
-         * the chip in m_apALSAChip[pcm_id]. Clear that slot now — otherwise the
-         * manager would hold a pointer into memory we're about to free or stash
-         * for later free, and any retry of AddPCM on this id would hit attach's
-         * "already attached" guard. unregister is a no-op if attach didn't run. */
+        printk(KERN_ERR "mr_alsa_audio_add_pcm_to_card: chip_create(card=%d dev=%d pcm_id=%d) failed: %d\n",
+               card_handle, device_idx, global_pcm_id, err);
         if (g_mr_alsa_audio_ops && g_mr_alsa_audio_ops->unregister_alsa_driver)
             g_mr_alsa_audio_ops->unregister_alsa_driver(g_ravenna_peer, chip);
-        /* If snd_pcm_new succeeded, the PCM is on card->devices and
-         * references chip via private_data; we must NOT kfree chip here.
-         * Stash it in g_extra_chips so card_free reclaims it later. We
-         * can't easily tell whether snd_pcm_new succeeded from out here,
-         * so adopt the safe rule: any non-NULL chip after chip_create
-         * lives until card_free. */
-        g_extra_chips[slot] = chip;
-        if (slot >= g_extra_chip_count)
-            g_extra_chip_count = slot + 1;
         return err;
     }
-    g_extra_chips[slot] = chip;
-    if (slot >= g_extra_chip_count)
-        g_extra_chip_count = slot + 1;
-    dev_info(&g_device->dev, "mr_alsa_audio_add_pcm: created hw:%s,%d\n",
-             g_card->id, pcm_id);
+    dev_info(&g_device->dev, "mr_alsa_audio_add_pcm_to_card: card %d (%s) dev %d pcm_id %d rate %u\n",
+             card_handle, mc->card->id, device_idx, global_pcm_id, sample_rate);
+    return 0;
+}
+
+int mr_alsa_audio_register_card(int card_handle)
+{
+    struct mr_alsa_card *mc;
+    int err;
+    if (card_handle < 0 || card_handle >= MR_ALSA_MAX_CARDS || !g_cards[card_handle].card)
+        return -EINVAL;
+    mc = &g_cards[card_handle];
+    if (mc->registered)
+        return 0; /* idempotent */
+    err = snd_card_register(mc->card);
+    if (err < 0)
+    {
+        printk(KERN_ERR "mr_alsa_audio_register_card: snd_card_register(handle=%d) failed: %d\n",
+               card_handle, err);
+        return err;
+    }
+    mc->registered = true;
+    dev_info(&g_device->dev, "mr_alsa_audio_register_card: hw:%s registered (%u pcm%s)\n",
+             mc->card->id, mc->chip_count, mc->chip_count == 1 ? "" : "s");
+    return 0;
+}
+
+/* Tear down one card: detach its chips from the manager (clears each
+ * m_apALSAChip[] slot + releases its (domain,rate) timer refcount) BEFORE
+ * freeing the card, so the manager never resolves a freed chip (the fix for the
+ * old unload-with-streams UAF). snd_card_free then disconnects + frees the
+ * card; the per-card private_free (mr_alsa_audio_card_free) reclaims the chips
+ * and clears the g_cards[] slot. */
+static void mr_alsa_audio_teardown_card(struct mr_alsa_card *mc)
+{
+    unsigned int i;
+    if (!mc || !mc->card)
+        return;
+    for (i = 0; i < mc->chip_count; ++i)
+        if (mc->chips[i] && g_mr_alsa_audio_ops && g_mr_alsa_audio_ops->unregister_alsa_driver)
+            g_mr_alsa_audio_ops->unregister_alsa_driver(g_ravenna_peer, mc->chips[i]);
+    snd_card_free(mc->card);
+}
+
+int mr_alsa_audio_remove_card(int card_handle)
+{
+    if (card_handle < 0 || card_handle >= MR_ALSA_MAX_CARDS || !g_cards[card_handle].card)
+        return -EINVAL;
+    mr_alsa_audio_teardown_card(&g_cards[card_handle]);
     return 0;
 }
 
@@ -2923,9 +2913,11 @@ static int mr_alsa_audio_chip_remove(struct platform_device *devptr)
 static void mr_alsa_audio_chip_remove(struct platform_device *devptr)
 #endif
 {
-    struct snd_card *card;
-    card = platform_get_drvdata(devptr);
-    snd_card_free(card);
+    int i;
+    (void)devptr;
+    /* W10 multi-card: tear down every card this module created. */
+    for (i = 0; i < MR_ALSA_MAX_CARDS; ++i)
+        mr_alsa_audio_teardown_card(&g_cards[i]);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
     return 0;
 #endif
@@ -2972,16 +2964,10 @@ int mr_alsa_audio_card_init(void* ravenna_peer, struct alsa_ops *callbacks)
         device = platform_device_register_simple(SND_MR_ALSA_AUDIO_DRIVER, 0, NULL, 0);
         if (!IS_ERR(device))
         {
-            if (!platform_get_drvdata(device))
-            {
-                platform_device_unregister(device);
-                printk(KERN_ERR "mr_alsa_audio_card_init: platform_get_drvdata failed..\n" );
-            }
-            else
-            {
-                g_device = device;
-                cards++;
-            }
+            /* W10 multi-card: probe creates no card; success = the platform
+             * anchor registered. Cards are added later via AddCard. */
+            g_device = device;
+            cards++;
         }
         else
         {
