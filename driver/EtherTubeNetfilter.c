@@ -203,7 +203,10 @@ int DestroyEtherTube(TEtherTubeNetfilter* self)
 int Start(TEtherTubeNetfilter* self, const char *ifname)
 {
     int ret = 1;
-    spin_lock((spinlock_t*)self->netfilterLock_);
+    /* _bh: netfilterLock_ is also taken in rx_packet (NET_RX softirq), so the
+     * process-context Start/Stop must block softirqs to avoid a same-CPU
+     * self-deadlock with the RX hook (2026 locking audit). */
+    spin_lock_bh((spinlock_t*)self->netfilterLock_);
 
     if (ifname)
     {
@@ -216,16 +219,16 @@ int Start(TEtherTubeNetfilter* self, const char *ifname)
         MTAL_DP_INFO("Start ifname=0\n");
         ret = 0;
     }
-    spin_unlock((spinlock_t*)self->netfilterLock_);
+    spin_unlock_bh((spinlock_t*)self->netfilterLock_);
     return ret;
 }
 
 ////////////////////////////////////////////////////////////////////////
 int Stop(TEtherTubeNetfilter* self)
 {
-    spin_lock((spinlock_t*)self->netfilterLock_);
+    spin_lock_bh((spinlock_t*)self->netfilterLock_);
     self->started_ = 0;
-    spin_unlock((spinlock_t*)self->netfilterLock_);
+    spin_unlock_bh((spinlock_t*)self->netfilterLock_);
     return 1;
 }
 
