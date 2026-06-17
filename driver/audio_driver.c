@@ -668,12 +668,24 @@ static uint32_t mr_alsa_audio_get_capture_buffer_size_in_frames(void *rawchip)
     }
     return res;
 }
+/*
+ * chip->playback_lock / chip->capture_lock are shared between the audio TIC
+ * (mr_alsa_audio_pcm_interrupt, run from the manager's SOFT hrtimer ->
+ * hrtimer_run_softirq -> softirq context) and process context (the manager's
+ * MuteOutputBuffer/MuteInputBuffer on stop/mute, the buffer-offset getters,
+ * pcm copy). Every acquisition therefore uses the _bh variant so a tick softirq
+ * can never run on a CPU that already holds the lock in process context.
+ * Using plain spin_lock here self-deadlocked: stop()/trigger-stop muted a chip
+ * (holding the lock across a multi-MB memset) and the same-CPU tick spun on it
+ * forever -> hard lockup. (A handful of pcm_prepare-path sites use spin_lock_irq,
+ * which is stronger and equally softirq-safe.)
+ */
 static void mr_alsa_audio_lock_playback_buffer(void *rawchip)
 {
     if(rawchip)
     {
         struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip*)rawchip;
-        spin_lock(&chip->playback_lock);
+        spin_lock_bh(&chip->playback_lock);
     }
 }
 static void mr_alsa_audio_unlock_playback_buffer(void *rawchip)
@@ -681,7 +693,7 @@ static void mr_alsa_audio_unlock_playback_buffer(void *rawchip)
     if(rawchip)
     {
         struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip*)rawchip;
-        spin_unlock(&chip->playback_lock);
+        spin_unlock_bh(&chip->playback_lock);
     }
 }
 static void mr_alsa_audio_lock_capture_buffer(void *rawchip)
@@ -689,7 +701,7 @@ static void mr_alsa_audio_lock_capture_buffer(void *rawchip)
     if(rawchip)
     {
         struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip*)rawchip;
-        spin_lock(&chip->capture_lock);
+        spin_lock_bh(&chip->capture_lock);
     }
 }
 static void mr_alsa_audio_unlock_capture_buffer(void *rawchip)
@@ -697,7 +709,7 @@ static void mr_alsa_audio_unlock_capture_buffer(void *rawchip)
     if(rawchip)
     {
         struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip*)rawchip;
-        spin_unlock(&chip->capture_lock);
+        spin_unlock_bh(&chip->capture_lock);
     }
 }
 
@@ -731,11 +743,11 @@ static int mr_alsa_audio_pcm_interrupt(void *rawchip, int direction)
             struct snd_pcm_runtime *runtime;
             unsigned long bytes_to_frame_factor;
 
-            spin_lock(&chip->capture_lock);
+            spin_lock_bh(&chip->capture_lock);
 
             sub = chip->capture_substream;
             if (!sub) {
-                spin_unlock(&chip->capture_lock);
+                spin_unlock_bh(&chip->capture_lock);
                 return 0;
             }
             runtime = sub->runtime;
@@ -776,7 +788,7 @@ static int mr_alsa_audio_pcm_interrupt(void *rawchip, int direction)
                 do_period_elapsed = 1;
             }
 
-            spin_unlock(&chip->capture_lock);
+            spin_unlock_bh(&chip->capture_lock);
 
             /* sub was snapshotted inside lock — safe to use here because
              * ALSA core holds its own refcount on the substream until close
@@ -793,11 +805,11 @@ static int mr_alsa_audio_pcm_interrupt(void *rawchip, int direction)
             struct snd_pcm_runtime *runtime;
             unsigned long bytes_to_frame_factor;
 
-            spin_lock(&chip->playback_lock);
+            spin_lock_bh(&chip->playback_lock);
 
             sub = chip->playback_substream;
             if (!sub) {
-                spin_unlock(&chip->playback_lock);
+                spin_unlock_bh(&chip->playback_lock);
                 return 0;
             }
             runtime = sub->runtime;
@@ -841,7 +853,7 @@ static int mr_alsa_audio_pcm_interrupt(void *rawchip, int direction)
                 do_period_elapsed = 1;
             }
 
-            spin_unlock(&chip->playback_lock);
+            spin_unlock_bh(&chip->playback_lock);
 
             if (do_period_elapsed)
                 snd_pcm_period_elapsed(sub);
@@ -857,9 +869,9 @@ static uint32_t mr_alsa_audio_pcm_get_playback_buffer_offset(void *rawchip)
     if(rawchip)
     {
         struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip*)rawchip;
-        spin_lock(&chip->playback_lock);
+        spin_lock_bh(&chip->playback_lock);
         offset = chip->playback_buffer_pos;
-        spin_unlock(&chip->playback_lock);
+        spin_unlock_bh(&chip->playback_lock);
     }
     return offset;
 }
