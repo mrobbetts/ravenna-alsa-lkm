@@ -67,6 +67,10 @@ static void multipcm_w8_log_tally(TRTP_streams_manager* self, const char* szOp, 
 //#define All_LockSinkRPTStreams() spin_lock_irqsave((spinlock_t*)self->m_csSourceRTPStreams, flags);
 //#define All_UnlockSinkRPTStreams() spin_unlock_irqrestore((spinlock_t*)self->m_csSourceRTPStreams, flags);
 
+/* WARNING: these locks are shared with SOFTIRQ readers (the audio TIC pump and
+ * the NET_RX packet hook). They MUST stay spin_lock_irqsave (or at least _bh) --
+ * do NOT switch to the commented-out plain spin_lock variants below, which would
+ * reintroduce a same-CPU softirq self-deadlock (2026 locking audit). */
 #define All_LockSinkRPTStreams() unsigned long flags; spin_lock_irqsave((spinlock_t*)self->m_csSinkRTPStreams, flags);
 #define All_UnlockSinkRPTStreams() spin_unlock_irqrestore((spinlock_t*)self->m_csSinkRTPStreams, flags);
 
@@ -797,6 +801,7 @@ int update_RTP_stream_name(TRTP_streams_manager* self, const TRTP_stream_update_
             if(&self->m_apRTPSourceOrderedStreams[us]->m_RTPAudioStream == (TRTP_audio_stream*)(size_t)pRTP_stream_update_name->m_hRTPStreamHandle)
 			{
 				set_stream_name(&self->m_apRTPSourceOrderedStreams[us]->m_RTPAudioStream.m_tRTPStream.m_RTP_stream_info, pRTP_stream_update_name->m_cName);
+				All_UnlockSourceRPTStreams()
 				return 1;
 			}
 		}
@@ -813,6 +818,7 @@ int update_RTP_stream_name(TRTP_streams_manager* self, const TRTP_stream_update_
 				if (&self->m_apRTPSinkOrderedStreams[usNICId][us]->m_RTPAudioStream == (TRTP_audio_stream*)(size_t)pRTP_stream_update_name->m_hRTPStreamHandle)
 				{
 					set_stream_name(&self->m_apRTPSinkOrderedStreams[usNICId][us]->m_RTPAudioStream.m_tRTPStream.m_RTP_stream_info, pRTP_stream_update_name->m_cName);
+					All_UnlockSinkRPTStreams()
 					return 1;
 				}
 			}
