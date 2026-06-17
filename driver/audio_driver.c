@@ -669,16 +669,16 @@ static uint32_t mr_alsa_audio_get_capture_buffer_size_in_frames(void *rawchip)
     return res;
 }
 /*
- * chip->playback_lock / chip->capture_lock are shared between the audio TIC
- * (mr_alsa_audio_pcm_interrupt, run from the manager's SOFT hrtimer ->
- * hrtimer_run_softirq -> softirq context) and process context (the manager's
- * MuteOutputBuffer/MuteInputBuffer on stop/mute, the buffer-offset getters,
- * pcm copy). Every acquisition therefore uses the _bh variant so a tick softirq
- * can never run on a CPU that already holds the lock in process context.
- * Using plain spin_lock here self-deadlocked: stop()/trigger-stop muted a chip
- * (holding the lock across a multi-MB memset) and the same-CPU tick spun on it
- * forever -> hard lockup. (A handful of pcm_prepare-path sites use spin_lock_irq,
- * which is stronger and equally softirq-safe.)
+ * chip->playback_lock / chip->capture_lock are shared between SOFTIRQ context --
+ * the audio TIC: mr_alsa_audio_pcm_interrupt AND the buffer-offset getters, both
+ * reached from the manager's SOFT hrtimer (hrtimer_run_softirq; the offset getter
+ * via the RTP transmit, SendRTPAudioPackets) -- and PROCESS context: the manager's
+ * MuteOutputBuffer/MuteInputBuffer on stop/mute, and pcm_close. Every acquisition
+ * therefore uses the _bh variant so a tick softirq can never run on a CPU that
+ * already holds the lock in process context. Using plain spin_lock here
+ * self-deadlocked: stop()/trigger-stop muted a chip (holding the lock across a
+ * multi-MB memset) and the same-CPU tick spun on it forever -> hard lockup.
+ * (pcm_close uses spin_lock_irq, which is stronger and equally softirq-safe.)
  */
 static void mr_alsa_audio_lock_playback_buffer(void *rawchip)
 {
