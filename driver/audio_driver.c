@@ -2574,25 +2574,17 @@ static int mr_alsa_audio_create_pcm(struct snd_card *card,
     snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC, NULL, 0, 0);
 #endif
 
-    /* Post-register dynamic add: trigger snd_pcm_dev_register so the
-     * chardev nodes appear. For device_idx == 0 the card-wide register
-     * sweep in snd_card_register handles this. */
-    if (device_idx > 0)
-    {
-        err = snd_device_register(card, pcm);
-        if (err < 0)
-        {
-            printk(KERN_ERR "mr_alsa_audio_create_pcm: snd_device_register(pcm_id=%d) failed: %d\n",
-                   device_idx, err);
-            /* Leave the PCM on card->devices; snd_card_free at module
-             * unload will free it via snd_pcm_dev_free. Don't kfree the
-             * chip from our caller either — the PCM still references it
-             * via private_data. The caller (mr_alsa_audio_add_pcm) handles
-             * the slot-tracking implications. */
-            return err;
-        }
-    }
-
+    /* Do NOT snd_device_register here. Every PCM is added to the card BEFORE
+     * register_card (the deferred-register model: add_card -> add_pcm_to_card
+     * x N -> register_card; add_pcm_to_card rejects an already-registered card,
+     * and reconfiguration is recreate-card, never a live add). snd_pcm_new has
+     * placed this device on card->devices in BUILD state; snd_card_register's
+     * sweep registers EVERY such device (dev 0, 1, 2, ...) at once -- same as it
+     * already does for device 0. The earlier per-PCM snd_device_register for
+     * device_idx > 0 assumed a post-register dynamic add; on the not-yet-
+     * registered card it failed with -ENOENT (pcmC<n>D1p kobject_add, no parent
+     * registration yet) -- which is exactly why a 2nd PCM never worked. The
+     * managed buffer is already attached above, before that card-wide sweep. */
     return err;
 }
 
