@@ -207,12 +207,19 @@ bool init(struct TManager* self, int* errorCode)
 
     for (i = 0; i < _MAX_NICS; i++)
     {
-        if (!init_ptp(&self->m_PTP[i], &self->m_EthernetFilter[i], &self->m_c_audio_streamer_clock_PTP_callback))
+        unsigned int d;
+        for (d = 0; d < MAX_DOMAINS; d++)
         {
-            DebugMsg("CManager::init: self->m_PTP.Init() failed");
-            theAnswer = false;
-            err = -EINVAL;
-            goto Failure;
+            /* W11: a servo per (NIC, domain), all sharing this NIC's filter.
+             * Configured to its domain by SetPTPConfig; the feed-all dispatch
+             * lets each self-filter incoming PTP by byDomainNumber. */
+            if (!init_ptp(&self->m_PTP[i][d], &self->m_EthernetFilter[i], &self->m_c_audio_streamer_clock_PTP_callback))
+            {
+                DebugMsg("CManager::init: self->m_PTP.Init() failed");
+                theAnswer = false;
+                err = -EINVAL;
+                goto Failure;
+            }
         }
     }
 
@@ -280,7 +287,9 @@ void destroy(struct TManager* self)
     }
     for (i = 0; i < _MAX_NICS; i++)
     {
-        destroy_ptp(&self->m_PTP[i]);
+        unsigned int d;
+        for (d = 0; d < MAX_DOMAINS; d++)
+            destroy_ptp(&self->m_PTP[i][d]);
     }
     for (i = 0; i < _MAX_NICS; i++)
     {
@@ -693,7 +702,10 @@ bool SetSamplingRate(struct TManager* self, uint32_t samplingRate)
                 return false;
             }
         }
-        while (GetLockStatus(&self->m_PTP[0]) != PTPLS_LOCKED || GetLockStatus(&self->m_PTP[1]) != PTPLS_LOCKED);
+        /* W11: wait on chip 0's domain servos (legacy global-rate path). Already
+         * bounded by the nbloop cap above — a GM-less domain times out, not hangs. */
+        while (GetLockStatus(&self->m_PTP[0][entry ? entry->domain : 0]) != PTPLS_LOCKED ||
+               GetLockStatus(&self->m_PTP[1][entry ? entry->domain : 0]) != PTPLS_LOCKED);
         //MTAL_DP("CManager::SetSamplingRate(%u) Completed\n", samplingRate);
     }
 
@@ -768,7 +780,9 @@ bool SetDSDSamplingRate(struct TManager* self, uint32_t samplingRate)
                 return false;
             }
         }
-        while (GetLockStatus(&self->m_PTP[0]) != PTPLS_LOCKED || GetLockStatus(&self->m_PTP[1]) != PTPLS_LOCKED);
+        /* W11: wait on chip 0's domain servos; bounded by the nbloop cap above. */
+        while (GetLockStatus(&self->m_PTP[0][entry ? entry->domain : 0]) != PTPLS_LOCKED ||
+               GetLockStatus(&self->m_PTP[1][entry ? entry->domain : 0]) != PTPLS_LOCKED);
         //MTAL_DP("\n>>> CManager::SetSamplingRate completed () (self->m_PTP.GetLockStatus() == PTPLS_LOCKED)\n\n");
     }
     return true;
@@ -868,7 +882,7 @@ static void tic_entry_start(struct TManager* self, struct tic_timer_entry* entry
     int i;
     for (i = 0; i < _MAX_NICS; i++)
     {
-        TClock_PTP* pServo = &self->m_PTP[i];
+        TClock_PTP* pServo = &self->m_PTP[i][entry->domain];
         if (!self->m_Is_NIC_Active[i])
             continue;
         spin_lock_bh((spinlock_t*)pServo->m_csPTPTime);
@@ -906,7 +920,7 @@ static void tic_entry_stop(struct TManager* self, struct tic_timer_entry* entry)
     for (i = 0; i < _MAX_NICS; i++)
     {
         tic_engine_stop(&entry->engine[i]);
-        ResetPTPLock(&self->m_PTP[i], true);
+        ResetPTPLock(&self->m_PTP[i][entry->domain], true);
     }
 }
 
@@ -951,16 +965,17 @@ static struct tic_timer_entry* get_or_create_tic_entry(struct TManager* self, ui
     entry->active_nic = 0;
     for (nic = 0; nic < _MAX_NICS; nic++)
     {
-        tic_engine_init(&entry->engine[nic], &self->m_PTP[nic]);
+        /* W11: bind this entry's engine to its domain's servo on each NIC. */
+        tic_engine_init(&entry->engine[nic], &self->m_PTP[nic][domain]);
         /* 2026-06-11 review fix: attach can fail (engine list full once
          * W11 multiplies the keyspace) — unwind, don't half-create. */
-        if (!clock_ptp_attach_engine(&self->m_PTP[nic], &entry->engine[nic]))
+        if (!clock_ptp_attach_engine(&self->m_PTP[nic][domain], &entry->engine[nic]))
         {
             unsigned int u;
             tic_engine_destroy(&entry->engine[nic]);
             for (u = 0; u < nic; u++)
             {
-                clock_ptp_detach_engine(&self->m_PTP[u], &entry->engine[u]);
+                clock_ptp_detach_engine(&self->m_PTP[u][domain], &entry->engine[u]);
                 tic_engine_destroy(&entry->engine[u]);
             }
             return NULL;
@@ -974,7 +989,7 @@ static struct tic_timer_entry* get_or_create_tic_entry(struct TManager* self, ui
         unsigned int u;
         for (u = 0; u < _MAX_NICS; u++)
         {
-            clock_ptp_detach_engine(&self->m_PTP[u], &entry->engine[u]);
+            clock_ptp_detach_engine(&self->m_PTP[u][domain], &entry->engine[u]);
             tic_engine_destroy(&entry->engine[u]);
         }
         return NULL;
@@ -1009,7 +1024,7 @@ static void put_tic_entry(struct TManager* self, struct tic_timer_entry* entry)
     for (i = 0; i < _MAX_NICS; i++)
     {
         tic_engine_stop(&entry->engine[i]);
-        clock_ptp_detach_engine(&self->m_PTP[i], &entry->engine[i]);
+        clock_ptp_detach_engine(&self->m_PTP[i][entry->domain], &entry->engine[i]);
         tic_engine_destroy(&entry->engine[i]);
     }
     smp_store_release(&entry->active, false);
@@ -1026,7 +1041,7 @@ static void tic_entry_select_nic(struct TManager* self, struct tic_timer_entry* 
     bool elig0 = tic_engine_lock_status(&entry->engine[0]) == PTPLS_LOCKED;
     bool elig1 = tic_engine_lock_status(&entry->engine[1]) == PTPLS_LOCKED;
 
-    if (elig0 && GetPTPPriority(&self->m_PTP[0]) <= GetPTPPriority(&self->m_PTP[1]))
+    if (elig0 && GetPTPPriority(&self->m_PTP[0][entry->domain]) <= GetPTPPriority(&self->m_PTP[1][entry->domain]))
     {
         WRITE_ONCE(entry->active_nic, 0);
     }
@@ -1061,7 +1076,7 @@ void manager_entry_tick(struct tic_timer_entry* entry, uint64_t* pui64NextRTXClo
     for (nic = 0; nic < _MAX_NICS; nic++)
     {
         if (ctx[nic].bStarted)
-            clock_ptp_periodic_checks(&self->m_PTP[nic], ctx[nic].ui64CurrentRTXClockTime);
+            clock_ptp_periodic_checks(&self->m_PTP[nic][entry->domain], ctx[nic].ui64CurrentRTXClockTime);
     }
 
     for (nic = 0; nic < _MAX_NICS; nic++)
@@ -1659,9 +1674,18 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             else
             {
                 TPTPConfig* ptpConfig = (TPTPConfig*)msg_rcv->data;
+                /* W11: configure every (NIC, domain) servo to ITS domain (slot ==
+                 * domain number) sharing the daemon's global DSCP. The daemon's
+                 * ptpConfig->ui8Domain is not used — domains come from the cards. */
                 for (i = 0; i < _MAX_NICS; i++)
                 {
-                    SetPTPConfig(&self->m_PTP[i], ptpConfig);
+                    unsigned int d;
+                    for (d = 0; d < MAX_DOMAINS; d++)
+                    {
+                        TPTPConfig cfg = *ptpConfig;
+                        cfg.ui8Domain = (uint8_t)d;
+                        SetPTPConfig(&self->m_PTP[i][d], &cfg);
+                    }
                 }
                 msg_reply.errCode = 0;
             }
@@ -1672,7 +1696,8 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             //MTAL_DP_INFO("Get PTP Config\n");
 
             TPTPConfig ptpConfig;
-            GetPTPConfig(&self->m_PTP[manager_status_nic(self)], &ptpConfig);
+            /* W11: per-domain GetPTPConfig is the next sub-slice; report domain 0. */
+            GetPTPConfig(&self->m_PTP[manager_status_nic(self)][0], &ptpConfig);
 
             msg_reply.errCode = 0;
             msg_reply.dataSize = sizeof(TPTPConfig);
@@ -1686,7 +1711,9 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             //MTAL_DP_INFO("Get PTP Status\n");
 
             TPTPStatus ptpStatus;
-            GetPTPStatus(&self->m_PTP[manager_status_nic(self)], &ptpStatus);
+            /* W11: per-domain GetPTPStatus is the next sub-slice; report domain 0
+             * (so the daemon's mirror + SDP GMID stay global, the slice-1 state). */
+            GetPTPStatus(&self->m_PTP[manager_status_nic(self)][0], &ptpStatus);
 
             msg_reply.errCode = 0;
             msg_reply.dataSize = sizeof(TPTPStatus);
@@ -2052,7 +2079,18 @@ EDispatchResult DispatchPacket(struct TManager* self, void* pBuffer, uint32_t pa
     {
         if (self->m_Is_NIC_Active[nicId])
         {
-            nDispatchResult = process_PTP_packet(&self->m_PTP[nicId], pUDPPacketBase, packetsize);
+            /* W11 feed-all: hand the packet to every domain's servo on this NIC;
+             * each self-filters by byDomainNumber (PTP.c), so exactly the matching
+             * domain acts. No break — correctness doesn't lean on the per-domain
+             * return value, and a non-PTP packet bails cheaply in each on the port
+             * check before we fall through to the RTP path. */
+            unsigned int d;
+            for (d = 0; d < MAX_DOMAINS; d++)
+            {
+                EDispatchResult rd = process_PTP_packet(&self->m_PTP[nicId][d], pUDPPacketBase, packetsize);
+                if (rd != DR_PACKET_NOT_USED)
+                    nDispatchResult = rd;
+            }
             if (nDispatchResult == DR_PACKET_NOT_USED)
             {
                 nDispatchResult = process_UDP_packet(&self->m_RTP_streams_manager, nicId, pUDPPacketBase, packetsize);
@@ -2798,12 +2836,19 @@ int attach_alsa_driver(void* user, const struct ravenna_mgr_ops *ops, void *alsa
             MTAL_DP("attach_alsa_driver: pcm_id %d rate=%u frame_size=%u (chip-prestashed=%u)\n",
                     pcm_id, effective_rate, fsize, chip_rate);
         }
-        /* W5: bind the chip to its (domain, tick_rate) timer entry — the
-         * per-chip clock handle. Domain is 0 until W11 (DeviceGroup.domain
-         * is planted fail-loud in W7). The map is published before the
-         * chip slot so a tick-path reader that acquires the chip pointer
-         * always finds the entry. */
-        entry = get_or_create_tic_entry(self, 0, effective_rate);
+        /* W5/W11: bind the chip to its (domain, tick_rate) timer entry — the
+         * per-chip clock handle. The domain is the chip's owning card's PTP
+         * domain (W11; was pinned 0). The map is published before the chip slot
+         * so a tick-path reader that acquires the chip pointer always finds the
+         * entry. */
+        uint8_t chip_domain = ops->get_pcm_domain ? ops->get_pcm_domain(alsa_chip_pointer) : 0;
+        if (chip_domain >= MAX_DOMAINS)
+        {
+            MTAL_DP("attach_alsa_driver: pcm_id %d: domain %u >= MAX_DOMAINS %u — using 0\n",
+                    pcm_id, chip_domain, MAX_DOMAINS);
+            chip_domain = 0;
+        }
+        entry = get_or_create_tic_entry(self, chip_domain, effective_rate);
         if (!entry)
         {
             MTAL_DP("attach_alsa_driver: pcm_id %d: no (domain, rate) timer entry for rate %u\n",
@@ -2882,6 +2927,10 @@ int set_sample_rate(void* user, uint32_t rate)
     {
         if(IsStarted(self))
         {
+            /* W11: legacy global-rate path — wait on chip 0's domain servos,
+             * bounded by the nbloop cap (a GM-less domain times out, never hangs). */
+            struct tic_timer_entry* e0 = smp_load_acquire(&self->m_apChipEntry[0]);
+            uint8_t dom = e0 ? e0->domain : 0;
             do
             {
                 CW_msleep_interruptible(1);
@@ -2891,7 +2940,7 @@ int set_sample_rate(void* user, uint32_t rate)
                     return false;
                 }
             }
-            while (GetLockStatus(&self->m_PTP[0]) != PTPLS_LOCKED || GetLockStatus(&self->m_PTP[1]) != PTPLS_LOCKED);
+            while (GetLockStatus(&self->m_PTP[0][dom]) != PTPLS_LOCKED || GetLockStatus(&self->m_PTP[1][dom]) != PTPLS_LOCKED);
             MTAL_DP("CManager::set_sample_rate completed\n");
         }
         return 0;

@@ -77,6 +77,7 @@ struct ravenna_mgr_ops
     void (*set_pcm_sample_rate)(void *mr_alsa_audio_chip, uint32_t rate, uint32_t frame_size);
     uint32_t (*get_pcm_sample_rate)(void *mr_alsa_audio_chip);
     uint32_t (*get_pcm_frame_size)(void *mr_alsa_audio_chip);
+    uint8_t (*get_pcm_domain)(void *mr_alsa_audio_chip); /* W11: the chip's card's PTP domain */
 };
 
 /// Put functions to be called by ALSA driver (C ALSA to CPP Ravenna wrapper/owner object)

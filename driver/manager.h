@@ -98,8 +98,17 @@ _Static_assert(MR_ALSA_MAX_EXTRA_PCMS == MAX_PCMS - 1,
  *
  * Eight valid tick rates (44.1/48/88.2/96/176.4/192/352.8/384 kHz; DSD
  * keys on its 352.8k tick-rate clock domain, not the 2.8M bit rate).
+ *
+ * W11: with multiple PTP domains an entry is per (domain, tick_rate), so 8
+ * rates no longer bound the count. Each entry still needs ≥1 chip (chip_refcount
+ * > 0), so chips bound it — size to MAX_PCMS.
  */
-#define MAX_TIC_ENTRIES 8
+#define MAX_TIC_ENTRIES MAX_PCMS
+
+/* W11: PTP servos are instanced per (NIC, domain). A card supplies exactly one
+ * domain and cards may share, so distinct domains can never exceed the card
+ * count — size the per-domain dimension to MR_ALSA_MAX_CARDS. */
+#define MAX_DOMAINS MR_ALSA_MAX_CARDS
 
 struct TManager;
 
@@ -121,7 +130,11 @@ struct TManager
     bool m_Is_NIC_Active[_MAX_NICS];
 
     TEtherTubeNetfilter m_EthernetFilter[_MAX_NICS];
-    TClock_PTP m_PTP[_MAX_NICS];
+    /* W11: one PTP servo per (NIC, domain). Domains index directly (slot ==
+     * domain number, capped at MAX_DOMAINS); a tic_timer_entry attaches its
+     * engine[nic] to m_PTP[nic][entry->domain]. Static resources — no per-domain
+     * refcount/registry; the entry's chip_refcount already governs attach/detach. */
+    TClock_PTP m_PTP[_MAX_NICS][MAX_DOMAINS];
     TRTP_streams_manager m_RTP_streams_manager;
     uint32_t m_NumberOfInputs;
     uint32_t m_NumberOfOutputs;
