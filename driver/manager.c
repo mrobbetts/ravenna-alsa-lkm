@@ -1710,9 +1710,12 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             //MTAL_DP_INFO("Get PTP Status\n");
 
             TPTPStatus ptpStatus;
-            /* W11: per-domain GetPTPStatus is the next sub-slice; report domain 0
-             * (so the daemon's mirror + SDP GMID stay global, the slice-1 state). */
-            GetPTPStatus(&self->m_PTP[manager_status_nic(self)][0], &ptpStatus);
+            /* W11: per-domain status — the request carries the wanted domain as a
+             * single byte (a legacy no-data request defaults to domain 0). */
+            uint8_t dom = (msg_rcv->dataSize >= 1) ? *(uint8_t*)msg_rcv->data : 0;
+            if (dom >= MAX_DOMAINS)
+                dom = 0;
+            GetPTPStatus(&self->m_PTP[manager_status_nic(self)][dom], &ptpStatus);
 
             msg_reply.errCode = 0;
             msg_reply.dataSize = sizeof(TPTPStatus);
