@@ -114,6 +114,7 @@ struct mr_alsa_card {
     struct mr_alsa_audio_chip *chips[MR_ALSA_MAX_EXTRA_PCMS + 1]; /* by per-card device idx */
     unsigned int chip_count;
     bool registered;
+    uint8_t domain;   /* W11: the card's PTP clock domain (cards may share one) */
 };
 static struct mr_alsa_card g_cards[MR_ALSA_MAX_CARDS];
 
@@ -1042,6 +1043,15 @@ static uint32_t mr_alsa_audio_get_pcm_frame_size(void *mr_alsa_audio_chip)
     return (uint32_t)(smp_load_acquire(&chip->pcm_rate_and_frame) & 0xFFFFFFFFu);
 }
 
+/* W11: a chip's PTP clock domain is its owning card's (set at add_card). Derived
+ * on demand from chip->card via the g_cards lookup — no per-chip field needed. */
+static uint8_t mr_alsa_audio_get_pcm_domain(void *mr_alsa_audio_chip)
+{
+    struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip *)mr_alsa_audio_chip;
+    struct mr_alsa_card *mc = chip ? mr_alsa_card_of(chip->card) : NULL;
+    return mc ? mc->domain : 0;
+}
+
 static struct ravenna_mgr_ops g_ravenna_manager_ops = {
     .get_playback_buffer =  mr_alsa_audio_get_playback_buffer,
     .get_playback_buffer_size_in_frames = mr_alsa_audio_get_playback_buffer_size_in_frames,
@@ -1060,7 +1070,8 @@ static struct ravenna_mgr_ops g_ravenna_manager_ops = {
     .get_io_state = mr_alsa_audio_get_io_state,
     .set_pcm_sample_rate = mr_alsa_audio_set_pcm_sample_rate,
     .get_pcm_sample_rate = mr_alsa_audio_get_pcm_sample_rate,
-    .get_pcm_frame_size = mr_alsa_audio_get_pcm_frame_size
+    .get_pcm_frame_size = mr_alsa_audio_get_pcm_frame_size,
+    .get_pcm_domain = mr_alsa_audio_get_pcm_domain
 };
 
 
@@ -2809,6 +2820,7 @@ int mr_alsa_audio_add_card(int card_handle, const char *id, uint8_t domain)
     mc->card = card;
     mc->chip_count = 0;
     mc->registered = false;
+    mc->domain = domain;   /* W11: kept so the chip→tick-entry bind can key on it */
     dev_info(&g_device->dev, "mr_alsa_audio_add_card: card %d (%s) created, domain %u\n",
              card_handle, card->id, domain);
     return 0;
