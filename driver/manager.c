@@ -181,8 +181,8 @@ bool init(struct TManager* self, int* errorCode)
 
     self->m_RingBufferFrameSize = RINGBUFFERSIZE;
 
-    self->m_nPlayoutDelay = 0;
-    self->m_nCaptureDelay = 0;
+    /* W9 #14: playout/capture delay moved off the manager onto each chip
+     * (set per-pcm_id via Set{Playout,Capture}Delay, read at prepare()). */
 
     self->m_NumberOfInputs = DEFAULT_NUMBEROFINPUTS;
     SetNumberOfInputs(self, self->m_NumberOfInputs);
@@ -1781,56 +1781,37 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             }
             break;
         case MT_ALSA_Msg_SetPlayoutDelay:
-            /* Payload (Stage 1+): {int32_t pcm_id, int32_t delay_in_samples}.
-             * Stage 1 stores delay manager-wide and refuses non-zero
-             * pcm_id, so the per-PCM gap is visible to the daemon (which
-             * already restricts itself to pcm_id=0 in init). Per-PCM
-             * delay storage lands in Stage 2 when m_nPlayoutDelay moves
-             * onto the chip. */
-            if (msg_rcv->dataSize != sizeof(int32_t) * 2)
-            {
-                MTAL_DP_ERR("MT_ALSA_Msg_SetPlayoutDelay invalid data size\n");
-                msg_reply.errCode = -315;
-            }
-            else
-            {
-                int32_t pcm_id = *(int32_t*)msg_rcv->data;
-                int32_t delay  = *(int32_t*)((char*)msg_rcv->data + sizeof(int32_t));
-                if (pcm_id != 0)
-                {
-                    MTAL_DP_ERR("MT_ALSA_Msg_SetPlayoutDelay: per-pcm_id (%d) not supported in Stage 1\n", pcm_id);
-                    msg_reply.errCode = -EINVAL;
-                }
-                else
-                {
-                    self->m_nPlayoutDelay = delay;
-                    MTAL_DP_INFO("MT_ALSA_Msg_SetPlayoutDelay pcm_id=0 set to %d\n",
-                                 self->m_nPlayoutDelay);
-                    msg_reply.errCode = 0;
-                }
-            }
-            break;
         case MT_ALSA_Msg_SetCaptureDelay:
+            /* W9 #14: payload {int32_t pcm_id, int32_t delay_in_samples}. The
+             * delay is now a per-chip advisory latency (no manager-wide
+             * m_n*Delay): resolve the chip for pcm_id and store on it; read at
+             * prepare() into runtime->delay. Any in-range pcm_id is accepted. */
             if (msg_rcv->dataSize != sizeof(int32_t) * 2)
             {
-                MTAL_DP_ERR("MT_ALSA_Msg_SetCaptureDelay invalid data size\n");
+                MTAL_DP_ERR("MT_ALSA_Msg_Set%sDelay invalid data size\n",
+                            msg_rcv->id == MT_ALSA_Msg_SetPlayoutDelay ? "Playout" : "Capture");
                 msg_reply.errCode = -315;
             }
             else
             {
                 int32_t pcm_id = *(int32_t*)msg_rcv->data;
                 int32_t delay  = *(int32_t*)((char*)msg_rcv->data + sizeof(int32_t));
-                if (pcm_id != 0)
+                bool is_playout = (msg_rcv->id == MT_ALSA_Msg_SetPlayoutDelay);
+                void* chip = (pcm_id >= 0 && pcm_id < MAX_PCMS)
+                                 ? get_chip_by_pcm_id(self, pcm_id) : NULL;
+                if (!chip)
                 {
-                    MTAL_DP_ERR("MT_ALSA_Msg_SetCaptureDelay: per-pcm_id (%d) not supported in Stage 1\n", pcm_id);
-                    msg_reply.errCode = -EINVAL;
+                    MTAL_DP_ERR("MT_ALSA_Msg_Set%sDelay: no chip for pcm_id %d\n",
+                                is_playout ? "Playout" : "Capture", pcm_id);
+                    msg_reply.errCode = -ENODEV;
                 }
                 else
                 {
-                    self->m_nCaptureDelay = delay;
-                    MTAL_DP_INFO("MT_ALSA_Msg_SetCaptureDelay pcm_id=0 set to %d\n",
-                                 self->m_nCaptureDelay);
-                    msg_reply.errCode = 0;
+                    msg_reply.errCode = is_playout
+                        ? mr_alsa_audio_set_playout_delay(chip, delay)
+                        : mr_alsa_audio_set_capture_delay(chip, delay);
+                    MTAL_DP_INFO("MT_ALSA_Msg_Set%sDelay pcm_id=%d set to %d\n",
+                                 is_playout ? "Playout" : "Capture", pcm_id, delay);
                 }
             }
             break;
@@ -3019,27 +3000,9 @@ int get_nb_outputs(void* user, uint32_t *nb_Channels)
     return -EINVAL;
 }
 
-int get_playout_delay(void* user, snd_pcm_sframes_t *delay_in_sample)
-{
-    struct TManager* self = (struct TManager*)user;
-    if (delay_in_sample)
-    {
-        *delay_in_sample = self->m_nPlayoutDelay;
-        return 0;
-    }
-    return -EINVAL;
-}
-
-int get_capture_delay(void* user, snd_pcm_sframes_t *delay_in_sample)
-{
-    struct TManager* self = (struct TManager*)user;
-    if (delay_in_sample)
-    {
-        *delay_in_sample = self->m_nCaptureDelay;
-        return 0;
-    }
-    return -EINVAL;
-}
+/* W9 #14: get_playout_delay / get_capture_delay removed — the delay is now a
+ * per-chip property read directly at prepare() (see audio_driver.c), not a
+ * manager-wide value fetched via callback. */
 
 int get_output_jitter_buffer_offset(void* user, uint32_t *offset)
 {
@@ -3292,8 +3255,6 @@ void init_alsa_callbacks(struct TManager* self)
     //self->m_alsa_callbacks.set_nb_outputs = &set_nb_outputs;
     self->m_alsa_callbacks.get_nb_inputs = &get_nb_inputs;
     self->m_alsa_callbacks.get_nb_outputs = &get_nb_outputs;
-    self->m_alsa_callbacks.get_playout_delay = &get_playout_delay;
-    self->m_alsa_callbacks.get_capture_delay = &get_capture_delay;
     self->m_alsa_callbacks.start_interrupts = &start_interrupts;
     self->m_alsa_callbacks.stop_interrupts = &stop_interrupts;
     self->m_alsa_callbacks.notify_master_volume_change = &notify_master_volume_change;
