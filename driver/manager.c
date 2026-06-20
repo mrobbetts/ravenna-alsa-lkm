@@ -1725,6 +1725,29 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             CW_netlink_send_reply_to_user_land(&msg_reply);
             return; // because ptpStatus is out of the scope if send reply at the end of the function
         }
+        case MT_ALSA_Msg_GetPCMStatus:
+        {
+            /* #22: per-PCM TIC-engine lock — the chip's (domain, rate) entry's
+             * active-NIC engine. An unattached/unknown pcm reports unlocked. */
+            struct TPCMStatus pcmStatus;
+            int32_t pcm_id = (msg_rcv->dataSize >= (int)sizeof(int32_t))
+                                 ? *(int32_t*)msg_rcv->data
+                                 : -1;
+            pcmStatus.nTICLockStatus = PTPLS_UNLOCKED;
+            if (pcm_id >= 0 && pcm_id < MAX_PCMS)
+            {
+                struct tic_timer_entry* entry =
+                    smp_load_acquire(&self->m_apChipEntry[pcm_id]);
+                if (entry)
+                    pcmStatus.nTICLockStatus =
+                        tic_engine_lock_status(active_engine_of(entry));
+            }
+            msg_reply.errCode = 0;
+            msg_reply.dataSize = sizeof(struct TPCMStatus);
+            msg_reply.data = &pcmStatus;
+            CW_netlink_send_reply_to_user_land(&msg_reply);
+            return;
+        }
         case MT_ALSA_Msg_SetMasterOutputVolume:
             if (msg_rcv->dataSize != sizeof(int32_t))
             {
