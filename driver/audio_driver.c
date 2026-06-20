@@ -244,6 +244,14 @@ struct mr_alsa_audio_chip
     int32_t current_playback_volume; /// cached value for volume control
     int32_t current_playback_switch; /// cached value for switch control
 
+    /* W9 #14: per-PCM advisory ALSA latency (frames), latched into
+     * runtime->delay at prepare() so snd_pcm_delay() reports this chip's own
+     * latency. Set per-pcm_id via MT_ALSA_Msg_Set{Playout,Capture}Delay
+     * (replaces the former manager-wide m_n*Delay). NOTE: advisory only — the
+     * real RTP buffering depth is the per-stream link offset, not this. */
+    int32_t playout_delay;
+    int32_t capture_delay;
+
     struct snd_card *card;  /* one card */
     struct snd_pcm *pcm;    /* has one pcm */
 
@@ -1207,7 +1215,9 @@ static int mr_alsa_audio_pcm_prepare(struct snd_pcm_substream *substream)
             chip->nb_playback_interrupts_per_period = ((runtime_dsd_mode != 0)? (MR_ALSA_PTP_FRAME_RATE_FOR_DSD / runtime->rate) : 1);
 
             /// Fill the additional delay between the packet output and the sound eared
-            chip->mr_alsa_audio_ops->get_playout_delay(chip->ravenna_peer, &runtime->delay);
+            /* W9 #14: per-PCM advisory latency, read straight off this chip (no
+             * manager round-trip / shared m_nPlayoutDelay). */
+            runtime->delay = chip->playout_delay;
 
             /* Select optimized de-interleave function based on format */
             {
@@ -1267,6 +1277,11 @@ static int mr_alsa_audio_pcm_prepare(struct snd_pcm_substream *substream)
             chip->current_alsa_capture_stride = snd_pcm_format_physical_width(runtime->format) >> 3;
             chip->capture_buffer_pos = offset;
             chip->current_capture_interrupt_idx = 0;
+            /* W9 #14: per-PCM advisory capture latency. Advisory only — the real
+             * receive buffering is the per-sink link offset (capture_buffer_pos
+             * above), not this. Previously dead (get_capture_delay had no
+             * caller); now reported via runtime->delay for snd_pcm_delay(). */
+            runtime->delay = chip->capture_delay;
             chip->nb_capture_interrupts_per_period = ((runtime_dsd_mode != 0)? (MR_ALSA_PTP_FRAME_RATE_FOR_DSD / runtime->rate) : 1);
 
             /* Select optimized capture interleave function */
@@ -2882,6 +2897,27 @@ int mr_alsa_audio_add_pcm_to_card(int card_handle, int global_pcm_id,
     }
     dev_info(&g_device->dev, "mr_alsa_audio_add_pcm_to_card: card %d (%s) dev %d pcm_id %d rate %u\n",
              card_handle, mc->card->id, device_idx, global_pcm_id, sample_rate);
+    return 0;
+}
+
+/* W9 #14: store this chip's advisory ALSA latency. chip_ptr is the manager's
+ * m_apALSAChip[] slot (== struct mr_alsa_audio_chip*), resolved by the caller
+ * via get_chip_by_pcm_id(). Takes effect at the next prepare() (PCM open). */
+int mr_alsa_audio_set_playout_delay(void *chip_ptr, int32_t delay)
+{
+    struct mr_alsa_audio_chip *chip = chip_ptr;
+    if (!chip)
+        return -EINVAL;
+    chip->playout_delay = delay;
+    return 0;
+}
+
+int mr_alsa_audio_set_capture_delay(void *chip_ptr, int32_t delay)
+{
+    struct mr_alsa_audio_chip *chip = chip_ptr;
+    if (!chip)
+        return -EINVAL;
+    chip->capture_delay = delay;
     return 0;
 }
 

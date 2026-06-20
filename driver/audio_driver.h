@@ -107,8 +107,9 @@ struct alsa_ops
     int (*get_jitter_buffer_sample_bytelength)(void* ravenna_peer, char *byte_len); /// returns current Ravenna sample rate (actual PCM rate or actual DSD rate)
     int (*get_nb_inputs)(void* ravenna_peer, uint32_t *nb_channels);
     int (*get_nb_outputs)(void* ravenna_peer, uint32_t *nb_channels);
-    int (*get_playout_delay)(void* ravenna_peer, snd_pcm_sframes_t *delay_in_sample);
-    int (*get_capture_delay)(void* ravenna_peer, snd_pcm_sframes_t *delay_in_sample);
+    /* W9 #14: playout/capture delay is now a per-chip property (see
+     * mr_alsa_audio_set_{playout,capture}_delay), read directly at prepare();
+     * the former manager-callback round-trip (get_*_delay) is gone. */
     int (*set_jitter_buffer_depth)(void* ravenna_peer, uint32_t depth_in_frames); /// must not sleep (called under spinlock)
     int (*start_interrupts)(void* ravenna_peer, void *mr_alsa_audio_chip, bool is_playback); /// starts IO on the given chip
     int (*stop_interrupts)(void* ravenna_peer, void *mr_alsa_audio_chip, bool is_playback); /// stops IO on the given chip
@@ -152,6 +153,11 @@ extern int mr_alsa_audio_add_card(int card_handle, const char *id, uint8_t domai
 extern int mr_alsa_audio_add_pcm_to_card(int card_handle, int global_pcm_id, uint32_t sample_rate, const char *name);
 extern int mr_alsa_audio_register_card(int card_handle);
 extern int mr_alsa_audio_remove_card(int card_handle);
+/* W9 #14: set a chip's advisory ALSA latency (frames). chip_ptr is the
+ * manager's m_apALSAChip[] slot (== struct mr_alsa_audio_chip*). 0 / negative
+ * errno; takes effect at the next prepare(). */
+extern int mr_alsa_audio_set_playout_delay(void *chip_ptr, int32_t delay);
+extern int mr_alsa_audio_set_capture_delay(void *chip_ptr, int32_t delay);
 /* Tear down ALL cards (clean slate). Called at module unload and from the
  * manager's full Reset (MT_ALSA_Msg_Reset, pcm_id < 0) so a restarting daemon
  * redeclares onto an empty module. Safe no-op when no cards exist. */
