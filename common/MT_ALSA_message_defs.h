@@ -108,7 +108,10 @@ enum MT_ALSA_msg_id
      * down. Appended to preserve existing wire-protocol values. */
     MT_ALSA_Msg_AddCard,                  //    U2K Input: struct MT_ALSA_AddCard_args
     MT_ALSA_Msg_RegisterCard,             //    U2K Input: int32_t card_handle
-    MT_ALSA_Msg_RemoveCard                //    U2K Input: int32_t card_handle
+    MT_ALSA_Msg_RemoveCard,               //    U2K Input: int32_t card_handle
+    /* #22: per-PCM TIC-engine status (the media-clock lock). Appended to
+     * preserve wire-protocol values. */
+    MT_ALSA_Msg_GetPCMStatus              //    U2K Input: int32_t pcm_id, output: struct TPCMStatus
 };
 
 /*
@@ -139,6 +142,14 @@ struct MT_ALSA_AddCard_args
     int32_t  card_handle;   /* daemon-assigned card index [0, MR_ALSA_MAX_CARDS) */
     uint8_t  domain;
     char     id[MT_ALSA_PCM_NAME_MAXLEN];
+};
+
+/* #22: per-PCM clock status (output of MT_ALSA_Msg_GetPCMStatus) — the TIC
+ * engine's composite lock on the chip's active NIC: is this PCM's media clock
+ * actually tracking? (Jitter/scheduling metrics are a later addition.) */
+struct TPCMStatus
+{
+    int32_t nTICLockStatus;   /* EPTPLockStatus: 0 unlocked / 1 locking / 2 locked */
 };
 
 struct MT_ALSA_msg
