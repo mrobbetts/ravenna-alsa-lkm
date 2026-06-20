@@ -348,7 +348,10 @@ EDispatchResult process_PTP_packet(TClock_PTP* self, TUDPPacketBase* pUDPPacketB
                         memcpy(&self->m_PTPMaster_Announce, &pPTPV2MsgAnnouncePacket->V2MsgAnnounce, sizeof(TV2MsgAnnounce));
                         if (*(uint64_t*)pPTPV2MsgAnnouncePacket->V2MsgAnnounce.byGrandmasterClockIdentity != self->m_ui64PTPMaster_GMID)
                         {
-                            printk("[nic %u dom %u] Updating PTP Master GMID to %llu\n", self->m_pEth_netfilter->nic_id, self->m_PTPConfig.ui8Domain, *(uint64_t*)pPTPV2MsgAnnouncePacket->V2MsgAnnounce.byGrandmasterClockIdentity);
+                            {
+                                const uint8_t* g = pPTPV2MsgAnnouncePacket->V2MsgAnnounce.byGrandmasterClockIdentity;
+                                printk("[nic %u dom %u] Updating PTP Master GMID to %02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X\n", self->m_pEth_netfilter->nic_id, self->m_PTPConfig.ui8Domain, g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]);
+                            }
                         }
                         // save announce time
                         self->m_ui64PTPMaster_GMID = *(uint64_t*)pPTPV2MsgAnnouncePacket->V2MsgAnnounce.byGrandmasterClockIdentity;
@@ -688,7 +691,7 @@ void clock_ptp_periodic_checks(TClock_PTP* self, uint64_t ui64CurrentRTXClockTim
 		EPTPLockStatus s = (self->m_usPTPLockCounter == 0) ? PTPLS_LOCKED : PTPLS_UNLOCKED;
 		if (s != self->m_lastReportedPTPLock)
 		{
-			printk("PTP lock [nic %u dom %u] status changed from %d to %d\n", self->m_pEth_netfilter->nic_id, self->m_PTPConfig.ui8Domain, self->m_lastReportedPTPLock, s);
+			printk("PTP lock [nic %u dom %u] status changed from %s to %s\n", self->m_pEth_netfilter->nic_id, self->m_PTPConfig.ui8Domain, self->m_lastReportedPTPLock == PTPLS_LOCKED ? "locked" : "unlocked", s == PTPLS_LOCKED ? "locked" : "unlocked");
 			self->m_lastReportedPTPLock = s;
 		}
 	}
