@@ -233,7 +233,10 @@ void tic_engine_steer(TTicEngine* self, uint64_t ui64T1)
                 /* printk (not MTAL_DP): the old composite lock-status
                  * print made TIC transitions dmesg-visible; keep that
                  * operational signal, now with per-rate identity. */
-                printk("[nic %u dom %u] TIC locked (rate %u)\n", pServo->m_pEth_netfilter->nic_id, pServo->m_PTPConfig.ui8Domain, self->m_ui32SamplingRate);
+                {
+                    uint64_t period_us = self->m_dTIC_BasePeriod / 1000000ULL; /* [ps] -> [us] */
+                    printk("[nic %u dom %u] TIC locked (rate %u, period %llu.%03llu ms)\n", pServo->m_pEth_netfilter->nic_id, pServo->m_PTPConfig.ui8Domain, self->m_ui32SamplingRate, period_us / 1000, period_us % 1000);
+                }
             }
         }
         else if (abs(dPhaseAdj) > 1000000)
