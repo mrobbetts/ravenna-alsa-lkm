@@ -554,36 +554,15 @@ void UpdateFrameSize(struct TManager* self)
 
     MTAL_DP("CManager::UpdateFrameSize() new TIC Frame Size = %u\n", self->m_ui32FrameSize);
 
-    /*
-     * Multi-rate Stage 2: chip 0 follows manager-wide m_SampleRate (its
-     * historical relationship from the single-PCM era). Chips 1+ have
-     * their rate locked at AddPCM time and are not touched here.
-     *
-     * SetSamplingRate / SetDSDSamplingRate require IO stopped before
-     * calling them, so the per-chip publish here can't race the tick
-     * path. We still use the smp_store_release-paired set_pcm_sample_rate
-     * for consistency with the rest of the per-chip publish discipline.
-     */
+    /* W14: no chip-0 special case — every chip's rate is locked at AddPCM and
+     * never follows a manager-wide rate. Refresh EVERY active entry's frame
+     * size from its OWN tick rate, because m_TICFrameSizeAt1FS / m_MaxFrameSize
+     * (which parameterize all cadences) may be what changed here. Engines pick
+     * the new values up via tic_entry_start; callers guarantee IO is stopped.
+     * (A DSD entry keys on 352800, which compute_frame_size_for_rate maps to
+     * the same nFS=8 frame as the DSD bit rate.) */
     {
-        const struct ravenna_mgr_ops *frontend = smp_load_acquire(&self->m_alsa_driver_frontend);
-        void *chip0 = smp_load_acquire(&self->m_apALSAChip[0]);
-        if (frontend && chip0 && frontend->set_pcm_sample_rate)
-            frontend->set_pcm_sample_rate(chip0, self->m_SampleRate, self->m_ui32FrameSize);
-    }
-
-    /* W5: chip 0's registry entry follows the manager-wide rate (its
-     * historical relationship) — re-key it; then refresh EVERY active
-     * entry's frame size from its own tick rate, because
-     * m_TICFrameSizeAt1FS / m_MaxFrameSize may be what changed here and
-     * those parameterize all cadences. (A DSD entry keys on 352800,
-     * which compute_frame_size_for_rate maps to the same nFS=8 frame as
-     * the DSD bit rate.) Engines pick new values up via tic_entry_start
-     * on the start / rate-change paths; callers guarantee IO is stopped. */
-    {
-        struct tic_timer_entry* entry0 = smp_load_acquire(&self->m_apChipEntry[0]);
         unsigned int t;
-        if (entry0)
-            entry0->tick_rate = tick_rate_for_sample_rate(self->m_SampleRate);
         for (t = 0; t < MAX_TIC_ENTRIES; t++)
         {
             struct tic_timer_entry* entry = &self->m_TicTimers[t];
@@ -1824,39 +1803,17 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             else
             {
                 struct MT_ALSA_AddPCM_args* args = (struct MT_ALSA_AddPCM_args*)msg_rcv->data;
-                uint32_t effective_rate;
                 MTAL_DP_INFO("MT_ALSA_Msg_AddPCM pcm_id=%d rate=%u in=%u out=%u\n",
                              args->pcm_id, args->sample_rate,
                              args->num_inputs, args->num_outputs);
-                /*
-                 * Multi-rate Stage 2: per-PCM rates are now accepted. The
-                 * effective rate is args->sample_rate if non-zero (the
-                 * daemon explicitly requested this chip be at rate X), or
-                 * the manager-wide m_SampleRate otherwise (legacy
-                 * "inherit default" semantics, also used when daemon
-                 * doesn't yet populate DeviceGroup.sample_rate — Stage 2
-                 * task #6).
-                 *
-                 * Validate args->sample_rate against the supported PCM
-                 * rate set if it was specified. We do NOT validate
-                 * m_SampleRate as a fallback because DEFAULT_SAMPLERATE
-                 * is always valid by construction; and the daemon's own
-                 * SetSampleRate has already validated whatever was
-                 * configured.
-                 *
-                 * The tick scheduling (single hrtimer at manager rate)
-                 * still belongs to the manager-wide value in this
-                 * commit; Stage 2 task #4 splits it into one hrtimer per
-                 * unique rate. Until then chips at rates other than
-                 * m_SampleRate will receive ticks at the wrong cadence
-                 * and emit malformed RTP. We accept the AddPCM regardless
-                 * so the kernel-side relaxation is in place ahead of the
-                 * matching daemon-side change in task #6; the daemon
-                 * stays single-rate until task #4 lands.
-                 */
-                if (args->sample_rate != 0 && !is_valid_pcm_rate(args->sample_rate))
+                /* W14: every PCM carries its OWN rate, set here at AddPCM. There
+                 * is no manager-wide m_SampleRate to fall back to — a missing or
+                 * unsupported rate is a hard error (the daemon always sends an
+                 * explicit, validated rate). is_valid_pcm_rate(0) is false, so
+                 * this also rejects rate 0. */
+                if (!is_valid_pcm_rate(args->sample_rate))
                 {
-                    MTAL_DP_ERR("MT_ALSA_Msg_AddPCM rate %u not in supported PCM set\n",
+                    MTAL_DP_ERR("MT_ALSA_Msg_AddPCM rate %u invalid (a per-PCM rate is required)\n",
                                 args->sample_rate);
                     msg_reply.errCode = -EINVAL;
                 }
@@ -1866,8 +1823,7 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
                     /* W7: ensure the name is NUL-terminated before use —
                      * it crossed the netlink boundary as a fixed array. */
                     args->name[sizeof(args->name) - 1] = '\0';
-                    effective_rate = args->sample_rate ? args->sample_rate : self->m_SampleRate;
-                    err = mr_alsa_audio_add_pcm_to_card(args->card_handle, args->pcm_id, effective_rate, args->name);
+                    err = mr_alsa_audio_add_pcm_to_card(args->card_handle, args->pcm_id, args->sample_rate, args->name);
                     msg_reply.errCode = err;
                 }
             }
