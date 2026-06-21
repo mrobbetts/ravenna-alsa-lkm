@@ -139,6 +139,13 @@ struct TManager
     uint32_t m_NumberOfInputs;
     uint32_t m_NumberOfOutputs;
     uint64_t m_RingBufferFrameSize;
+    /* W14: NOT authoritative anymore. Every chip carries its own rate (set at
+     * AddPCM, stored per-chip); there is no chip-0 special path. This stays at
+     * DEFAULT_SAMPLERATE (never mutated at runtime — the daemon no longer sends
+     * SetSampleRate) purely as a benign rate-CLASS default for a few global
+     * readers (audio sample-format / RTP mute pattern / tone test) whose
+     * per-PCM refactor is deferred; those only distinguish PCM vs DSD, and all
+     * current chips are PCM. Retire fully when those go per-PCM (W14b). */
     uint32_t m_SampleRate;
     enum eAudioMode m_AudioMode;
 
