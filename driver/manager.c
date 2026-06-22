@@ -2253,6 +2253,20 @@ uint32_t get_tick_rate_for_pcm(void* user, uint32_t pcm_id)
     return entry->tick_rate;
 }
 
+/* W11 fix: the pcm's PTP domain (the other half of its (domain, rate) registry
+ * key), so the pump filter can match domain AND rate. Same entry resolution as
+ * get_tick_rate_for_pcm; 0 when the pcm resolves to no entry. */
+uint8_t get_domain_for_pcm(void* user, uint32_t pcm_id)
+{
+    struct TManager* self = (struct TManager*)user;
+    struct tic_timer_entry* entry = NULL;
+    if (pcm_id < MAX_PCMS)
+        entry = smp_load_acquire(&self->m_apChipEntry[pcm_id]);
+    if (!entry)
+        return 0;
+    return entry->domain;
+}
+
 //////////////////////////////////////////////////////////////////////////////////
 uint64_t get_global_time(void* user)
 {
@@ -2845,6 +2859,7 @@ void Init_C_Callbacks(struct TManager* self)
     self->m_c_callbacks.get_live_out_mute_pattern_for_pcm = &get_live_out_mute_pattern_for_pcm;
     /* W5 step 3: per-(domain, rate) pump filter. */
     self->m_c_callbacks.get_tick_rate_for_pcm = &get_tick_rate_for_pcm;
+    self->m_c_callbacks.get_domain_for_pcm = &get_domain_for_pcm;  /* W11 fix */
     //m_c_dispatch_callbacks.user = this;
     //m_c_dispatch_callbacks.DispatchPacket = &DispatchPacket;
     self->m_c_audio_streamer_clock_PTP_callback.user = self;
