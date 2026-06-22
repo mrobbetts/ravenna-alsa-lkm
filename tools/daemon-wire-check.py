@@ -162,17 +162,45 @@ def _iface_ip(iface):
     return None
 
 
+def _sdp_group_domain(sdp, out):
+    """Record {multicast group -> PTP domain} from one SDP. Domain comes from
+    a=clock-domain:PTPv2 N, or the trailing field of a=ts-refclk:ptp=...:N."""
+    group = None
+    domain = None
+    for line in sdp.splitlines():
+        line = line.strip()
+        if line.startswith("c=IN IP4"):
+            try:
+                group = line.split()[2].split("/")[0]
+            except IndexError:
+                pass
+        elif line.startswith("a=clock-domain:"):
+            tok = line.split()[-1]
+            if tok.isdigit():
+                domain = tok
+        elif domain is None and line.startswith("a=ts-refclk:ptp="):
+            tok = line.split(":")[-1].strip()
+            if tok.isdigit():
+                domain = tok
+    if group and domain is not None:
+        out[group] = domain
+
+
 def survey_capture(iface, mcast, duration):
-    """Capture ALL RTP audio multicast on iface for `duration` s. Returns
-    [(wall, seq, ts, ssrc, src, group, pt)]. No port filter — the RTP version
-    field skips non-RTP multicast (SAP/mDNS/PTP), so a device's stream is caught
-    whatever port it uses."""
+    """Capture ALL audio multicast on iface for `duration` s. Returns
+    (rtp_pkts, group_domain_map): rtp_pkts = [(wall, seq, ts, ssrc, src, group,
+    pt)]; the map is built from any SAP-announced SDPs caught in the SAME capture
+    (so the PTP domain is shown per stream with NO daemon). No port filter — the
+    RTP version field separates stream packets from SDP/SAP, so a device's stream
+    is caught whatever port it uses; a stream whose SDP wasn't announced during
+    the window shows domain '?' (use a longer --duration to catch the SAP)."""
     with tempfile.NamedTemporaryFile(suffix=".pcap", delete=True) as tf:
         subprocess.run(["timeout", str(duration), "tcpdump", "-ni", iface,
                         "-w", tf.name, "udp and dst net %s" % mcast],
                        capture_output=True)
         data = open(tf.name, "rb").read()
     pkts = []
+    domains = {}
     off = 24
     while off + 16 <= len(data):
         sec, usec, incl = struct.unpack("<III", data[off:off + 12])
@@ -180,20 +208,23 @@ def survey_capture(iface, mcast, duration):
         pkt = data[off:off + incl]
         off += incl
         eth = 18 if (len(pkt) >= 14 and pkt[12:14] == b"\x81\x00") else 14
-        rtp = eth + 20 + 8
-        if len(pkt) < rtp + 12:
+        base = eth + 20 + 8
+        if len(pkt) < base:
             continue
-        r = pkt[rtp:]
-        if (r[0] & 0xC0) != 0x80:   # not RTP v2 -> skip non-RTP multicast
-            continue
-        src = ".".join(str(b) for b in pkt[eth + 12:eth + 16])
-        group = ".".join(str(b) for b in pkt[eth + 16:eth + 20])
-        pt = r[1] & 0x7F
-        seq = struct.unpack(">H", r[2:4])[0]
-        ts = struct.unpack(">I", r[4:8])[0]
-        ssrc = struct.unpack(">I", r[8:12])[0]
-        pkts.append((sec + usec / 1e6, seq, ts, ssrc, src, group, pt))
-    return pkts
+        r = pkt[base:]
+        if len(r) >= 12 and (r[0] & 0xC0) == 0x80:    # RTP v2 -> a stream packet
+            src = ".".join(str(b) for b in pkt[eth + 12:eth + 16])
+            group = ".".join(str(b) for b in pkt[eth + 16:eth + 20])
+            pt = r[1] & 0x7F
+            seq = struct.unpack(">H", r[2:4])[0]
+            ts = struct.unpack(">I", r[4:8])[0]
+            ssrc = struct.unpack(">I", r[8:12])[0]
+            pkts.append((sec + usec / 1e6, seq, ts, ssrc, src, group, pt))
+        else:                                          # maybe a SAP-announced SDP
+            i = r.find(b"v=0")
+            if 0 <= i and b"m=" in r[i:i + 1200]:
+                _sdp_group_domain(r[i:].decode("ascii", "replace"), domains)
+    return pkts, domains
 
 
 def _unwrap_and_order(pkts):
@@ -332,18 +363,24 @@ def cmd_survey(iface, duration, mcast):
     local = _iface_ip(iface)
     print("survey: iface %s, this host = %s, %.1fs capture, multicast %s\n"
           % (iface, local or "?", duration, mcast))
-    pkts = survey_capture(iface, mcast, duration)
+    pkts, domains = survey_capture(iface, mcast, duration)
     streams = {}
     for p in pkts:
         streams.setdefault((p[5], p[4], p[3], p[6]), []).append(p)  # group, src, ssrc, pt
     if not streams:
         print("  no RTP multicast captured — wrong --iface, broaden --mcast, or check sudo")
         return 0
-    print("  %-13s %-5s %-15s %-10s %2s %6s %4s %8s %8s  %s" %
-          ("group", "from", "src", "ssrc", "pt", "pkt/s", "spp", "implied", "mediaclk", "verdict"))
-    for (group, src, ssrc, pt), v in sorted(streams.items()):
+    if not domains:
+        print("  (no SAP/SDP announcements seen in the window -> PTP domain unknown;"
+              " use a longer --duration to catch them)\n")
+    print("  %-3s %-13s %-5s %-15s %-10s %2s %6s %4s %8s %8s  %s" %
+          ("dom", "group", "from", "src", "ssrc", "pt", "pkt/s", "spp", "implied", "mediaclk", "verdict"))
+    # sort by (domain, group) so streams sharing a PTP domain sit together
+    for (group, src, ssrc, pt), v in sorted(
+            streams.items(), key=lambda kv: (domains.get(kv[0][0], "~"), kv[0][0])):
         if len(v) < 8:
             continue
+        dom = domains.get(group, "?")
         _, ordered = _unwrap_and_order(v)
         walls = [p[0] for p in ordered]
         tss = [p[2] for p in ordered]
@@ -370,8 +407,8 @@ def cmd_survey(iface, duration, mcast):
             verdict = "cadence %.0f != clock %.0f" % (implied, mclk)
         else:
             verdict = "clean ~%d Hz" % nearest
-        print("  %-13s %-5s %-15s %-10s %2d %6.0f %4d %8.0f %8.0f  %s" %
-              (group, "LOCAL" if (local and src == local) else "ext",
+        print("  %-3s %-13s %-5s %-15s %-10s %2d %6.0f %4d %8.0f %8.0f  %s" %
+              (dom, group, "LOCAL" if (local and src == local) else "ext",
                src, hex(ssrc), pt, pktrate, spp, implied, mclk, verdict))
     return 0
 

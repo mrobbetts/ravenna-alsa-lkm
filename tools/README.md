@@ -57,17 +57,21 @@ Exit code 0/1 = PASS/FAIL, one line per source. Read-only by default; auto-flags
 when a rate runs in >1 domain (the exact W11 over-send condition — the per-source
 check then confirms the pump filter keeps them separate, lkm 24e5bcc).
 
-`--survey --iface IFACE` needs no daemon: it captures EVERY RTP audio multicast
-on the wire (RTP-version-filtered, so SAP/mDNS are skipped — no port assumption),
-groups by (group, sender, SSRC), labels each LOCAL (this host) vs ext, and prints
-a per-stream verdict — packet rate, samples/packet, cadence-implied rate,
-media-clock rate, and one of: `clean ~N Hz`, `FREE-RUN ±X% off N Hz` (a smooth
-but off-rate clock, e.g. a GM freewheeling 2.5% slow), or `NON-MONOTONIC: K
-back-jumps` (backward timestamps). It's the "scan the whole fabric / compare our
-output vs another device's output" view — e.g. it cleanly shows a Digiface-RAV
-freewheeling its grandmaster −2.54% off 48k (its own output, our daemon not in
-the path) next to clean reference streams. `--mcast` overrides the captured
-range (default 239.0.0.0/8).
+`--survey --iface IFACE` needs no daemon: it captures EVERY audio multicast on
+the wire, groups by (group, sender, SSRC), labels each LOCAL (this host) vs ext,
+tags each with its PTP **domain**, and prints a per-stream verdict — packet rate,
+samples/packet, cadence-implied rate, media-clock rate, and one of: `clean ~N Hz`,
+`FREE-RUN ±X% off N Hz` (a smooth but off-rate clock, e.g. a GM freewheeling 2.5%
+slow), or `NON-MONOTONIC: K back-jumps` (backward timestamps). RTP packets are
+separated from SDP by the RTP version field (no port assumption); the **domain**
+is read from any SAP-announced SDP caught in the same window (`a=clock-domain` /
+`a=ts-refclk`), so it's still daemon-free — a stream whose SDP wasn't announced
+during the window shows `?` (use a longer `--duration` to catch the SAP). Output
+is sorted by domain, so streams sharing a clock sit together. It's the "scan the
+whole fabric / compare our output vs another device's" view — e.g. it cleanly
+shows a Digiface-RAV freewheeling its grandmaster −2.54% off 48k on domain 0 (its
+own output, our daemon not in the path) next to clean reference streams. `--mcast`
+overrides the captured range (default 239.0.0.0/8).
 
 `--exercise --yes` is DESTRUCTIVE: it snapshots the selected PCMs' rates, walks
 each through the full valid rate ladder (44100..384000; `--rates 48000,96000` to
