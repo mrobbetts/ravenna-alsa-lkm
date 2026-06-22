@@ -251,6 +251,13 @@ struct mr_alsa_audio_chip
      * in-place path snd_ctl_notify()s it on a live rate change. */
     struct snd_kcontrol *current_rate_control;
 
+    /* W15: in-place re-rate latch. 0 = normal; nonzero = ARMED for this target
+     * rate. While armed the chip keeps running at its live rate; close() applies
+     * the re-key (re-rate to pending_rate) once the chip goes idle. The PCM Rate
+     * kcontrol reports pending_rate (the target) while armed so a follower
+     * reopens at it. Written in netlink/process context only (never softirq). */
+    uint32_t pending_rate;
+
     /* W9 #14: per-PCM advisory ALSA latency (frames), latched into
      * runtime->delay at prepare() so snd_pcm_delay() reports this chip's own
      * latency. Set per-pcm_id via MT_ALSA_Msg_Set{Playout,Capture}Delay
@@ -1004,8 +1011,10 @@ static void mr_alsa_audio_set_pcm_sample_rate(void *mr_alsa_audio_chip, uint32_t
 {
     struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip *)mr_alsa_audio_chip;
     uint32_t dsd_mode;
+    uint32_t old_rate;
     if (!chip)
         return;
+    old_rate = mr_alsa_audio_get_pcm_sample_rate(chip);
     /* W6: refresh this chip's constraint lists alongside the rate
      * publish. A PCM-rate chip advertises exactly its configured rate
      * and its exact tick frame as the only period size; a DSD-rate chip
@@ -1040,6 +1049,16 @@ static void mr_alsa_audio_set_pcm_sample_rate(void *mr_alsa_audio_chip, uint32_t
      * see a torn (rate, frame_size) combination. */
     smp_store_release(&chip->pcm_rate_and_frame,
                       ((uint64_t)rate << 32) | (uint64_t)frame_size);
+
+    /* W15: this is the single rate-publish chokepoint (attach, re-key, legacy
+     * chip-0 path). If the live rate just reached a pending target, the latch
+     * is satisfied — disarm. And whenever the live rate actually changed, tell
+     * listeners of the PCM Rate control to re-read it (VOLATILE, no cache). */
+    if (chip->pending_rate == rate)
+        chip->pending_rate = 0;
+    if (chip->current_rate_control && old_rate != rate)
+        snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
+                       &chip->current_rate_control->id);
 }
 
 static uint32_t mr_alsa_audio_get_pcm_sample_rate(void *mr_alsa_audio_chip)
@@ -1085,7 +1104,11 @@ static int mr_alsa_audio_current_rate_get(struct snd_kcontrol *kcontrol,
     chip = snd_kcontrol_chip(kcontrol);
     if (chip == NULL)
         return -EINVAL;
-    ucontrol->value.integer.value[0] = mr_alsa_audio_get_pcm_sample_rate(chip);
+    /* W15: while armed for an in-place re-rate, report the TARGET so a follower
+     * reopens at the rate it's about to become; otherwise the live rate. */
+    ucontrol->value.integer.value[0] =
+        chip->pending_rate ? chip->pending_rate
+                           : mr_alsa_audio_get_pcm_sample_rate(chip);
     return 0;
 }
 
@@ -1096,6 +1119,35 @@ static struct snd_kcontrol_new mr_alsa_audio_ctrl_current_rate = {
     .info = mr_alsa_audio_current_rate_info,
     .get = mr_alsa_audio_current_rate_get,
 };
+
+/* W15: true when no substream is open, i.e. the chip is safe to re-key in place.
+ * The substream pointers are written under the chip spinlocks in open/close;
+ * an aligned pointer read here is atomic, and a stale read only costs the
+ * caller (the SetPCMRate handler) one extra retry. */
+static bool mr_alsa_audio_pcm_is_idle(void *mr_alsa_audio_chip)
+{
+    struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip *)mr_alsa_audio_chip;
+    if (!chip)
+        return true;
+    return chip->capture_substream == NULL && chip->playback_substream == NULL;
+}
+
+/* W15: latch a pending in-place re-rate on a busy chip (target 0 = disarm).
+ * Sets the PCM Rate kcontrol to the target + notifies so a follower closes and
+ * reopens at it; the actual re-key happens in pcm_close when the chip goes idle.
+ * Process/netlink context only. */
+static void mr_alsa_audio_arm_pcm_rate(void *mr_alsa_audio_chip, uint32_t target_rate)
+{
+    struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip *)mr_alsa_audio_chip;
+    if (!chip)
+        return;
+    if (chip->pending_rate == target_rate)
+        return;  /* no change — don't emit a spurious control event */
+    chip->pending_rate = target_rate;
+    if (chip->current_rate_control)
+        snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
+                       &chip->current_rate_control->id);
+}
 
 /* W11: a chip's PTP clock domain is its owning card's (set at add_card). Derived
  * on demand from chip->card via the g_cards lookup — no per-chip field needed. */
@@ -1125,7 +1177,9 @@ static struct ravenna_mgr_ops g_ravenna_manager_ops = {
     .set_pcm_sample_rate = mr_alsa_audio_set_pcm_sample_rate,
     .get_pcm_sample_rate = mr_alsa_audio_get_pcm_sample_rate,
     .get_pcm_frame_size = mr_alsa_audio_get_pcm_frame_size,
-    .get_pcm_domain = mr_alsa_audio_get_pcm_domain
+    .get_pcm_domain = mr_alsa_audio_get_pcm_domain,
+    .pcm_is_idle = mr_alsa_audio_pcm_is_idle,
+    .arm_pcm_rate = mr_alsa_audio_arm_pcm_rate
 };
 
 
@@ -2191,6 +2245,12 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
     //period_time_us_max = 1 + (minPTPFrameSize * 1000000) / 44100;
 
     printk(KERN_DEBUG "entering mr_alsa_audio_pcm_open (substream name=%s #%d) ...\n", substream->name, substream->number);
+    /* W15: barrier against a concurrent in-place re-key (from another
+     * substream's last close). Briefly takes+releases the manager's registry
+     * lock so this open reads a fully-applied (rate, constraints), never a
+     * half-swapped state. Cheap + uncontended in the common case. */
+    if (chip->mr_alsa_audio_ops && chip->mr_alsa_audio_ops->registry_barrier)
+        chip->mr_alsa_audio_ops->registry_barrier(chip->ravenna_peer);
     /* W6: this chip's OWN configured rate and tick frame govern the
      * open — the manager-wide rate is meaningless under per-PCM rates. */
     chip->current_rate = mr_alsa_audio_get_pcm_sample_rate(chip);
@@ -2432,6 +2492,28 @@ static int mr_alsa_audio_pcm_close(struct snd_pcm_substream *substream)
         chip->capture_pid = -1;
         chip->capture_substream = NULL;
         spin_unlock_irq(&chip->capture_lock);
+    }
+
+    /* W15: in-place re-rate latch. If this was the last close and the chip is
+     * armed for a pending rate, apply the re-key now — the chip is idle, so the
+     * (domain,rate) registry move is safe. set_pcm_rate runs in the manager
+     * under the registry lock and (via set_pcm_sample_rate) clears pending_rate
+     * + notifies the PCM Rate control. Done outside the chip spinlocks: the
+     * re-key may sleep (hrtimer_cancel of a freed old entry). A racing reopen is
+     * handled by registry_barrier in pcm_open. */
+    if (chip->pending_rate &&
+        chip->capture_substream == NULL && chip->playback_substream == NULL &&
+        chip->mr_alsa_audio_ops && chip->mr_alsa_audio_ops->set_pcm_rate)
+    {
+        uint32_t target = chip->pending_rate;
+        int err = chip->mr_alsa_audio_ops->set_pcm_rate(chip->ravenna_peer,
+                                                        chip->global_pcm_id, target);
+        if (err < 0)
+            printk(KERN_WARNING "mr_alsa_audio_pcm_close: pcm_id %d in-place re-rate to %u failed: %d\n",
+                   chip->global_pcm_id, target, err);
+        else
+            printk(KERN_INFO "mr_alsa_audio_pcm_close: pcm_id %d re-rated in place to %u on last close\n",
+                   chip->global_pcm_id, target);
     }
     return 0;
 }
@@ -2704,6 +2786,7 @@ static int mr_alsa_audio_create_alsa_devices(   struct snd_card *card,
     chip->playback_volume_control = NULL;
     chip->playback_switch_control = NULL;
     chip->current_rate_control = NULL;
+    chip->pending_rate = 0;
     chip->current_playback_volume = 0;
     chip->current_playback_switch = 1;
 

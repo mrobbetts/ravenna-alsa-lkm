@@ -78,6 +78,12 @@ struct ravenna_mgr_ops
     uint32_t (*get_pcm_sample_rate)(void *mr_alsa_audio_chip);
     uint32_t (*get_pcm_frame_size)(void *mr_alsa_audio_chip);
     uint8_t (*get_pcm_domain)(void *mr_alsa_audio_chip); /* W11: the chip's card's PTP domain */
+    /* W15 in-place re-rate. pcm_is_idle: true when no substream is open (safe to
+     * re-key). arm_pcm_rate: latch a pending target rate (0 = disarm) on a busy
+     * chip — sets the "PCM Rate" kcontrol to the target + notifies so a follower
+     * reopens at it; the actual re-key waits for the chip to go idle. */
+    bool (*pcm_is_idle)(void *mr_alsa_audio_chip);
+    void (*arm_pcm_rate)(void *mr_alsa_audio_chip, uint32_t target_rate);
 };
 
 /// Put functions to be called by ALSA driver (C ALSA to CPP Ravenna wrapper/owner object)
@@ -118,6 +124,13 @@ struct alsa_ops
     int (*notify_master_switch_change)(void* ravenna_peer, int direction, int32_t value); /// direction: 0 for playback, 1 for capture. value: 0 for mute, 1 for enable
     int (*get_master_volume_value)(void* ravenna_peer, int direction, int32_t* value); /// direction: 0 for playback, 1 for capture. value: from -99 to 0
     int (*get_master_switch_value)(void* ravenna_peer, int direction, int32_t* value); /// direction: 0 for playback, 1 for capture. value: 0 for mute, 1
+    /* W15 in-place re-rate. set_pcm_rate re-keys an IDLE chip's (domain,rate)
+     * timer entry to new_rate under the manager's registry lock (the in-place
+     * alternative to recreate-card); called from pcm_close when an armed chip
+     * goes idle. registry_barrier briefly takes+releases that lock so pcm_open
+     * cannot observe a half-applied re-key. */
+    int (*set_pcm_rate)(void* ravenna_peer, int32_t pcm_id, uint32_t new_rate);
+    void (*registry_barrier)(void* ravenna_peer);
 };
 
 /// Put ALSA driver functions which needs to be used by CPP code here:
