@@ -153,49 +153,76 @@ def _parse_pcap(data):
     return pkts
 
 
-def analyze(pkts, expect_rate, spp):
-    """Return (ok, metrics, failures[])."""
+def _unwrap_and_order(pkts):
+    """pkts are (wall, seq16, ts, ssrc, src) in CAPTURE order. Extend the 16-bit
+    sequence across wraps (a high->low drop > 32768 = a wrap), then order by the
+    extended sequence — wrap-safe AND tolerant of the occasional reorder. Sorting
+    raw 16-bit seq instead silently scrambles any stream long enough to wrap
+    (e.g. a 3000 pkt/s source in a 3 s capture)."""
+    ext = []
+    epoch = 0
+    prev = None
+    for p in pkts:
+        s = p[1]
+        if prev is not None and s < prev and (prev - s) > 32768:
+            epoch += 1 << 16
+        prev = s
+        ext.append((epoch + s, p))
+    ext.sort(key=lambda x: x[0])
+    return [e[0] for e in ext], [e[1] for e in ext]
+
+
+def analyze(pkts, expect_rate, spp, tol=0.005):
+    """Return (ok, metrics, failures[]). tol = fraction of off ts-steps tolerated
+    (rare wire reordering) before flagging."""
     fails = []
     m = {}
-    if len(pkts) < 4:
+    if len(pkts) < 8:
         return False, {"pkts": len(pkts)}, ["too few packets (%d) — source silent or wrong group/iface" % len(pkts)]
-    pkts.sort(key=lambda x: x[1])  # by seq
-    senders = {p[4] for p in pkts}
-    ssrcs = {p[3] for p in pkts}
-    dur = pkts[-1][0] - pkts[0][0]
-    m["pkts"] = len(pkts)
+    eseq, ordered = _unwrap_and_order(pkts)
+    senders = {p[4] for p in ordered}
+    ssrcs = {p[3] for p in ordered}
+    walls = [p[0] for p in ordered]
+    tss = [p[2] for p in ordered]
+    dur = max(walls) - min(walls)
+    m["pkts"] = len(ordered)
     m["senders"] = senders
     m["ssrcs"] = {hex(s) for s in ssrcs}
-    m["pktrate"] = len(pkts) / dur if dur > 0 else 0
+    m["pktrate"] = len(ordered) / dur if dur > 0 else 0
     steps = {}
-    seqgaps = 0
-    for i in range(len(pkts) - 1):
-        if ((pkts[i + 1][1] - pkts[i][1]) & 0xFFFF) != 1:
-            seqgaps += 1
-        st = (pkts[i + 1][2] - pkts[i][2]) & 0xFFFFFFFF
+    seqgaps = sum(1 for i in range(len(eseq) - 1) if eseq[i + 1] - eseq[i] != 1)
+    for i in range(len(ordered) - 1):
+        st = (tss[i + 1] - tss[i]) & 0xFFFFFFFF
         steps[st] = steps.get(st, 0) + 1
     m["ts_steps"] = steps
     m["seqgaps"] = seqgaps
-    span = (pkts[-1][2] - pkts[0][2]) & 0xFFFFFFFF
-    m["mediaclock"] = span / dur if dur > 0 else 0
+    m["mediaclock"] = ((max(tss) - min(tss)) & 0xFFFFFFFF) / dur if dur > 0 else 0
+    total = sum(steps.values())
+    offsteps = total - steps.get(spp, 0) if spp else total
 
     if len(senders) != 1:
         fails.append("%d senders (expect 1): %s" % (len(senders), senders))
     if len(ssrcs) != 1:
         fails.append("%d SSRCs (expect 1) — collision/leak: %s" % (len(ssrcs), m["ssrcs"]))
-    if seqgaps:
-        fails.append("%d sequence gaps (expect 0)" % seqgaps)
-    if spp and set(steps) != {spp}:
-        fails.append("ts step %s (expect constant %d) — over-send / bad media clock"
-                     % (sorted(steps), spp))
+    if seqgaps > max(1, total * tol):
+        fails.append("%d sequence gaps (expect ~0)" % seqgaps)
+    if spp and offsteps > total * tol:
+        fails.append("ts step not constant %d: %d/%d off (%s) — over-send / bad media clock"
+                     % (spp, offsteps, total, _top(steps)))
     if expect_rate:
         nominal = expect_rate / spp if spp else 0
         if nominal and abs(m["pktrate"] - nominal) / nominal > 0.05:
-            fails.append("pktrate %.0f/s (expect ~%.0f/s = %dx)"
-                         % (m["pktrate"], nominal, round(m["pktrate"] / nominal) if nominal else 0))
+            fails.append("pktrate %.0f/s (expect ~%.0f/s = %.1fx)"
+                         % (m["pktrate"], nominal, m["pktrate"] / nominal if nominal else 0))
         if abs(m["mediaclock"] - expect_rate) / expect_rate > 0.01:
             fails.append("media clock %.0f Hz (expect ~%d)" % (m["mediaclock"], expect_rate))
     return (not fails), m, fails
+
+
+def _top(steps, n=4):
+    """Top n ts-steps by count, as a compact 'step:count' string."""
+    return ", ".join("%d:%d" % (s, c) for s, c in
+                     sorted(steps.items(), key=lambda kv: -kv[1])[:n])
 
 
 # --------------------------------------------------------------------- checks ---
@@ -214,10 +241,10 @@ def check_sources(base, iface, duration, sources):
         pkts = capture(ifc, s["group"], s["port"], duration)
         ok, m, fails = analyze(pkts, s["rate"], s["spp"])
         tag = "OK  " if ok else "FAIL"
-        print("  [%s] source %s  dom=%s  %s:%d  %s Hz x%s spp%s  ->  %.0f pkt/s, mclk %.0f, steps %s"
+        print("  [%s] source %s  dom=%s  %s:%d  %s Hz x%s spp%s  ->  %.0f pkt/s, mclk %.0f, steps {%s}"
               % (tag, s["name"], s["domain"], s["group"], s["port"], s["rate"],
                  s["channels"], s["spp"], m.get("pktrate", 0), m.get("mediaclock", 0),
-                 sorted(m.get("ts_steps", {}))))
+                 _top(m.get("ts_steps", {}))))
         for f in fails:
             print("         - " + f)
         allok = allok and ok
