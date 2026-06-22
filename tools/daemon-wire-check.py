@@ -219,9 +219,15 @@ def analyze(pkts, expect_rate, spp, tol=0.005):
     return (not fails), m, fails
 
 
+def _signed(s):
+    """Render a 32-bit ts-step as signed, so a backward step reads -608 not
+    4294966688."""
+    return s - (1 << 32) if s >= (1 << 31) else s
+
+
 def _top(steps, n=4):
-    """Top n ts-steps by count, as a compact 'step:count' string."""
-    return ", ".join("%d:%d" % (s, c) for s, c in
+    """Top n ts-steps by count, as a compact 'step:count' string (signed)."""
+    return ", ".join("%d:%d" % (_signed(s), c) for s, c in
                      sorted(steps.items(), key=lambda kv: -kv[1])[:n])
 
 
