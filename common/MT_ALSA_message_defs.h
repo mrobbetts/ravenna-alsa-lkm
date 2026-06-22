@@ -111,7 +111,14 @@ enum MT_ALSA_msg_id
     MT_ALSA_Msg_RemoveCard,               //    U2K Input: int32_t card_handle
     /* #22: per-PCM TIC-engine status (the media-clock lock). Appended to
      * preserve wire-protocol values. */
-    MT_ALSA_Msg_GetPCMStatus              //    U2K Input: int32_t pcm_id, output: struct TPCMStatus
+    MT_ALSA_Msg_GetPCMStatus,             //    U2K Input: int32_t pcm_id, output: struct TPCMStatus
+    /* W15: in-place per-PCM re-rate (the alternative to recreate-card). Inputs:
+     * int32_t pcm_id, uint32_t sample_rate. If the chip is idle the kernel
+     * re-keys it to the new rate immediately; if a client holds it open the
+     * kernel ARMS the chip (advertises the target on the "PCM Rate" kcontrol +
+     * notifies) and returns -EBUSY, applying the re-rate when the chip next goes
+     * idle (last close). Appended to preserve wire-protocol values. */
+    MT_ALSA_Msg_SetPCMRate                //    U2K Inputs: int32_t pcm_id, uint32_t sample_rate
 };
 
 /*

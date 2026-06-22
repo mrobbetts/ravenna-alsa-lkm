@@ -126,6 +126,19 @@ static int cosbuf[48] = {
 #endif // MT_TONE_TEST
 
 //////////////////////////////////////////////////////////////////////////////////
+/* W15: writers-only registry lock. Serializes the (domain,rate) table mutators
+ * — get_or_create_tic_entry / put_tic_entry and the chip->entry pointer swap —
+ * against each other. Until W15 those ran on the netlink thread alone (serialized
+ * for free); the in-place re-rate adds a SECOND mutator context (pcm_close, the
+ * app's thread), so they now need an explicit lock. The softirq tick is a pure
+ * reader (smp_load_acquire on entry->active + m_apChipEntry) and NEVER takes
+ * this lock — readers stay wait-free. Deadlock rule: a holder must never block
+ * on a PCM open/close while holding it (notably: teardown_card detaches every
+ * chip — under this lock, via detach_alsa_driver — and only THEN calls
+ * snd_card_free, which waits for closes; the lock is not held across that). */
+static DEFINE_MUTEX(g_registry_lock);
+
+//////////////////////////////////////////////////////////////////////////////////
 /* W5 registry helpers (definitions follow Set* functions, which use them) */
 static uint32_t tick_rate_for_sample_rate(uint32_t sample_rate);
 static void tic_entry_refresh_base_period(struct tic_timer_entry* entry);
@@ -276,6 +289,9 @@ void destroy(struct TManager* self)
      * cancelled before the servos are destroyed. */
     {
         unsigned int t;
+        /* W15: hold the registry lock for the put_tic_entry invariant (module
+         * unload, uncontended — no opens possible here). */
+        mutex_lock(&g_registry_lock);
         for (t = 0; t < MAX_TIC_ENTRIES; t++)
         {
             struct tic_timer_entry* entry = &self->m_TicTimers[t];
@@ -284,6 +300,7 @@ void destroy(struct TManager* self)
             entry->chip_refcount = 1;
             put_tic_entry(self, entry);
         }
+        mutex_unlock(&g_registry_lock);
     }
     for (i = 0; i < _MAX_NICS; i++)
     {
@@ -1008,6 +1025,72 @@ static void put_tic_entry(struct TManager* self, struct tic_timer_entry* entry)
     smp_store_release(&entry->active, false);
 }
 
+/* W15: re-key an IDLE chip's (domain,rate) timer entry to new_rate in place —
+ * the in-place alternative to recreate-card. Move the chip from its current
+ * entry to the (domain, new_rate) entry (creating it if first, freeing the old
+ * if last), republishing the chip's (rate, frame_size). Bound into alsa_ops as
+ * set_pcm_rate and called from pcm_close when an armed chip goes idle (and from
+ * the SetPCMRate handler when the chip is already idle). `user` is the manager
+ * (== ravenna_peer, as for detach_alsa_driver). */
+static int manager_set_pcm_rate(void* user, int32_t pcm_id, uint32_t new_rate)
+{
+    struct TManager* self = (struct TManager*)user;
+    struct tic_timer_entry *old_entry, *new_entry;
+    void* chip;
+    uint8_t domain;
+    uint32_t fsize;
+    int ret = 0;
+    if (!self || pcm_id < 0 || pcm_id >= MAX_PCMS)
+        return -EINVAL;
+
+    mutex_lock(&g_registry_lock);
+    chip      = smp_load_acquire(&self->m_apALSAChip[pcm_id]);
+    old_entry = smp_load_acquire(&self->m_apChipEntry[pcm_id]);
+    if (!chip || !old_entry)
+    {
+        /* chip detached underneath us (e.g. card teardown raced the close) —
+         * nothing to re-rate. */
+        ret = -ENODEV;
+        goto out;
+    }
+    /* keep the chip on its own PTP domain; only the rate changes. */
+    domain = old_entry->domain;
+    new_entry = get_or_create_tic_entry(self, domain, new_rate);
+    if (!new_entry)
+    {
+        MTAL_DP_ERR("manager_set_pcm_rate: pcm_id %d no (domain %u, rate %u) entry\n",
+                    pcm_id, domain, new_rate);
+        ret = -EINVAL;
+        goto out;
+    }
+    /* publish the chip's new (rate, frame_size) — this also disarms the latch
+     * (pending_rate == new_rate) and notifies the PCM Rate control. */
+    fsize = compute_frame_size_for_rate(new_rate, self->m_TICFrameSizeAt1FS, self->m_MaxFrameSize);
+    if (self->m_alsa_driver_frontend && self->m_alsa_driver_frontend->set_pcm_sample_rate)
+        self->m_alsa_driver_frontend->set_pcm_sample_rate(chip, new_rate, fsize);
+    /* swap the chip's entry pointer, then drop the old entry's ref (frees +
+     * stops it if this was its last chip). For a same-tick-rate re-rate (DSD
+     * family) new_entry == old_entry: get_or_create bumped the refcount and this
+     * put restores it — net no-op, chip rate still updated. */
+    smp_store_release(&self->m_apChipEntry[pcm_id], new_entry);
+    put_tic_entry(self, old_entry);
+    MTAL_DP_INFO("manager_set_pcm_rate: pcm_id %d re-rated in place to %u (domain %u)\n",
+                 pcm_id, new_rate, domain);
+out:
+    mutex_unlock(&g_registry_lock);
+    return ret;
+}
+
+/* W15: pcm_open barrier — take+release the registry lock so an open cannot run
+ * concurrently with (and observe a half-applied) re-key from another
+ * substream's last close. */
+static void manager_registry_barrier(void* user)
+{
+    (void)user;
+    mutex_lock(&g_registry_lock);
+    mutex_unlock(&g_registry_lock);
+}
+
 /* Per-entry NIC selection — today's preference rule (priority-preferred
  * NIC 0, else NIC 1, else default 0) with per-entry eligibility:
  * eligible = servo PTP-locked AND this entry's engine on that NIC
@@ -1725,6 +1808,60 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             msg_reply.data = &pcmStatus;
             CW_netlink_send_reply_to_user_land(&msg_reply);
             return;
+        }
+        case MT_ALSA_Msg_SetPCMRate:
+        {
+            /* W15: in-place per-PCM re-rate. Payload {int32_t pcm_id, uint32_t
+             * sample_rate}. Idle chip -> re-key now; busy chip -> ARM (the PCM
+             * Rate kcontrol advertises the target + notifies) and return -EBUSY
+             * so the daemon retries once the client has released the device. */
+            if (msg_rcv->dataSize != (int)(sizeof(int32_t) * 2))
+            {
+                MTAL_DP_ERR("MT_ALSA_Msg_SetPCMRate invalid data size (got %d, expected %zu)\n",
+                            msg_rcv->dataSize, sizeof(int32_t) * 2);
+                msg_reply.errCode = -315;
+            }
+            else
+            {
+                int32_t  pcm_id   = *(int32_t*)msg_rcv->data;
+                uint32_t new_rate = *(uint32_t*)((char*)msg_rcv->data + sizeof(int32_t));
+                const struct ravenna_mgr_ops* fe = self->m_alsa_driver_frontend;
+                void* chip = (pcm_id >= 0 && pcm_id < MAX_PCMS)
+                                 ? get_chip_by_pcm_id(self, pcm_id) : NULL;
+                if (!chip || !fe)
+                {
+                    MTAL_DP_ERR("MT_ALSA_Msg_SetPCMRate: no chip for pcm_id %d\n", pcm_id);
+                    msg_reply.errCode = -ENODEV;
+                }
+                else if (!is_valid_pcm_rate(new_rate))
+                {
+                    MTAL_DP_ERR("MT_ALSA_Msg_SetPCMRate: pcm_id %d invalid rate %u\n",
+                                pcm_id, new_rate);
+                    msg_reply.errCode = -EINVAL;
+                }
+                else if (fe->get_pcm_sample_rate && fe->get_pcm_sample_rate(chip) == new_rate)
+                {
+                    /* already at the target — clear any stale arm, success. */
+                    if (fe->arm_pcm_rate)
+                        fe->arm_pcm_rate(chip, 0);
+                    msg_reply.errCode = 0;
+                }
+                else if (fe->pcm_is_idle && fe->pcm_is_idle(chip))
+                {
+                    msg_reply.errCode = manager_set_pcm_rate(self, pcm_id, new_rate);
+                    MTAL_DP_INFO("MT_ALSA_Msg_SetPCMRate pcm_id=%d -> %u (idle, applied err=%d)\n",
+                                 pcm_id, new_rate, msg_reply.errCode);
+                }
+                else
+                {
+                    if (fe->arm_pcm_rate)
+                        fe->arm_pcm_rate(chip, new_rate);
+                    msg_reply.errCode = -EBUSY;
+                    MTAL_DP_INFO("MT_ALSA_Msg_SetPCMRate pcm_id=%d -> %u (busy, armed; daemon should retry)\n",
+                                 pcm_id, new_rate);
+                }
+            }
+            break;
         }
         case MT_ALSA_Msg_SetMasterOutputVolume:
             if (msg_rcv->dataSize != sizeof(int32_t))
@@ -2810,21 +2947,27 @@ int attach_alsa_driver(void* user, const struct ravenna_mgr_ops *ops, void *alsa
                     pcm_id, chip_domain, MAX_DOMAINS);
             chip_domain = 0;
         }
+        /* W15: registry lock — serialize the entry get-or-create + the
+         * chip->entry + chip-slot publishes against an in-place re-key from
+         * pcm_close (the only other table mutator context). */
+        mutex_lock(&g_registry_lock);
         entry = get_or_create_tic_entry(self, chip_domain, effective_rate);
         if (!entry)
         {
+            mutex_unlock(&g_registry_lock);
             MTAL_DP("attach_alsa_driver: pcm_id %d: no (domain, rate) timer entry for rate %u\n",
                     pcm_id, effective_rate);
             return -EINVAL;
         }
         smp_store_release(&self->m_apChipEntry[pcm_id], entry);
+        /* Publish the slot with release semantics so the hrtimer reader sees
+         * the chip pointer only after the chip itself is fully constructed. */
+        smp_store_release(&self->m_apALSAChip[pcm_id], alsa_chip_pointer);
+        new_count = (uint32_t)pcm_id + 1;
+        if (new_count > self->m_uPCMCount)
+            smp_store_release(&self->m_uPCMCount, new_count);
+        mutex_unlock(&g_registry_lock);
     }
-    /* Publish the slot with release semantics so the hrtimer reader sees
-     * the chip pointer only after the chip itself is fully constructed. */
-    smp_store_release(&self->m_apALSAChip[pcm_id], alsa_chip_pointer);
-    new_count = (uint32_t)pcm_id + 1;
-    if (new_count > self->m_uPCMCount)
-        smp_store_release(&self->m_uPCMCount, new_count);
     return 0;
 }
 
@@ -2834,6 +2977,12 @@ void detach_alsa_driver(void* user, void *alsa_chip_pointer)
     uint32_t i;
     if (!self || !alsa_chip_pointer)
         return;
+    /* W15: registry lock — serialize the slot/entry clear + put against an
+     * in-place re-key (pcm_close). Held only around the table mutation; the
+     * caller (teardown_card) runs detach for every chip and THEN calls
+     * snd_card_free without this lock, so the lock is never held across a
+     * close-wait (no deadlock). */
+    mutex_lock(&g_registry_lock);
     for (i = 0; i < self->m_uPCMCount; ++i)
     {
         if (self->m_apALSAChip[i] != alsa_chip_pointer)
@@ -2852,8 +3001,10 @@ void detach_alsa_driver(void* user, void *alsa_chip_pointer)
             smp_store_release(&self->m_apChipEntry[i], NULL);
             put_tic_entry(self, entry);
         }
+        mutex_unlock(&g_registry_lock);
         return;
     }
+    mutex_unlock(&g_registry_lock);
 }
 
 void* get_chip_by_pcm_id(struct TManager* self, int32_t pcm_id)
@@ -3216,5 +3367,7 @@ void init_alsa_callbacks(struct TManager* self)
     self->m_alsa_callbacks.notify_master_switch_change = &notify_master_switch_change;
     self->m_alsa_callbacks.get_master_volume_value = &get_master_volume_value;
     self->m_alsa_callbacks.get_master_switch_value = &get_master_switch_value;
+    self->m_alsa_callbacks.set_pcm_rate = &manager_set_pcm_rate;       /* W15 in-place re-rate */
+    self->m_alsa_callbacks.registry_barrier = &manager_registry_barrier; /* W15 open barrier */
 
 }
