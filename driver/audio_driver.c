@@ -244,6 +244,13 @@ struct mr_alsa_audio_chip
     int32_t current_playback_volume; /// cached value for volume control
     int32_t current_playback_switch; /// cached value for switch control
 
+    /* W15: per-PCM read-only "current rate" control (Hz). Unlike the card-level
+     * master volume/switch above (device-0-only, NADAC model), this is genuinely
+     * per-PCM (scoped via id.device). It lets an ALSA capture client read the
+     * chip's active rate and re-open at it after an in-place re-rate; the
+     * in-place path snd_ctl_notify()s it on a live rate change. */
+    struct snd_kcontrol *current_rate_control;
+
     /* W9 #14: per-PCM advisory ALSA latency (frames), latched into
      * runtime->delay at prepare() so snd_pcm_delay() reports this chip's own
      * latency. Set per-pcm_id via MT_ALSA_Msg_Set{Playout,Capture}Delay
@@ -1050,6 +1057,45 @@ static uint32_t mr_alsa_audio_get_pcm_frame_size(void *mr_alsa_audio_chip)
         return 0;
     return (uint32_t)(smp_load_acquire(&chip->pcm_rate_and_frame) & 0xFFFFFFFFu);
 }
+
+/* W15: per-PCM read-only "current rate" control. Reports this chip's active
+ * sample rate (Hz) so an ALSA capture client (CamillaDSP, or a small follow
+ * supervisor) can read the rate and re-open at it after an in-place re-rate.
+ * VOLATILE: the value changes underneath userspace on a re-rate without a .put,
+ * so ALSA must not cache it. Registered per-PCM with iface PCM + id.device set
+ * to the per-card device index, so cards holding several PCMs don't collide. */
+static int mr_alsa_audio_current_rate_info(struct snd_kcontrol *kcontrol,
+                                           struct snd_ctl_elem_info *uinfo)
+{
+    if (uinfo == NULL)
+        return -EINVAL;
+    uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+    uinfo->count = 1;
+    uinfo->value.integer.min = 0;
+    uinfo->value.integer.max = 768000; /* headroom over the max supported rate */
+    return 0;
+}
+
+static int mr_alsa_audio_current_rate_get(struct snd_kcontrol *kcontrol,
+                                          struct snd_ctl_elem_value *ucontrol)
+{
+    struct mr_alsa_audio_chip *chip = NULL;
+    if (kcontrol == NULL || ucontrol == NULL)
+        return -EINVAL;
+    chip = snd_kcontrol_chip(kcontrol);
+    if (chip == NULL)
+        return -EINVAL;
+    ucontrol->value.integer.value[0] = mr_alsa_audio_get_pcm_sample_rate(chip);
+    return 0;
+}
+
+static struct snd_kcontrol_new mr_alsa_audio_ctrl_current_rate = {
+    .name = "PCM Rate",
+    .iface = SNDRV_CTL_ELEM_IFACE_PCM,
+    .access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+    .info = mr_alsa_audio_current_rate_info,
+    .get = mr_alsa_audio_current_rate_get,
+};
 
 /* W11: a chip's PTP clock domain is its owning card's (set at add_card). Derived
  * on demand from chip->card via the g_cards lookup — no per-chip field needed. */
@@ -2657,6 +2703,7 @@ static int mr_alsa_audio_create_alsa_devices(   struct snd_card *card,
 
     chip->playback_volume_control = NULL;
     chip->playback_switch_control = NULL;
+    chip->current_rate_control = NULL;
     chip->current_playback_volume = 0;
     chip->current_playback_switch = 1;
 
@@ -2671,6 +2718,19 @@ static int mr_alsa_audio_create_alsa_devices(   struct snd_card *card,
         if (err < 0)
             return err;
     }
+
+    /* W15: a per-PCM read-only current-rate control on EVERY chip (unlike the
+     * card-level master volume/switch above). Scoped per-PCM via id.device so
+     * PCMs sharing a card don't collide. The chip's rate is already published
+     * (add_pcm_to_card stashes it before chip_create), so the first read is
+     * correct. */
+    chip->current_rate_control = snd_ctl_new1(&mr_alsa_audio_ctrl_current_rate, chip);
+    if (chip->current_rate_control == NULL)
+        return -ENOMEM;
+    chip->current_rate_control->id.device = device_idx;
+    err = snd_ctl_add(card, chip->current_rate_control);
+    if (err < 0)
+        return err;
 
     /// sets callbacks for Ravenna Manager
     if(chip->ravenna_peer && chip->mr_alsa_audio_ops)
