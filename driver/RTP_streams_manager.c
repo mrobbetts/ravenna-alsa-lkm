@@ -1168,11 +1168,19 @@ EDispatchResult process_UDP_packet(TRTP_streams_manager* self, unsigned char byN
  * step earlier. */
 static bool stream_on_tick(TRTP_streams_manager* self, TRTP_audio_stream* pRTPAudioStream, uint8_t ui8Domain, uint32_t ui32TickRate)
 {
-	(void)ui8Domain; /* single PTP domain until W11 (entries never share a tick_rate across domains today) */
+	uint32_t pcm_id;
 	if (!self->m_pManager || !self->m_pManager->get_tick_rate_for_pcm)
 		return true;
-	return self->m_pManager->get_tick_rate_for_pcm(self->m_pManager->user,
-		pRTPAudioStream->m_tRTPStream.m_RTP_stream_info.m_uiPCMId) == ui32TickRate;
+	pcm_id = pRTPAudioStream->m_tRTPStream.m_RTP_stream_info.m_uiPCMId;
+	/* W11 fix: a stream belongs to exactly ONE (domain, rate) entry and must be
+	 * pumped only by that entry's tick. Matching the tick RATE alone (the
+	 * original single-domain shortcut) made two domains running the same rate
+	 * each pump the other's streams — an N x over-send with garbled per-packet
+	 * timestamps (N = number of same-rate domains). Match the DOMAIN too. */
+	if (self->m_pManager->get_domain_for_pcm &&
+	    self->m_pManager->get_domain_for_pcm(self->m_pManager->user, pcm_id) != ui8Domain)
+		return false;
+	return self->m_pManager->get_tick_rate_for_pcm(self->m_pManager->user, pcm_id) == ui32TickRate;
 }
 
 //////////////////////////////////////////////////////////////

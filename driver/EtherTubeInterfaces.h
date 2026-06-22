@@ -133,6 +133,12 @@ typedef struct
 	 * family, applied one step earlier). Consumed by the streams
 	 * manager's per-(domain, rate) pump filter. */
 	uint32_t (*get_tick_rate_for_pcm)(void* self, uint32_t pcm_id);
+	/* W11 fix: the pcm's PTP domain (its (domain, rate) registry key's
+	 * domain half). The per-(domain, rate) pump filter must match BOTH this
+	 * and the tick rate — otherwise two domains running the same rate each
+	 * pump the other's streams (N x over-send). 0 when the pcm resolves to no
+	 * entry (paired with get_tick_rate_for_pcm == 0). */
+	uint8_t (*get_domain_for_pcm)(void* self, uint32_t pcm_id);
 } rtp_audio_stream_ops;
 
 /// Put functions to be called by PTP ato Manager

@@ -313,6 +313,8 @@ unsigned char get_live_out_mute_pattern(void* user, uint32_t /*ulChannelId*/);
 uint64_t get_global_SAC_for_pcm(void* user, uint32_t pcm_id);
 /* W5 step 3: tick-rate (registry-key) resolution for the pump filter. */
 uint32_t get_tick_rate_for_pcm(void* user, uint32_t pcm_id);
+/* W11 fix: domain (other registry-key half) for the pump filter. */
+uint8_t get_domain_for_pcm(void* user, uint32_t pcm_id);
 uint32_t get_frame_size_for_pcm(void* user, uint32_t pcm_id);
 uint32_t get_live_in_jitter_buffer_length_for_pcm(void* user, uint32_t pcm_id);
 uint32_t get_live_out_jitter_buffer_length_for_pcm(void* user, uint32_t pcm_id);
