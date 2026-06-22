@@ -153,6 +153,49 @@ def _parse_pcap(data):
     return pkts
 
 
+def _iface_ip(iface):
+    out = subprocess.run(["ip", "-o", "-4", "addr", "show", "dev", iface],
+                         capture_output=True, text=True).stdout
+    for tok in out.split():
+        if "/" in tok and tok.count(".") == 3:
+            return tok.split("/")[0]
+    return None
+
+
+def survey_capture(iface, mcast, duration):
+    """Capture ALL RTP audio multicast on iface for `duration` s. Returns
+    [(wall, seq, ts, ssrc, src, group, pt)]. No port filter — the RTP version
+    field skips non-RTP multicast (SAP/mDNS/PTP), so a device's stream is caught
+    whatever port it uses."""
+    with tempfile.NamedTemporaryFile(suffix=".pcap", delete=True) as tf:
+        subprocess.run(["timeout", str(duration), "tcpdump", "-ni", iface,
+                        "-w", tf.name, "udp and dst net %s" % mcast],
+                       capture_output=True)
+        data = open(tf.name, "rb").read()
+    pkts = []
+    off = 24
+    while off + 16 <= len(data):
+        sec, usec, incl = struct.unpack("<III", data[off:off + 12])
+        off += 16
+        pkt = data[off:off + incl]
+        off += incl
+        eth = 18 if (len(pkt) >= 14 and pkt[12:14] == b"\x81\x00") else 14
+        rtp = eth + 20 + 8
+        if len(pkt) < rtp + 12:
+            continue
+        r = pkt[rtp:]
+        if (r[0] & 0xC0) != 0x80:   # not RTP v2 -> skip non-RTP multicast
+            continue
+        src = ".".join(str(b) for b in pkt[eth + 12:eth + 16])
+        group = ".".join(str(b) for b in pkt[eth + 16:eth + 20])
+        pt = r[1] & 0x7F
+        seq = struct.unpack(">H", r[2:4])[0]
+        ts = struct.unpack(">I", r[4:8])[0]
+        ssrc = struct.unpack(">I", r[8:12])[0]
+        pkts.append((sec + usec / 1e6, seq, ts, ssrc, src, group, pt))
+    return pkts
+
+
 def _unwrap_and_order(pkts):
     """pkts are (wall, seq16, ts, ssrc, src) in CAPTURE order. Extend the 16-bit
     sequence across wraps (a high->low drop > 32768 = a wrap), then order by the
@@ -275,6 +318,64 @@ def cmd_check(base, iface, duration):
     return 0 if ok else 1
 
 
+# -------------------------------------------------------------------- survey ---
+def cmd_survey(iface, duration, mcast):
+    """Capture EVERY RTP audio multicast on the wire (no daemon needed) and
+    characterize each stream: local (this host) vs external sender, packet rate,
+    samples-per-packet, cadence-implied rate, media-clock rate, and a verdict.
+    Distinguishes a clean stream from a free-running-off-rate one (e.g. a GM
+    freewheeling 2.5% slow) and a non-monotonic one (backward timestamps) — i.e.
+    produces an attachable evidence table for exactly the dirty-GM case."""
+    if not iface:
+        print("survey needs --iface (the AES67 capture interface), e.g. --iface vl_audio")
+        return 2
+    local = _iface_ip(iface)
+    print("survey: iface %s, this host = %s, %.1fs capture, multicast %s\n"
+          % (iface, local or "?", duration, mcast))
+    pkts = survey_capture(iface, mcast, duration)
+    streams = {}
+    for p in pkts:
+        streams.setdefault((p[5], p[4], p[3], p[6]), []).append(p)  # group, src, ssrc, pt
+    if not streams:
+        print("  no RTP multicast captured — wrong --iface, broaden --mcast, or check sudo")
+        return 0
+    print("  %-13s %-5s %-15s %-10s %2s %6s %4s %8s %8s  %s" %
+          ("group", "from", "src", "ssrc", "pt", "pkt/s", "spp", "implied", "mediaclk", "verdict"))
+    for (group, src, ssrc, pt), v in sorted(streams.items()):
+        if len(v) < 8:
+            continue
+        _, ordered = _unwrap_and_order(v)
+        walls = [p[0] for p in ordered]
+        tss = [p[2] for p in ordered]
+        dur = max(walls) - min(walls)
+        if dur <= 0:
+            continue
+        steps = {}
+        for i in range(len(ordered) - 1):
+            st = (tss[i + 1] - tss[i]) & 0xFFFFFFFF
+            steps[st] = steps.get(st, 0) + 1
+        fwd = {s: c for s, c in steps.items() if 0 < _signed(s) < (1 << 20)}
+        spp = max(fwd, key=fwd.get) if fwd else 0
+        backjumps = sum(c for s, c in steps.items() if _signed(s) < 0)
+        pktrate = len(ordered) / dur
+        implied = pktrate * spp
+        mclk = ((max(tss) - min(tss)) & 0xFFFFFFFF) / dur
+        nearest = min(VALID_RATES, key=lambda r: abs(r - mclk))
+        offpct = (mclk - nearest) / nearest * 100.0
+        if backjumps >= 1:
+            verdict = "NON-MONOTONIC: %d back-jump(s), mclk %.0f vs %d" % (backjumps, mclk, nearest)
+        elif abs(offpct) > 0.1:
+            verdict = "FREE-RUN %+.2f%% off %d Hz" % (offpct, nearest)
+        elif abs(implied - mclk) / mclk > 0.005:
+            verdict = "cadence %.0f != clock %.0f" % (implied, mclk)
+        else:
+            verdict = "clean ~%d Hz" % nearest
+        print("  %-13s %-5s %-15s %-10s %2d %6.0f %4d %8.0f %8.0f  %s" %
+              (group, "LOCAL" if (local and src == local) else "ext",
+               src, hex(ssrc), pt, pktrate, spp, implied, mclk, verdict))
+    return 0
+
+
 # ------------------------------------------------------------------ exercise ---
 def set_pcm_rate(base, card, pcm, rate, ins, outs):
     api(base, "/api/card/%s/pcm/%s" % (card, pcm), method="PUT",
@@ -341,6 +442,9 @@ def main():
     ap.add_argument("--iface", default=None, help="capture iface (auto-detect from SDP sender if omitted)")
     ap.add_argument("--duration", type=float, default=3.0, help="seconds to capture per source")
     ap.add_argument("--exercise", action="store_true", help="destructive re-rate matrix + restore")
+    ap.add_argument("--survey", action="store_true",
+                    help="characterize EVERY RTP multicast on --iface (local vs external sender); no daemon needed")
+    ap.add_argument("--mcast", default="239.0.0.0/8", help="--survey multicast range to capture")
     ap.add_argument("--settle", type=float, default=2.0, help="seconds to wait after a re-rate (--exercise)")
     ap.add_argument("--only", default=None, help="limit --exercise to these card/pcm names (comma-separated)")
     ap.add_argument("--rates", default=None,
@@ -349,6 +453,8 @@ def main():
     ap.add_argument("--yes", action="store_true", help="confirm destructive --exercise")
     args = ap.parse_args()
     try:
+        if args.survey:
+            return cmd_survey(args.iface, args.duration, args.mcast)
         if args.exercise:
             return cmd_exercise(args.daemon, args.iface, args.duration, args)
         return cmd_check(args.daemon, args.iface, args.duration)
