@@ -2511,9 +2511,16 @@ static int mr_alsa_audio_pcm_close(struct snd_pcm_substream *substream)
         if (err < 0)
             printk(KERN_WARNING "mr_alsa_audio_pcm_close: pcm_id %d in-place re-rate to %u failed: %d\n",
                    chip->global_pcm_id, target, err);
-        else
+        else {
             printk(KERN_INFO "mr_alsa_audio_pcm_close: pcm_id %d re-rated in place to %u on last close\n",
                    chip->global_pcm_id, target);
+            /* W15: tell the daemon the armed re-rate applied, so it re-attaches
+             * the sink now (the netlink SetPCMRate path doesn't notify — its
+             * command reply already informs the daemon). */
+            if (chip->mr_alsa_audio_ops->notify_pcm_rate_applied)
+                chip->mr_alsa_audio_ops->notify_pcm_rate_applied(
+                    chip->ravenna_peer, chip->global_pcm_id, target);
+        }
     }
     return 0;
 }

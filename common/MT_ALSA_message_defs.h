@@ -118,7 +118,13 @@ enum MT_ALSA_msg_id
      * kernel ARMS the chip (advertises the target on the "PCM Rate" kcontrol +
      * notifies) and returns -EBUSY, applying the re-rate when the chip next goes
      * idle (last close). Appended to preserve wire-protocol values. */
-    MT_ALSA_Msg_SetPCMRate                //    U2K Inputs: int32_t pcm_id, uint32_t sample_rate
+    MT_ALSA_Msg_SetPCMRate,               //    U2K Inputs: int32_t pcm_id, uint32_t sample_rate
+    /* W15: K2U notification that an ARMED in-place re-rate has now been applied
+     * autonomously (the holding client closed the PCM, so close() fired the
+     * latch). Lets the daemon re-attach the sink at the new rate the instant it
+     * happens, instead of polling. Inputs: int32_t pcm_id, uint32_t sample_rate.
+     * Appended to preserve wire-protocol values. */
+    MT_ALSA_Msg_PCMRateApplied            //    K2U Inputs: int32_t pcm_id, uint32_t sample_rate
 };
 
 /*
