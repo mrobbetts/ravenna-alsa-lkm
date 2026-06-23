@@ -84,6 +84,9 @@ struct ravenna_mgr_ops
      * reopens at it; the actual re-key waits for the chip to go idle. */
     bool (*pcm_is_idle)(void *mr_alsa_audio_chip);
     void (*arm_pcm_rate)(void *mr_alsa_audio_chip, uint32_t target_rate);
+    /* W28: the chip's ARMED pending re-rate target (0 = not armed). Read for
+     * GetPCMStatus so the daemon sees live + armed rate as kernel truth. */
+    uint32_t (*get_pcm_pending_rate)(void *mr_alsa_audio_chip);
 };
 
 /// Put functions to be called by ALSA driver (C ALSA to CPP Ravenna wrapper/owner object)

@@ -1792,17 +1792,28 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             /* #22: per-PCM TIC-engine lock — the chip's (domain, rate) entry's
              * active-NIC engine. An unattached/unknown pcm reports unlocked. */
             struct TPCMStatus pcmStatus;
+            const struct ravenna_mgr_ops* fe = self->m_alsa_driver_frontend;
             int32_t pcm_id = (msg_rcv->dataSize >= (int)sizeof(int32_t))
                                  ? *(int32_t*)msg_rcv->data
                                  : -1;
             pcmStatus.nTICLockStatus = PTPLS_UNLOCKED;
+            pcmStatus.live_rate = 0;     /* W28: kernel-truth live + armed rate */
+            pcmStatus.pending_rate = 0;
             if (pcm_id >= 0 && pcm_id < MAX_PCMS)
             {
                 struct tic_timer_entry* entry =
                     smp_load_acquire(&self->m_apChipEntry[pcm_id]);
+                void* chip = get_chip_by_pcm_id(self, pcm_id);
                 if (entry)
                     pcmStatus.nTICLockStatus =
                         tic_engine_lock_status(active_engine_of(entry));
+                if (chip && fe)
+                {
+                    if (fe->get_pcm_sample_rate)
+                        pcmStatus.live_rate = fe->get_pcm_sample_rate(chip);
+                    if (fe->get_pcm_pending_rate)
+                        pcmStatus.pending_rate = fe->get_pcm_pending_rate(chip);
+                }
             }
             msg_reply.errCode = 0;
             msg_reply.dataSize = sizeof(struct TPCMStatus);
@@ -1861,6 +1872,30 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
                     MTAL_DP_INFO("MT_ALSA_Msg_SetPCMRate pcm_id=%d -> %u (busy, armed; daemon should retry)\n",
                                  pcm_id, new_rate);
                 }
+            }
+            break;
+        }
+        case MT_ALSA_Msg_CancelPCMRate:
+        {
+            /* W28: retract an ARMED in-place re-rate — disarm the latch. Clears
+             * pending_rate (the chip stays at its live rate; nothing is applied),
+             * so a stale/erroneous re-rate never fires on the next close.
+             * Idempotent: a no-op when the chip isn't armed. Payload {int32_t pcm_id}. */
+            int32_t pcm_id = (msg_rcv->dataSize >= (int)sizeof(int32_t))
+                                 ? *(int32_t*)msg_rcv->data : -1;
+            const struct ravenna_mgr_ops* fe = self->m_alsa_driver_frontend;
+            void* chip = (pcm_id >= 0 && pcm_id < MAX_PCMS)
+                             ? get_chip_by_pcm_id(self, pcm_id) : NULL;
+            if (!chip || !fe || !fe->arm_pcm_rate)
+            {
+                MTAL_DP_ERR("MT_ALSA_Msg_CancelPCMRate: no chip for pcm_id %d\n", pcm_id);
+                msg_reply.errCode = -ENODEV;
+            }
+            else
+            {
+                fe->arm_pcm_rate(chip, 0);  /* target 0 = disarm */
+                msg_reply.errCode = 0;
+                MTAL_DP_INFO("MT_ALSA_Msg_CancelPCMRate pcm_id=%d (disarmed)\n", pcm_id);
             }
             break;
         }

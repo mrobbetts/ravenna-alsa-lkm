@@ -124,7 +124,13 @@ enum MT_ALSA_msg_id
      * latch). Lets the daemon re-attach the sink at the new rate the instant it
      * happens, instead of polling. Inputs: int32_t pcm_id, uint32_t sample_rate.
      * Appended to preserve wire-protocol values. */
-    MT_ALSA_Msg_PCMRateApplied            //    K2U Inputs: int32_t pcm_id, uint32_t sample_rate
+    MT_ALSA_Msg_PCMRateApplied,           //    K2U Inputs: int32_t pcm_id, uint32_t sample_rate
+    /* W28 (intent-in/truth-out): retract an ARMED in-place re-rate. The latch is
+     * cleared (chip stays at its live rate; nothing is applied) so a re-rate
+     * issued in error — or made stale by a source that reverted before the client
+     * released the device — never fires later. Idempotent (no-op if not armed).
+     * Input: int32_t pcm_id. Appended to preserve wire-protocol values. */
+    MT_ALSA_Msg_CancelPCMRate             //    U2K Input: int32_t pcm_id
 };
 
 /*
@@ -163,6 +169,13 @@ struct MT_ALSA_AddCard_args
 struct TPCMStatus
 {
     int32_t nTICLockStatus;   /* EPTPLockStatus: 0 unlocked / 1 locking / 2 locked */
+    /* W28 (intent-in/truth-out): the kernel is the source of truth for the live
+     * chip rate. live_rate = the rate the chip is actually keyed to right now;
+     * pending_rate = an ARMED in-place re-rate target (0 = not armed). The daemon
+     * reads these rather than trusting its own cached/commanded rate. Appended to
+     * preserve wire layout — older readers that stop at nTICLockStatus still work. */
+    uint32_t live_rate;
+    uint32_t pending_rate;
 };
 
 struct MT_ALSA_msg
