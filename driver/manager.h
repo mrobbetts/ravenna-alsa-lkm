@@ -358,6 +358,7 @@ int start_interrupts(void* user, void* alsa_chip_pointer, bool is_playback);
 int stop_interrupts(void* user, void* alsa_chip_pointer, bool is_playback);
 int notify_master_volume_change(void* user, int direction, int32_t value);
 int notify_master_switch_change(void* user, int direction, int32_t value);
+void notify_pcm_rate_applied(void* user, int32_t pcm_id, uint32_t rate);  // W15 K2U
 int get_master_volume_value(void* user, int direction, int32_t* value);
 int get_master_switch_value(void* user, int direction, int32_t* value);
 

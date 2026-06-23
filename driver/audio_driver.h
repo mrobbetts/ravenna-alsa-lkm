@@ -131,6 +131,12 @@ struct alsa_ops
      * cannot observe a half-applied re-key. */
     int (*set_pcm_rate)(void* ravenna_peer, int32_t pcm_id, uint32_t new_rate);
     void (*registry_barrier)(void* ravenna_peer);
+    /* W15: K2U-notify the daemon that an armed re-rate applied autonomously
+     * (close() fired the latch). Called from pcm_close after set_pcm_rate
+     * succeeds; the daemon re-attaches the sink on the event instead of polling.
+     * NOT called from the netlink SetPCMRate path (the command reply informs the
+     * daemon there). */
+    void (*notify_pcm_rate_applied)(void* ravenna_peer, int32_t pcm_id, uint32_t rate);
 };
 
 /// Put ALSA driver functions which needs to be used by CPP code here:

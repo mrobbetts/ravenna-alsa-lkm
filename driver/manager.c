@@ -3264,6 +3264,24 @@ int notify_master_switch_change(void* user, int direction, int32_t value)
     return -EINVAL;
 }
 
+/* W15: K2U-notify the daemon that an armed in-place re-rate applied autonomously
+ * (pcm_close fired the latch). Payload {int32_t pcm_id, int32_t rate}. Sent from
+ * pcm_close (process context) — the same context the volume/switch notifies use.
+ * Not sent from the netlink SetPCMRate path (the command reply informs there). */
+void notify_pcm_rate_applied(void* user, int32_t pcm_id, uint32_t rate)
+{
+    struct MT_ALSA_msg msgSent, msgAnswer;
+    int32_t buf[2];
+    (void)user;
+    buf[0] = pcm_id;
+    buf[1] = (int32_t)rate;
+    msgSent.id = MT_ALSA_Msg_PCMRateApplied;
+    msgSent.errCode = 0;
+    msgSent.dataSize = sizeof(buf);
+    msgSent.data = (void*)buf;
+    CW_netlink_send_msg_to_user_land(&msgSent, &msgAnswer);
+}
+
 int get_master_volume_value(void* user, int direction, int32_t* value)
 {
     if(value && direction == 0)
@@ -3384,5 +3402,6 @@ void init_alsa_callbacks(struct TManager* self)
     self->m_alsa_callbacks.get_master_switch_value = &get_master_switch_value;
     self->m_alsa_callbacks.set_pcm_rate = &manager_set_pcm_rate;       /* W15 in-place re-rate */
     self->m_alsa_callbacks.registry_barrier = &manager_registry_barrier; /* W15 open barrier */
+    self->m_alsa_callbacks.notify_pcm_rate_applied = &notify_pcm_rate_applied; /* W15 K2U event */
 
 }
