@@ -1149,6 +1149,14 @@ static void mr_alsa_audio_arm_pcm_rate(void *mr_alsa_audio_chip, uint32_t target
                        &chip->current_rate_control->id);
 }
 
+/* W28: the chip's ARMED pending re-rate target (0 = not armed). Plain read of
+ * pending_rate — a stale read only mis-times one GetPCMStatus, harmless. */
+static uint32_t mr_alsa_audio_get_pcm_pending_rate(void *mr_alsa_audio_chip)
+{
+    struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip *)mr_alsa_audio_chip;
+    return chip ? chip->pending_rate : 0;
+}
+
 /* W11: a chip's PTP clock domain is its owning card's (set at add_card). Derived
  * on demand from chip->card via the g_cards lookup — no per-chip field needed. */
 static uint8_t mr_alsa_audio_get_pcm_domain(void *mr_alsa_audio_chip)
@@ -1179,7 +1187,8 @@ static struct ravenna_mgr_ops g_ravenna_manager_ops = {
     .get_pcm_frame_size = mr_alsa_audio_get_pcm_frame_size,
     .get_pcm_domain = mr_alsa_audio_get_pcm_domain,
     .pcm_is_idle = mr_alsa_audio_pcm_is_idle,
-    .arm_pcm_rate = mr_alsa_audio_arm_pcm_rate
+    .arm_pcm_rate = mr_alsa_audio_arm_pcm_rate,
+    .get_pcm_pending_rate = mr_alsa_audio_get_pcm_pending_rate
 };
 
 
