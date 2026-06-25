@@ -43,6 +43,9 @@
 #define NS_2_REF_UNIT 100000    /* ns is the linux time unit */
 
 #define TIC_LOCK_HYSTERESIS 5
+/* W16: consecutive railed-integrator observations before the servo is declared
+ * SATURATED (and de-saturated). Hysteresis so a transient rail doesn't flap it. */
+#define SATURATION_HYSTERESIS 5
 
 /* One engine per valid tick rate (44.1/48/88.2/96/176.4/192/352.8/384 kHz;
  * DSD ticks in the 352.8k clock domain). */
@@ -79,6 +82,10 @@ typedef struct TTicEngine_s
 
     /* TIC frame */
     uint16_t m_usTICLockCounter; /* == 0 means that TIC frame PLL reached the lock state */
+    /* W16: hysteresis counter for the railed-integrator (saturated) state. At
+     * SATURATION_HYSTERESIS the servo is railed — the GM is beyond our steering
+     * range and we cannot track it (so we must not claim lock). */
+    uint16_t m_usSaturatedCounter;
 
     volatile uint64_t m_ui64TIC_LastRTXClockTime; /* [100us] */
     uint64_t m_ui64TIC_LastRTXClockTimeAtT2;      /* [100us] */
@@ -176,6 +183,10 @@ void tic_engine_set_next_abs_time(TTicEngine* self, uint64_t ui64NextAbsoluteTim
  * TIC lock. With one engine per servo this is exactly the old
  * GetLockStatus(). */
 EPTPLockStatus tic_engine_lock_status(TTicEngine* self);
+/* W16: true when the media servo is railed (the GM is beyond our steering range
+ * and untrackable). Distinguishes a "saturated, not locked" engine from one that
+ * is merely "acquiring" — both report PTPLS_LOCKING via lock_status. */
+bool tic_engine_is_saturated(TTicEngine* self);
 
 bool tic_engine_is_drop(TTicEngine* self, bool bReset);
 

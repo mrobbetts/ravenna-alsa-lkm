@@ -66,6 +66,7 @@ void tic_engine_init(TTicEngine* self, struct TClock_PTP_s* pServo)
      * path, explicitly by tic_entry_start on the no-reset AddPCM path
      * (2026-06-11 review fix) — before the engine can report locked */
     self->m_usTICLockCounter = 0;
+    self->m_usSaturatedCounter = 0;  /* W16 */
 
     self->m_uiTIC_DropCounter = 0;
     self->m_uiTIC_LastDropCounter = 0;
@@ -100,6 +101,7 @@ void tic_engine_reset(TTicEngine* self)
 {
     self->m_dTIC_IGR = 0;
     self->m_usTICLockCounter = TIC_LOCK_HYSTERESIS;
+    self->m_usSaturatedCounter = 0;  /* W16 */
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -216,6 +218,22 @@ void tic_engine_steer(TTicEngine* self, uint64_t ui64T1)
         self->m_dTIC_IGR = ((self->m_dTIC_IGR + dProportional) * 95) / 100; // [ps]
         self->m_dTIC_IGR = max(min(self->m_dTIC_IGR, 4000000LL), -4000000LL); // integral part is bound to +/- 4us which corresponds to +/- 400ns in the formula below
 
+        /* W16: the integrator pinned at its bound == the servo is railed: the GM
+         * is beyond our steering range and we cannot track it. This is the real
+         * "can't track" signal — dPhaseAdj below is IGR/10, capped well under the
+         * lock thresholds, so it can never reflect a railed servo (which is why
+         * the engine used to claim lock to a freewheeling GM). Track it with
+         * hysteresis; the integrator's leak un-winds a transient quickly. */
+        if (self->m_dTIC_IGR >= 4000000LL || self->m_dTIC_IGR <= -4000000LL)
+        {
+            if (self->m_usSaturatedCounter < SATURATION_HYSTERESIS)
+                self->m_usSaturatedCounter++;
+        }
+        else if (self->m_usSaturatedCounter > 0)
+        {
+            self->m_usSaturatedCounter--;
+        }
+
         // Proportional + integral part
         dPhaseAdj = /*dProportional + */self->m_dTIC_IGR / 10; // we allow the integral part to correct up to +/- 150us for the coming half a second or +/- 300ppm
 
@@ -225,7 +243,16 @@ void tic_engine_steer(TTicEngine* self, uint64_t ui64T1)
         self->m_dTIC_CurrentPeriod += dPhaseAdj * 1000; // [ps]
 
         // Lock detection
-        if (abs(dPhaseAdj) < 800000 && self->m_usTICLockCounter > 0)
+        /* W16: gate lock on saturation FIRST. A railed servo (GM beyond range)
+         * must never claim lock, but dPhaseAdj (= IGR/10) is capped below the
+         * thresholds below, so the legacy branches can't catch it. */
+        if (self->m_usSaturatedCounter >= SATURATION_HYSTERESIS)
+        {
+            if (self->m_usTICLockCounter == 0)
+                printk("[nic %u dom %u] TIC saturated (rate %u) — GM beyond steering range, not locked\n", pServo->m_pEth_netfilter->nic_id, pServo->m_PTPConfig.ui8Domain, self->m_ui32SamplingRate);
+            self->m_usTICLockCounter = TIC_LOCK_HYSTERESIS;
+        }
+        else if (abs(dPhaseAdj) < 800000 && self->m_usTICLockCounter > 0)
         {
             self->m_usTICLockCounter--;
             if (self->m_usTICLockCounter == 0)
@@ -277,6 +304,7 @@ void tic_engine_phase_init_from_locked(TTicEngine* self)
     self->m_dTIC_CurrentPeriod = self->m_dTIC_BasePeriod;
     self->m_dTIC_IGR = 0;
     self->m_usTICLockCounter = TIC_LOCK_HYSTERESIS;
+    self->m_usSaturatedCounter = 0;  /* W16 */
 
     self->m_ui64TIC_LastRTXClockTime = ui64Now;
     self->m_ui64TIC_LastRTXClockTimeAtT2 = ui64Now; /* sane until the next sync snapshot */
@@ -477,6 +505,15 @@ EPTPLockStatus tic_engine_lock_status(TTicEngine* self)
         return PTPLS_LOCKING;
     }
     return PTPLS_LOCKED;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+/* W16: the media servo is railed — the GM is beyond our steering range and
+ * untrackable. Combined with lock_status, lets a consumer distinguish
+ * "saturated (GM too far off)" from "acquiring (converging)". */
+bool tic_engine_is_saturated(TTicEngine* self)
+{
+    return self->m_usSaturatedCounter >= SATURATION_HYSTERESIS;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
