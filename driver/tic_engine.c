@@ -366,6 +366,21 @@ void tic_engine_tick_advance(TTicEngine* self, TTicEngineTickCtx* pCtx)
             }
         }
 
+        /* W16: monotonic + CONTIGUOUS media clock. A railed media servo (an
+         * untrackable GM freewheeling far past the ±3000ppm steering range)
+         * re-anchors the count BACKWARD via the edge-window branches above, which
+         * the SAC publish turns into a non-monotonic RTP timestamp that mutes
+         * downstream receivers. The fix belongs here, at the count: the TX reads
+         * the SAC once per tick and steps within it, so the SAC must advance by
+         * >= one frame EACH tick (a held/flat SAC makes the TX re-emit the same
+         * range -> a backward step at the tick boundary). Never let the count
+         * regress or stall; the SAC then free-wheels forward at the railed rate
+         * (drifting off the bad GM but staying monotonic + contiguous). Forward
+         * jumps (a fast GM catching up) are preserved. Engine (re)start reseeds
+         * m_ui64LastTIC_Count, so this re-anchors cleanly. */
+        if (ui64CurrentTICCount <= self->m_ui64LastTIC_Count)
+            ui64CurrentTICCount = self->m_ui64LastTIC_Count + 1;
+
         pCtx->ui64AbsoluteTime = self->m_ui64TIC_NextAbsoluteTime;
         spin_unlock((spinlock_t*)pServo->m_csPTPTime);
     }
@@ -376,16 +391,7 @@ void tic_engine_tick_advance(TTicEngine* self, TTicEngineTickCtx* pCtx)
         {
             self->m_ui64GlobalPerformanceCounter = MTAL_LK_GetCounterTime();
             self->m_ui64GlobalTime = ui64CurrentRTXClockTime;
-            /* W16: monotonic ratchet — NEVER publish a regressing SAC. A backward
-             * TIC count (the media servo railed by an untrackable GM — e.g. a
-             * grandmaster freewheeling ~25000ppm off, far past our ±3000ppm
-             * steering range) would otherwise emit a non-monotonic SAC and mute
-             * downstream receivers. Hold the prior value; forward-only. A genuine
-             * engine (re)start re-anchors via the GlobalSAC=0 reset (tic_engine
-             * init), which this ratchet then climbs from. A forward catch-up on
-             * recovery is fine (receivers conceal a gap); only backward is fatal. */
-            if (self->m_ui64TICSAC > self->m_ui64GlobalSAC)
-                self->m_ui64GlobalSAC = self->m_ui64TICSAC;
+            self->m_ui64GlobalSAC = self->m_ui64TICSAC;  /* monotonic via the count clamp above */
         }
         spin_unlock(&self->m_csSAC_Time_Lock);
     }
