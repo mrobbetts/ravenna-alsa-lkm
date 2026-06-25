@@ -376,7 +376,16 @@ void tic_engine_tick_advance(TTicEngine* self, TTicEngineTickCtx* pCtx)
         {
             self->m_ui64GlobalPerformanceCounter = MTAL_LK_GetCounterTime();
             self->m_ui64GlobalTime = ui64CurrentRTXClockTime;
-            self->m_ui64GlobalSAC = self->m_ui64TICSAC;
+            /* W16: monotonic ratchet — NEVER publish a regressing SAC. A backward
+             * TIC count (the media servo railed by an untrackable GM — e.g. a
+             * grandmaster freewheeling ~25000ppm off, far past our ±3000ppm
+             * steering range) would otherwise emit a non-monotonic SAC and mute
+             * downstream receivers. Hold the prior value; forward-only. A genuine
+             * engine (re)start re-anchors via the GlobalSAC=0 reset (tic_engine
+             * init), which this ratchet then climbs from. A forward catch-up on
+             * recovery is fine (receivers conceal a gap); only backward is fatal. */
+            if (self->m_ui64TICSAC > self->m_ui64GlobalSAC)
+                self->m_ui64GlobalSAC = self->m_ui64TICSAC;
         }
         spin_unlock(&self->m_csSAC_Time_Lock);
     }
