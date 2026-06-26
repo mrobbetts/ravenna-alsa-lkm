@@ -119,6 +119,9 @@ bool init_ptp(TClock_PTP* self, TEtherTubeNetfilter* pEth_netfilter, clock_ptp_o
 
 	////////////// new algorithm
 	self->m_i64TIC_PTPToRTXClockOffset = 0;
+	self->m_i64GMRateOffsetPPB = 0;  /* W16 */
+	self->m_i64PrevOffset = 0;
+	self->m_ui64PrevOffsetT2 = 0;
 
 	self->m_wLastDelayReqSequenceId = 0;
 	memset(&self->m_PTPV2MsgDelayReqPacket, 0, sizeof(self->m_PTPV2MsgDelayReqPacket));
@@ -564,6 +567,22 @@ void ProcessT1(TClock_PTP* self, uint64_t ui64T1)
 		{
 			self->m_i64TIC_PTPToRTXClockOffset = (int64_t)self->m_ui64T2 - (int64_t)ui64T1;
 
+			/* W16: estimate the GM's rate offset vs our local reference from the
+			 * slope of the offset over successive Syncs (negative = GM slow). The
+			 * units cancel in the ratio, so this is ppb regardless of the time
+			 * unit. EMA-smoothed; a re-lock transient (absurd one-off slope) is
+			 * dropped. Surfaced so a railed engine can report the actual GM rate. */
+			if (self->m_ui64PrevOffsetT2 != 0 && self->m_ui64T2 > self->m_ui64PrevOffsetT2)
+			{
+				int64_t d_offset = self->m_i64TIC_PTPToRTXClockOffset - self->m_i64PrevOffset;
+				int64_t d_t = (int64_t)(self->m_ui64T2 - self->m_ui64PrevOffsetT2);
+				int64_t sample_ppb = -((d_offset * 1000000000LL) / d_t);
+				if (sample_ppb < 500000000LL && sample_ppb > -500000000LL)
+					self->m_i64GMRateOffsetPPB = (self->m_i64GMRateOffsetPPB * 7 + sample_ppb) / 8;
+			}
+			self->m_i64PrevOffset = self->m_i64TIC_PTPToRTXClockOffset;
+			self->m_ui64PrevOffsetT2 = self->m_ui64T2;
+
 			/* W5: frame alignment + PI steering is rate-keyed — fan out. */
 			for (e = 0; e < self->m_uNumEngines; e++)
 				if (self->m_apEngines[e])
@@ -747,6 +766,14 @@ void clock_ptp_detach_engine(TClock_PTP* self, TTicEngine* pEngine)
 		break;
 	}
 	spin_unlock_bh((spinlock_t*)self->m_csPTPTime);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+/* W16: the GM's estimated rate offset vs our local reference [ppb], negative =
+ * GM slow. Meaningful only while PTP-locked (steady Syncs); 0 otherwise. */
+int64_t GetGMRateOffsetPPB(TClock_PTP* self)
+{
+	return self ? self->m_i64GMRateOffsetPPB : 0;
 }
 
 ///////////////////////////////////////////////////////////////////////////////

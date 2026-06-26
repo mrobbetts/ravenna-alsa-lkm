@@ -73,6 +73,15 @@ typedef struct TClock_PTP_s
 
     volatile int64_t m_i64TIC_PTPToRTXClockOffset; // [100us]
 
+    /* W16: the GM's rate offset vs our local reference, estimated from the slope
+     * of the PTP offset (T2 - T1) over successive Syncs. Negative = GM running
+     * slow vs local (e.g. a freewheeling grandmaster). This is the honest "how
+     * far off is this GM" number — measurable even when the media servo is railed
+     * and cannot follow it. EMA-smoothed; prev_* hold the last slope sample. */
+    int64_t  m_i64GMRateOffsetPPB;
+    int64_t  m_i64PrevOffset;
+    uint64_t m_ui64PrevOffsetT2;
+
     // PTP Master
     volatile uint16_t m_usPTPMasterPortNumber;
 
@@ -157,6 +166,7 @@ extern "C"
   * engine TIC-locked. With one started engine this is exactly the
   * legacy composite. Per-rate callers use tic_engine_lock_status(). */
  EPTPLockStatus GetLockStatus(TClock_PTP* self);
+ int64_t GetGMRateOffsetPPB(TClock_PTP* self);  /* W16 */
 
  void SetPTPConfig(TClock_PTP* self, TPTPConfig* pPTPConfig);
  void GetPTPConfig(TClock_PTP* self, TPTPConfig* pPTPConfig);
