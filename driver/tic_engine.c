@@ -394,19 +394,28 @@ void tic_engine_tick_advance(TTicEngine* self, TTicEngineTickCtx* pCtx)
             }
         }
 
-        /* W16: monotonic + CONTIGUOUS media clock. A railed media servo (an
-         * untrackable GM freewheeling far past the ±3000ppm steering range)
-         * re-anchors the count BACKWARD via the edge-window branches above, which
-         * the SAC publish turns into a non-monotonic RTP timestamp that mutes
-         * downstream receivers. The fix belongs here, at the count: the TX reads
-         * the SAC once per tick and steps within it, so the SAC must advance by
-         * >= one frame EACH tick (a held/flat SAC makes the TX re-emit the same
-         * range -> a backward step at the tick boundary). Never let the count
-         * regress or stall; the SAC then free-wheels forward at the railed rate
-         * (drifting off the bad GM but staying monotonic + contiguous). Forward
-         * jumps (a fast GM catching up) are preserved. Engine (re)start reseeds
-         * m_ui64LastTIC_Count, so this re-anchors cleanly. */
-        if (ui64CurrentTICCount <= self->m_ui64LastTIC_Count)
+        /* W16: monotonic + CONTIGUOUS media clock, but ONLY while the servo is
+         * railed. A railed media servo (an untrackable GM, beyond the steering
+         * range) re-anchors the count BACKWARD via the edge-window branches above,
+         * which the SAC publish turns into a non-monotonic RTP timestamp that
+         * mutes receivers; free-wheel the count forward then (the SAC drifts off
+         * the bad GM but stays monotonic + contiguous — the TX reads the SAC once
+         * per tick and steps within it, so a held/flat SAC would make it re-emit
+         * the same range -> a backward step at the tick boundary).
+         *
+         * CRUCIAL: gate this on the rail (m_usSaturatedCounter > 0). Once the GM
+         * is trackable AGAIN, do NOT clamp — follow the GM directly (ui64Q),
+         * re-anchoring even if that steps the count back. The clamp is a forward
+         * ratchet; left ungated it NEVER re-syncs, so the forward drift it
+         * accumulates during a freewheel becomes a PERMANENT timestamp offset that
+         * outlives the freewheel (receiver: a huge fixed offset / "out of bound"
+         * long after the GM recovered). The re-anchor is a one-time re-sync at
+         * recovery, which receivers expect; a stuck offset is forever. The gate
+         * counter increments on the first railed Sync (immediate protection — no
+         * onset leak) and decays over SATURATION_HYSTERESIS clean Syncs (no flap
+         * at the rail boundary), releasing the clamp shortly after recovery. */
+        if (self->m_usSaturatedCounter > 0 &&
+            ui64CurrentTICCount <= self->m_ui64LastTIC_Count)
             ui64CurrentTICCount = self->m_ui64LastTIC_Count + 1;
 
         pCtx->ui64AbsoluteTime = self->m_ui64TIC_NextAbsoluteTime;
