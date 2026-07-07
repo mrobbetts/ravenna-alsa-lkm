@@ -51,6 +51,7 @@ struct ravenna_mgr_ops
     void (*lock_capture_buffer)(void *mr_alsa_audio_chip);
     void (*unlock_capture_buffer)(void *mr_alsa_audio_chip);
     int (*pcm_interrupt)(void *mr_alsa_audio_chip, int direction);/// direction: 0 for playback, 1 for capture. One interrupt per Ravenna TIC
+    void (*pcm_xrun)(void *mr_alsa_audio_chip);/// W17: force an xrun on the chip's open substreams after a media-clock re-anchor, so clients re-prepare onto the new timeline
     //uint32_t (*get_capture_buffer_offset)(void *mr_alsa_audio_chip);/// returns current offset in samples (channel independent) for Ravenna Ring Buffer
     uint32_t (*get_playback_buffer_offset)(void *mr_alsa_audio_chip);/// returns current offset (channel independent) in samples for Ravenna Ring Buffer
     int (*notify_master_volume_change)(void* mr_alsa_audio_chip, int direction, int32_t value); /// direction: 0 for playback, 1 for capture. value: from -99 to 0

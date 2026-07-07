@@ -46,6 +46,12 @@
 /* W16: consecutive railed-integrator observations before the servo is declared
  * SATURATED (and de-saturated). Hysteresis so a transient rail doesn't flap it. */
 #define SATURATION_HYSTERESIS 5
+/* W17: a per-tick count step (deviation from a normal +1 frame advance) larger
+ * than this is a media-clock RE-ANCHOR, not scheduling jitter — the GM returning
+ * after an outage, or the saturation clamp releasing on freewheel recovery. ~64
+ * frames (~64 ms at the 1 ms tick) is far above a dropped tick or two and far
+ * below any real re-anchor (which is thousands to millions of frames). */
+#define TIMELINE_BREAK_FRAMES 64
 
 /* One engine per valid tick rate (44.1/48/88.2/96/176.4/192/352.8/384 kHz;
  * DSD ticks in the 352.8k clock domain). */
@@ -86,6 +92,12 @@ typedef struct TTicEngine_s
      * SATURATION_HYSTERESIS the servo is railed — the GM is beyond our steering
      * range and we cannot track it (so we must not claim lock). */
     uint16_t m_usSaturatedCounter;
+    /* W17: latched when the tick count re-anchors by more than TIMELINE_BREAK_
+     * FRAMES (a GM returning after an outage, or the saturation clamp releasing).
+     * The manager consumes it and xruns the open substreams so clients re-prepare
+     * onto the new timeline instead of playing garbled audio. Set in tick_advance,
+     * read+cleared in the tick's manager pass (same softirq context). */
+    bool m_bTimelineBreak;
 
     volatile uint64_t m_ui64TIC_LastRTXClockTime; /* [100us] */
     uint64_t m_ui64TIC_LastRTXClockTimeAtT2;      /* [100us] */
@@ -187,6 +199,9 @@ EPTPLockStatus tic_engine_lock_status(TTicEngine* self);
  * and untrackable). Distinguishes a "saturated, not locked" engine from one that
  * is merely "acquiring" — both report PTPLS_LOCKING via lock_status. */
 bool tic_engine_is_saturated(TTicEngine* self);
+/* W17: read-and-clear the timeline-break latch (a large media-clock re-anchor).
+ * Returns true once per re-anchor; the manager turns it into an ALSA xrun. */
+bool tic_engine_take_timeline_break(TTicEngine* self);
 
 bool tic_engine_is_drop(TTicEngine* self, bool bReset);
 
