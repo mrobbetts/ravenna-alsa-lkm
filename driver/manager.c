@@ -2701,16 +2701,70 @@ unsigned char get_live_out_mute_pattern_for_pcm(void* user, uint32_t pcm_id, uin
 //////////////////////////////////////////////////////////////////////////////////
 // Caudio_streamer_clock_PTP_callback
 //////////////////////////////////////////////////////////////////////////////////
+/* W17: service every ALSA substream on this entry once — advance hw_ptr and
+ * copy between the ALSA rings and the live (network) buffers. Split out of the
+ * pump so it can run on EVERY tick, locked or not: while the media clock is
+ * unlocked the TX/RX network pump is skipped but the substreams are still
+ * serviced, so hw_ptr keeps advancing and each chip's ring cursor stays in
+ * lockstep with the SAC. That lockstep is what keeps a held-open client
+ * (e.g. CamillaDSP) aligned across a clock outage instead of stalling and then
+ * playing garbled audio when the clock relocks. Softirq context: acquire-load
+ * the frontend/count/slots to pair with the release stores in
+ * attach_alsa_driver / detach_alsa_driver. */
+static void service_entry_alsa_chips(struct TManager* self, struct tic_timer_entry* entry, bool xrun)
+{
+    const struct ravenna_mgr_ops *frontend = smp_load_acquire(&self->m_alsa_driver_frontend);
+    uint32_t count, i;
+
+    if (!frontend)
+        return;
+
+    count = smp_load_acquire(&self->m_uPCMCount);
+    for (i = 0; i < count; ++i)
+    {
+        void *chip = smp_load_acquire(&self->m_apALSAChip[i]);
+        if (!chip)
+            continue;
+        /* W5 step 3: a chip ticks only at its own entry's cadence; entry
+         * identity via the chip map. */
+        if (smp_load_acquire(&self->m_apChipEntry[i]) != entry)
+            continue;
+        if (frontend->get_io_state(chip, false))
+            frontend->pcm_interrupt(chip, 1);
+        if (frontend->get_io_state(chip, true))
+            frontend->pcm_interrupt(chip, 0);
+        /* W17: the media clock re-anchored this tick — xrun the open substreams
+         * so the client re-prepares onto the new timeline (re-derives its ring
+         * alignment from the new SAC) instead of playing garbled audio. */
+        if (xrun && frontend->pcm_xrun)
+            frontend->pcm_xrun(chip);
+    }
+}
+
 /* W5: the audio pump, per (domain, rate) entry — services ONLY this
  * entry's chips (chip-map identity) and streams (stream_on_tick via
- * get_tick_rate_for_pcm), at this entry's cadence. Gated on the
- * per-entry predicate — this entry's active engine fully locked — which
- * is the same condition as NIC-selection eligibility by construction. */
+ * get_tick_rate_for_pcm), at this entry's cadence. W17: the TX/RX network
+ * pump stays gated on the per-entry lock predicate (this entry's active
+ * engine fully locked — the same condition as NIC-selection eligibility),
+ * but ALSA client servicing runs whenever IO is running, locked or not. */
 static void manager_audio_frame_tic(struct TManager* self, struct tic_timer_entry* entry)
 {
+    unsigned short active = entry->active_nic;               /* plain read: sole writer */
+    unsigned short standby = (unsigned short)(active == 0 ? 1 : 0);
+    bool timeline_break, locked;
+
     prepare_buffer_lives(&self->m_RTP_streams_manager, entry->domain, entry->tick_rate);
+
+    /* W17: consume the ACTIVE engine's re-anchor latch (turned into an xrun in the
+     * locked service path below) and DISCARD the standby's — only the active clock
+     * feeds the SAC the clients see, and a stale standby latch would spuriously
+     * xrun on a later NIC failover. */
+    timeline_break = tic_engine_take_timeline_break(&entry->engine[active]);
+    (void)tic_engine_take_timeline_break(&entry->engine[standby]);
+
+    locked = (tic_engine_lock_status(&entry->engine[active]) == PTPLS_LOCKED);
     
-    if (self->m_bIORunning && tic_engine_lock_status(&entry->engine[entry->active_nic]) == PTPLS_LOCKED)
+    if (self->m_bIORunning && locked)
     {
         #ifdef MTTRANSPARENCY_CHECK
         {
@@ -2811,39 +2865,24 @@ static void manager_audio_frame_tic(struct TManager* self, struct tic_timer_entr
             frame_process_end(&self->m_RTP_streams_manager);
         }
         #else
-            /// write live outputs
+            /* W17: the TX pump (send_outgoing_packets) runs only when locked —
+             * we never emit RTP on a bad/absent GM — wrapped around the ALSA
+             * servicing, which also runs unlocked (the else branch below). */
             frame_process_begin(&self->m_RTP_streams_manager, entry->domain, entry->tick_rate);
-            {
-                /* Acquire-load frontend and count, then each slot, so we
-                 * pair with smp_store_release in attach_alsa_driver and
-                 * detach_alsa_driver. The loop body runs in softirq
-                 * context; we must not see a non-NULL chip pointer or a
-                 * non-NULL frontend whose contents aren't published. */
-                const struct ravenna_mgr_ops *frontend = smp_load_acquire(&self->m_alsa_driver_frontend);
-                if (frontend)
-                {
-                    uint32_t count = smp_load_acquire(&self->m_uPCMCount);
-                    uint32_t i;
-                    for (i = 0; i < count; ++i)
-                    {
-                        void *chip = smp_load_acquire(&self->m_apALSAChip[i]);
-                        if (!chip)
-                            continue;
-                        /* W5 step 3: a chip ticks only at its own entry's
-                         * cadence. Entry identity via the chip map — exact
-                         * even if two entries were ever to share a tick
-                         * rate momentarily. */
-                        if (smp_load_acquire(&self->m_apChipEntry[i]) != entry)
-                            continue;
-                        if (frontend->get_io_state(chip, false))
-                            frontend->pcm_interrupt(chip, 1);
-                        if (frontend->get_io_state(chip, true))
-                            frontend->pcm_interrupt(chip, 0);
-                    }
-                }
-            }
+            service_entry_alsa_chips(self, entry, timeline_break);
             frame_process_end(&self->m_RTP_streams_manager);
         #endif
+    }
+    else if (self->m_bIORunning)
+    {
+        /* W17: the media clock is unlocked but ALSA clients are running. Service
+         * their substreams anyway — no TX/RX network pump — so hw_ptr keeps
+         * advancing and each chip's ring cursor stays in lockstep with the SAC
+         * (that lockstep is exactly what prevents garbled audio when the clock
+         * relocks). Capture reads the mute-scrubbed live-in buffer, i.e. silence,
+         * from the PrepareBufferLives pass above. Without this the pointer freezes
+         * and a held-open client (CamillaDSP) stalls until a manual restart. */
+        service_entry_alsa_chips(self, entry, false);
     }
 }
 

@@ -67,6 +67,7 @@ void tic_engine_init(TTicEngine* self, struct TClock_PTP_s* pServo)
      * (2026-06-11 review fix) — before the engine can report locked */
     self->m_usTICLockCounter = 0;
     self->m_usSaturatedCounter = 0;  /* W16 */
+    self->m_bTimelineBreak = false;  /* W17 */
 
     self->m_uiTIC_DropCounter = 0;
     self->m_uiTIC_LastDropCounter = 0;
@@ -102,6 +103,7 @@ void tic_engine_reset(TTicEngine* self)
     self->m_dTIC_IGR = 0;
     self->m_usTICLockCounter = TIC_LOCK_HYSTERESIS;
     self->m_usSaturatedCounter = 0;  /* W16 */
+    self->m_bTimelineBreak = false;  /* W17 */
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -305,6 +307,7 @@ void tic_engine_phase_init_from_locked(TTicEngine* self)
     self->m_dTIC_IGR = 0;
     self->m_usTICLockCounter = TIC_LOCK_HYSTERESIS;
     self->m_usSaturatedCounter = 0;  /* W16 */
+    self->m_bTimelineBreak = false;  /* W17 */
 
     self->m_ui64TIC_LastRTXClockTime = ui64Now;
     self->m_ui64TIC_LastRTXClockTimeAtT2 = ui64Now; /* sane until the next sync snapshot */
@@ -422,6 +425,25 @@ void tic_engine_tick_advance(TTicEngine* self, TTicEngineTickCtx* pCtx)
         spin_unlock((spinlock_t*)pServo->m_csPTPTime);
     }
 
+    /* W17: detect a media-clock RE-ANCHOR — the count leaping far from a normal
+     * single-frame advance. This happens when the GM returns after an outage (the
+     * PTP offset is recomputed, so ui64Q leaps) or when the saturation clamp above
+     * releases on freewheel recovery (the count snaps back to the trackable GM).
+     * Either way the SAC-derived ring cursors jump out from under a client's steady
+     * hw_ptr, so latch a break for the manager to turn into an ALSA xrun -> the
+     * client re-prepares onto the new timeline instead of playing garbled audio.
+     * Ungated by lock: the leap can land during the post-relock LOCKING hysteresis,
+     * before the engine reports LOCKED. Skipped while m_ui64LastTIC_Count is still
+     * 0 (the cold-start first tick, before phase_init/the first schedule seed it):
+     * a running count is always large, so 0 unambiguously means "not seeded yet". */
+    if (self->m_ui64LastTIC_Count != 0)
+    {
+        int64_t step = (int64_t)ui64CurrentTICCount - (int64_t)self->m_ui64LastTIC_Count;
+        if (step < 1 - (int64_t)TIMELINE_BREAK_FRAMES ||
+            step > 1 + (int64_t)TIMELINE_BREAK_FRAMES)
+            self->m_bTimelineBreak = true;
+    }
+
     self->m_ui64TICSAC = (ui64CurrentTICCount - 1) * self->m_ui32FrameSize;
     {
         spin_lock(&self->m_csSAC_Time_Lock);
@@ -523,6 +545,16 @@ EPTPLockStatus tic_engine_lock_status(TTicEngine* self)
 bool tic_engine_is_saturated(TTicEngine* self)
 {
     return self->m_usSaturatedCounter >= SATURATION_HYSTERESIS;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+/* W17: read-and-clear the timeline-break latch. Same softirq context as the
+ * setter (tick_advance) and this consumer (the manager tick), so no lock. */
+bool tic_engine_take_timeline_break(TTicEngine* self)
+{
+    bool broke = self->m_bTimelineBreak;
+    self->m_bTimelineBreak = false;
+    return broke;
 }
 
 ///////////////////////////////////////////////////////////////////////////////

@@ -899,6 +899,37 @@ static uint32_t mr_alsa_audio_pcm_get_playback_buffer_offset(void *rawchip)
     return offset;
 }
 
+/* W17: force an xrun on this chip's open substreams after a media-clock
+ * re-anchor (called from the tick softirq). Snapshot each substream under its
+ * chip lock (pairs with pcm_close NULLing it under the same lock), DROP the lock,
+ * then snd_pcm_stop_xrun OUTSIDE it: stop_xrun takes the stream lock and
+ * re-enters our trigger(STOP) -> the chip buffer locks (mute), so holding the
+ * chip lock across it would self-deadlock. Same snapshot-then-act discipline as
+ * the period_elapsed call in pcm_interrupt; ALSA core keeps a refcount on the
+ * substream across close, and snd_pcm_stop_xrun no-ops a not-running/closing
+ * stream internally. The client sees a standard xrun and re-prepares, which
+ * re-derives its ring alignment from the new SAC. */
+static void mr_alsa_audio_pcm_xrun(void *rawchip)
+{
+    struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip*)rawchip;
+    struct snd_pcm_substream *sub;
+
+    if (!chip)
+        return;
+
+    spin_lock_bh(&chip->capture_lock);
+    sub = chip->capture_substream;
+    spin_unlock_bh(&chip->capture_lock);
+    if (sub)
+        snd_pcm_stop_xrun(sub);
+
+    spin_lock_bh(&chip->playback_lock);
+    sub = chip->playback_substream;
+    spin_unlock_bh(&chip->playback_lock);
+    if (sub)
+        snd_pcm_stop_xrun(sub);
+}
+
 static int mr_alsa_audio_notify_master_volume_change(void* rawchip, int direction, int32_t value)
 {
     int err = 0;
@@ -1176,6 +1207,7 @@ static struct ravenna_mgr_ops g_ravenna_manager_ops = {
     .lock_capture_buffer = mr_alsa_audio_lock_capture_buffer,
     .unlock_capture_buffer = mr_alsa_audio_unlock_capture_buffer,
     .pcm_interrupt = mr_alsa_audio_pcm_interrupt,
+    .pcm_xrun = mr_alsa_audio_pcm_xrun,
     //.get_capture_buffer_offset = mr_alsa_audio_pcm_get_capture_buffer_offset,
     .get_playback_buffer_offset = mr_alsa_audio_pcm_get_playback_buffer_offset,
     .notify_master_volume_change = mr_alsa_audio_notify_master_volume_change,
