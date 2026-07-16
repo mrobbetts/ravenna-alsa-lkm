@@ -844,6 +844,35 @@ void GetPTPStatus(TClock_PTP* self, TPTPStatus* pPTPStatus)
      * GM-rate estimate. Unlocked reads of PKT-written fields (u8/u16 + the
      * announce struct) — status reporting; worst case one transiently-stale
      * field during a concurrent announce, same discipline as the GMID above. */
+    /* W16 slice 3b: the DOMAIN-level clock state — clock-source health is a
+     * domain fact (the GM + servo), one truth for every PCM on the domain.
+     * NO_SIGNAL outranks all (without Syncs the engine counters are stale);
+     * then any railed engine makes the domain SATURATED (the GM is the cause);
+     * any converging engine makes it ACQUIRING; else LOCKED. Unlocked engine
+     * reads, same status-reporting discipline as the jitter scan below. */
+    if (self->m_usPTPLockCounter != 0)
+    {
+        pPTPStatus->clock_state = CLK_NO_SIGNAL;
+    }
+    else
+    {
+        unsigned int e, n = smp_load_acquire(&self->m_uNumEngines);
+        bool any_saturated = false, any_acquiring = false;
+        for (e = 0; e < n; e++)
+        {
+            TTicEngine* pEngine = self->m_apEngines[e];
+            if (!pEngine || !pEngine->m_bAudioFrameTICTimerStarted)
+                continue;
+            if (tic_engine_is_saturated(pEngine))
+                any_saturated = true;
+            else if (pEngine->m_usTICLockCounter != 0)
+                any_acquiring = true;
+        }
+        pPTPStatus->clock_state = any_saturated ? CLK_SATURATED
+                                : any_acquiring ? CLK_ACQUIRING
+                                : CLK_LOCKED;
+    }
+
     pPTPStatus->i64GMRateOffsetPPB = GetGMRateOffsetPPB(self);
     pPTPStatus->ui8GMPriority1 = self->m_PTPMaster_Announce.Priority1;
     pPTPStatus->ui8GMClockClass = self->m_PTPMaster_Announce.GrandmasterClockQuality.ui8ClockClass;

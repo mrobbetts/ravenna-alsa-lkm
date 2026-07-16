@@ -180,8 +180,19 @@ struct TPCMStatus
      * reason for unlockedness: 0 stopped / 1 no-signal / 2 acquiring / 3 locked
      * / 4 saturated (GM beyond steering range, untrackable). Supersedes
      * nTICLockStatus (kept for wire compat), which cannot distinguish
-     * acquiring from saturated. */
+     * acquiring from saturated. NOTE (slice 3b): clock-source health is a
+     * domain-level fact — the DOMAIN composite in TPTPStatus is what UIs
+     * should colour by; this per-PCM copy is the engine's own state, useful
+     * as detail (tooltips, per-rate acquiring transients). */
     int32_t clock_state;
+    /* W16 slice 3b (appended): engine-local EXECUTION health — is this PCM's
+     * tick engine meeting its own schedule? Meaningful regardless of clock
+     * state (a free-wheeling engine still ticks and services clients, W17).
+     * tick_period_us = the engine's nominal tick period; us_since_last_tick =
+     * elapsed since the last hrtimer tick ran. ticking ⇔ since ≲ a few
+     * periods. Both 0 when the engine is stopped. */
+    uint32_t tick_period_us;
+    uint32_t us_since_last_tick;
 };
 
 struct MT_ALSA_msg

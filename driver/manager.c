@@ -1800,6 +1800,8 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             pcmStatus.live_rate = 0;     /* W28: kernel-truth live + armed rate */
             pcmStatus.pending_rate = 0;
             pcmStatus.clock_state = CLK_STOPPED;  /* W16 slice 3 */
+            pcmStatus.tick_period_us = 0;         /* W16 slice 3b */
+            pcmStatus.us_since_last_tick = 0;
             if (pcm_id >= 0 && pcm_id < MAX_PCMS)
             {
                 struct tic_timer_entry* entry =
@@ -1807,12 +1809,27 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
                 void* chip = get_chip_by_pcm_id(self, pcm_id);
                 if (entry)
                 {
-                    pcmStatus.nTICLockStatus =
-                        tic_engine_lock_status(active_engine_of(entry));
-                    /* W16 slice 3: the canonical state (with the unlock REASON)
-                     * from the same active engine. */
-                    pcmStatus.clock_state =
-                        tic_engine_clock_state(active_engine_of(entry));
+                    TTicEngine* eng = active_engine_of(entry);
+                    pcmStatus.nTICLockStatus = tic_engine_lock_status(eng);
+                    /* W16 slice 3: the engine's state (with the unlock REASON).
+                     * Detail only — the domain composite in TPTPStatus is the
+                     * clock-source truth UIs should colour by. */
+                    pcmStatus.clock_state = tic_engine_clock_state(eng);
+                    /* W16 slice 3b: engine-local EXECUTION health — is the tick
+                     * meeting its own schedule? Meaningful regardless of clock
+                     * state (a free-wheeling engine still ticks, W17). Unlocked
+                     * u64 reads on 64-bit, status-reporting discipline. */
+                    if (eng->m_bAudioFrameTICTimerStarted)
+                    {
+                        uint64_t now_ns, since_us;
+                        uint64_t last_us = eng->m_ui64TIC_LastRTXClockTime * 100; /* [100us]->[us] */
+                        get_clock_time(&now_ns);
+                        since_us = now_ns / 1000 > last_us ? now_ns / 1000 - last_us : 0;
+                        pcmStatus.tick_period_us =
+                            (uint32_t)(eng->m_dTIC_BasePeriod / 1000000ULL); /* [ps]->[us] */
+                        pcmStatus.us_since_last_tick =
+                            since_us > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (uint32_t)since_us;
+                    }
                 }
                 if (chip && fe)
                 {
