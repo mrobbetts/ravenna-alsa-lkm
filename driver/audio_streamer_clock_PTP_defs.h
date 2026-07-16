@@ -82,6 +82,12 @@ typedef struct
 	uint8_t         ui8GMPriority2;
 	uint16_t        ui16GMStepsRemoved;
 	uint8_t         ui8GMTimeSource;
+	/* W16 slice 3b (bench review): clock-source health is a DOMAIN-level fact —
+	 * the GM + servo, one truth for every PCM on the domain. EClockState
+	 * composite: NO_SIGNAL (PTP unlocked) / SATURATED (any engine railed by the
+	 * GM) / ACQUIRING (any engine converging) / LOCKED. The per-PCM status
+	 * carries engine-local execution health instead (see TPCMStatus). */
+	int32_t         clock_state;
 } TPTPStatus;
 
 typedef struct
