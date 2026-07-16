@@ -176,6 +176,12 @@ struct TPCMStatus
      * preserve wire layout — older readers that stop at nTICLockStatus still work. */
     uint32_t live_rate;
     uint32_t pending_rate;
+    /* W16 slice 3 (appended): EClockState — the media-clock state WITH the
+     * reason for unlockedness: 0 stopped / 1 no-signal / 2 acquiring / 3 locked
+     * / 4 saturated (GM beyond steering range, untrackable). Supersedes
+     * nTICLockStatus (kept for wire compat), which cannot distinguish
+     * acquiring from saturated. */
+    int32_t clock_state;
 };
 
 struct MT_ALSA_msg

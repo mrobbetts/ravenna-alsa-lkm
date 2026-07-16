@@ -1798,14 +1798,21 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             pcmStatus.nTICLockStatus = PTPLS_UNLOCKED;
             pcmStatus.live_rate = 0;     /* W28: kernel-truth live + armed rate */
             pcmStatus.pending_rate = 0;
+            pcmStatus.clock_state = CLK_STOPPED;  /* W16 slice 3 */
             if (pcm_id >= 0 && pcm_id < MAX_PCMS)
             {
                 struct tic_timer_entry* entry =
                     smp_load_acquire(&self->m_apChipEntry[pcm_id]);
                 void* chip = get_chip_by_pcm_id(self, pcm_id);
                 if (entry)
+                {
                     pcmStatus.nTICLockStatus =
                         tic_engine_lock_status(active_engine_of(entry));
+                    /* W16 slice 3: the canonical state (with the unlock REASON)
+                     * from the same active engine. */
+                    pcmStatus.clock_state =
+                        tic_engine_clock_state(active_engine_of(entry));
+                }
                 if (chip && fe)
                 {
                     if (fe->get_pcm_sample_rate)

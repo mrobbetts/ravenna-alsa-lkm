@@ -199,6 +199,9 @@ EPTPLockStatus tic_engine_lock_status(TTicEngine* self);
  * and untrackable). Distinguishes a "saturated, not locked" engine from one that
  * is merely "acquiring" — both report PTPLS_LOCKING via lock_status. */
 bool tic_engine_is_saturated(TTicEngine* self);
+/* W16 slice 3: the canonical media-clock state (EClockState) — lock status WITH
+ * the reason for unlockedness. Single derivation site for the whole stack. */
+EClockState tic_engine_clock_state(TTicEngine* self);
 /* W17: read-and-clear the timeline-break latch (a large media-clock re-anchor).
  * Returns true once per re-anchor; the manager turns it into an ALSA xrun. */
 bool tic_engine_take_timeline_break(TTicEngine* self);

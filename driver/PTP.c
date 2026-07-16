@@ -839,6 +839,19 @@ void GetPTPStatus(TClock_PTP* self, TPTPStatus* pPTPStatus)
     pPTPStatus->nPTPLockStatus = GetLockStatus(self);
     pPTPStatus->ui64GMID[0] = self->m_ui64PTPMaster_GMID;
     pPTPStatus->i32NetworkJitter = 0; // TODO
+
+    /* W16 slice 3: the elected GM's Announce properties, verbatim, + the servo's
+     * GM-rate estimate. Unlocked reads of PKT-written fields (u8/u16 + the
+     * announce struct) — status reporting; worst case one transiently-stale
+     * field during a concurrent announce, same discipline as the GMID above. */
+    pPTPStatus->i64GMRateOffsetPPB = GetGMRateOffsetPPB(self);
+    pPTPStatus->ui8GMPriority1 = self->m_PTPMaster_Announce.Priority1;
+    pPTPStatus->ui8GMClockClass = self->m_PTPMaster_Announce.GrandmasterClockQuality.ui8ClockClass;
+    pPTPStatus->ui8GMClockAccuracy = self->m_PTPMaster_Announce.GrandmasterClockQuality.ui8ClockAccuracy;
+    pPTPStatus->ui16GMOffsetScaledLogVariance = MTAL_SWAP16(self->m_PTPMaster_Announce.GrandmasterClockQuality.ui16OffsetScaledLogVariance);
+    pPTPStatus->ui8GMPriority2 = self->m_PTPMaster_Announce.Priority2;
+    pPTPStatus->ui16GMStepsRemoved = MTAL_SWAP16(self->m_PTPMaster_Announce.ui16StepsRemoved);
+    pPTPStatus->ui8GMTimeSource = self->m_PTPMaster_Announce.ui8TimeSource;
 	/* W5: report the max clock jitter across this servo's engines and
 	 * reset each (per-engine stats become daemon-visible in W7). */
 	{

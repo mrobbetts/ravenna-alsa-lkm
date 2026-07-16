@@ -237,24 +237,26 @@ void tic_engine_steer(TTicEngine* self, uint64_t ui64T1)
         }
 
         // Proportional + integral part
-        dPhaseAdj = /*dProportional + */self->m_dTIC_IGR / 10; // we allow the integral part to correct up to +/- 150us for the coming half a second or +/- 300ppm
-
-        // limitor
-        dPhaseAdj = max(min(dPhaseAdj, 4000000LL), -4000000LL); // we allow the total correction up to +/- 1500us for the coming half a second or +/- 3000ppm
+        dPhaseAdj = /*dProportional + */self->m_dTIC_IGR / 10; // the leaky integral is the whole output: +/- 400ns period nudge per sync (~+/-370ppm at the 1ms tick) — the IGR bound above IS the steering-range limitor
 
         self->m_dTIC_CurrentPeriod += dPhaseAdj * 1000; // [ps]
 
-        // Lock detection
-        /* W16: gate lock on saturation FIRST. A railed servo (GM beyond range)
-         * must never claim lock, but dPhaseAdj (= IGR/10) is capped below the
-         * thresholds below, so the legacy branches can't catch it. */
+        /* Lock detection (W16 slice 3: honest form). The legacy dPhaseAdj
+         * thresholds were provably unreachable — dPhaseAdj = IGR/10 with the
+         * IGR clamped to +/-4,000,000 caps at +/-400,000, so the "< 800000"
+         * converging test was always true and the "> 1000000" lock-lost branch
+         * (and a second +/-4,000,000 limitor on dPhaseAdj itself) were dead
+         * code. What the ladder ACTUALLY implemented — and now states plainly —
+         * is: locked = TIC_LOCK_HYSTERESIS clean syncs while not saturated.
+         * Saturation (W16) is the one real "cannot track" signal; PTP loss
+         * re-arms the counter via ResetPTPLock. */
         if (self->m_usSaturatedCounter >= SATURATION_HYSTERESIS)
         {
             if (self->m_usTICLockCounter == 0)
                 printk("[nic %u dom %u] TIC saturated (rate %u) — GM beyond steering range, not locked\n", pServo->m_pEth_netfilter->nic_id, pServo->m_PTPConfig.ui8Domain, self->m_ui32SamplingRate);
             self->m_usTICLockCounter = TIC_LOCK_HYSTERESIS;
         }
-        else if (abs(dPhaseAdj) < 800000 && self->m_usTICLockCounter > 0)
+        else if (self->m_usTICLockCounter > 0)
         {
             self->m_usTICLockCounter--;
             if (self->m_usTICLockCounter == 0)
@@ -267,12 +269,6 @@ void tic_engine_steer(TTicEngine* self, uint64_t ui64T1)
                     printk("[nic %u dom %u] TIC locked (rate %u, period %llu.%03llu ms)\n", pServo->m_pEth_netfilter->nic_id, pServo->m_PTPConfig.ui8Domain, self->m_ui32SamplingRate, period_us / 1000, period_us % 1000);
                 }
             }
-        }
-        else if (abs(dPhaseAdj) > 1000000)
-        {
-            if (self->m_usTICLockCounter == 0)
-                printk("[%u] TIC lock lost (rate %u)\n", pServo->m_pEth_netfilter->nic_id, self->m_ui32SamplingRate);
-            self->m_usTICLockCounter = TIC_LOCK_HYSTERESIS;
         }
     } while (0);
 }
@@ -545,6 +541,27 @@ EPTPLockStatus tic_engine_lock_status(TTicEngine* self)
 bool tic_engine_is_saturated(TTicEngine* self)
 {
     return self->m_usSaturatedCounter >= SATURATION_HYSTERESIS;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+/* W16 slice 3: THE canonical media-clock state — the one derivation of "is this
+ * clock usable, and if not, why". Ordering is deliberate: a stopped engine says
+ * nothing about clocks; without PTP the saturation counter is stale (no Syncs
+ * feed the servo) so NO_SIGNAL outranks SATURATED; saturation then outranks
+ * ACQUIRING because a railed servo holds the lock counter re-armed forever —
+ * "converging" would be a lie. Reads are unlocked (u16/bool snapshots) — status
+ * reporting, same discipline as tic_engine_lock_status. */
+EClockState tic_engine_clock_state(TTicEngine* self)
+{
+    if (!self->m_bAudioFrameTICTimerStarted)
+        return CLK_STOPPED;
+    if (self->m_pServo->m_usPTPLockCounter != 0)
+        return CLK_NO_SIGNAL;
+    if (self->m_usSaturatedCounter >= SATURATION_HYSTERESIS)
+        return CLK_SATURATED;
+    if (self->m_usTICLockCounter != 0)
+        return CLK_ACQUIRING;
+    return CLK_LOCKED;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
