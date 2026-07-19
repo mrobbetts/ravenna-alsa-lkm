@@ -328,7 +328,12 @@ bool start(struct TManager* self)
     /* W5: per-entry engines + hrtimer. Entry metadata (tick_rate,
      * frame_size) already tracks m_SampleRate via UpdateFrameSize;
      * bResetPTPLock=true preserves the legacy StartAudioFrameTICTimer
-     * relock semantics on the start path. */
+     * relock semantics on the start path.
+     * K7 (2026-06 audit): under g_registry_lock — this sweep predates the
+     * second mutator context (APP pcm_close re-rate creates/frees entries
+     * under the lock); unlocked it could observe entry->active just before a
+     * final put and re-arm a just-cancelled hrtimer on a dead entry. */
+    mutex_lock(&g_registry_lock);
     for (t = 0; t < MAX_TIC_ENTRIES; t++)
     {
         struct tic_timer_entry* entry = &self->m_TicTimers[t];
@@ -336,6 +341,7 @@ bool start(struct TManager* self)
             continue;
         tic_entry_start(self, entry, true);
     }
+    mutex_unlock(&g_registry_lock);
     for (i = 0; i < _MAX_NICS; i++)
     {
         EnableEtherTube(&self->m_EthernetFilter[i], 1);
@@ -373,6 +379,8 @@ bool stop(struct TManager* self)
 
     {
         unsigned int t;
+        /* K7: under g_registry_lock — see start(). */
+        mutex_lock(&g_registry_lock);
         for (t = 0; t < MAX_TIC_ENTRIES; t++)
         {
             struct tic_timer_entry* entry = &self->m_TicTimers[t];
@@ -380,6 +388,7 @@ bool stop(struct TManager* self)
                 continue;
             tic_entry_stop(self, entry);
         }
+        mutex_unlock(&g_registry_lock);
     }
 
     self->m_bIsStarted = false;
@@ -580,6 +589,10 @@ void UpdateFrameSize(struct TManager* self)
      * the same nFS=8 frame as the DSD bit rate.) */
     {
         unsigned int t;
+        /* K7: under g_registry_lock — a concurrent APP-context re-rate
+         * (pcm_close latch apply) creates/frees entries; unlocked, this sweep
+         * could refresh a dying entry or miss a nascent one. */
+        mutex_lock(&g_registry_lock);
         for (t = 0; t < MAX_TIC_ENTRIES; t++)
         {
             struct tic_timer_entry* entry = &self->m_TicTimers[t];
@@ -591,6 +604,7 @@ void UpdateFrameSize(struct TManager* self)
                 self->m_MaxFrameSize);
             tic_entry_refresh_base_period(entry);
         }
+        mutex_unlock(&g_registry_lock);
     }
 }
 

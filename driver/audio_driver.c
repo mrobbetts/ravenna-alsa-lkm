@@ -738,6 +738,8 @@ static void mr_alsa_audio_unlock_capture_buffer(void *rawchip)
 
 static uint32_t mr_alsa_audio_get_pcm_frame_size(void *mr_alsa_audio_chip);
 static uint32_t mr_alsa_audio_get_pcm_sample_rate(void *mr_alsa_audio_chip);
+static void mr_alsa_audio_pcm_open_unwind(struct mr_alsa_audio_chip *chip,
+                                          struct snd_pcm_substream *substream);
 
 /// Driven by PTP Timer's interrupts
 static int mr_alsa_audio_pcm_interrupt(void *rawchip, int direction)
@@ -2466,6 +2468,7 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
     {
         printk("mr_alsa_audio_pcm_open: Unsupported sample rate (%u Hz)\n", runtime->rate);
         printk("unsuccessfully leaving mr_alsa_audio_pcm_open...\n");
+        mr_alsa_audio_pcm_open_unwind(chip, substream);  /* K5: ALSA won't close a failed open */
         return ret;
     }
     /// Sample rate constraint by format
@@ -2503,6 +2506,7 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
     {
         printk("mr_alsa_audio_pcm_open: Unsupported period size (%lu smp)\n", runtime->period_size);
         printk("unsuccessfully leaving mr_alsa_audio_pcm_open...\n");
+        mr_alsa_audio_pcm_open_unwind(chip, substream);  /* K5: ALSA won't close a failed open */
         return ret;
     }
 
@@ -2511,6 +2515,31 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
     return 0;
 }
 
+
+/* K5 (2026-06 audit): pcm_open publishes the substream pointer BEFORE the
+ * constraint calls, which can still fail — and ALSA does NOT call .close after
+ * a failed .open. Without an unwind the chip keeps a dangling substream whose
+ * runtime ALSA frees: pcm_is_idle reports busy forever (wedging the W15 armed
+ * latch until some later successful open) and the unlocked ring-length getters
+ * walk freed memory. Mirror close's clear-under-chip-lock discipline. */
+static void mr_alsa_audio_pcm_open_unwind(struct mr_alsa_audio_chip *chip,
+                                          struct snd_pcm_substream *substream)
+{
+    if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+    {
+        spin_lock_irq(&chip->playback_lock);
+        chip->playback_pid = -1;
+        chip->playback_substream = NULL;
+        spin_unlock_irq(&chip->playback_lock);
+    }
+    else if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+    {
+        spin_lock_irq(&chip->capture_lock);
+        chip->capture_pid = -1;
+        chip->capture_substream = NULL;
+        spin_unlock_irq(&chip->capture_lock);
+    }
+}
 
 /// close callback
 /// Obviously, this is called when a pcm substream is closed.
