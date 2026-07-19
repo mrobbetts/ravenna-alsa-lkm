@@ -1188,6 +1188,19 @@ void PrepareBufferLives(TRTP_audio_stream* self)
 		// Wrong RTP Seq id
 		bool bWrongRTPSeqId = self->m_ui32WrongRTPSeqIdCounter != self->m_ui32WrongRTPSeqIdLastCounter;
 		bool bSinkIsReceiving = self->m_ui32RTPPacketCounter != self->m_ui32RTPPacketLastCounter;
+
+		/* #32: the receive offset — last received timestamp (as SAC) minus the
+		 * local playout SAC, i.e. the live buffering margin in samples. Steady
+		 * ≈ the link offset when the sender shares our GM; a steady DRIFT means
+		 * the sender's media clock is not locked to ours (the VAD-freewheel
+		 * class) — surfaced so that condition is visible at a glance instead of
+		 * costing an evening of blind debugging. Same computation as the mute
+		 * path's delta above; 0 when nothing is arriving (a stale margin would
+		 * just be noise). */
+		self->m_StreamStatus.sink_receive_offset = bSinkIsReceiving
+			? (int32_t)(int64_t)(self->m_tRTPStream.m_ui64LastAudioSampleReceivedSAC -
+				pManager->get_global_SAC_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId))
+			: 0;
 		bool bWrontRTPSSRC = self->m_ui32WrongRTPSSRCCounter != self->m_ui32WrongRTPSSRCLastCounter;
 		bool bWrongRTPPayloadType = self->m_ui32WrongRTPPayloadTypeCounter != self->m_ui32WrongRTPPayloadTypeLastCounter;
 		bool bWrongRTPSAC = self->m_ui32WrongRTPSACCounter != self->m_ui32WrongRTPSACLastCounter;

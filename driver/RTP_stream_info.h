@@ -128,6 +128,14 @@ typedef struct {
 		unsigned int flags;
 	} u;
 	int sink_min_time; //  min packet arrival time
+	/* #32 (appended, pack(1) — older readers stop above): the sink's receive
+	 * offset in SAMPLES — last received RTP timestamp (mapped to SAC) minus the
+	 * local playout SAC. The buffering margin: steady ≈ the link offset when
+	 * sender and receiver share a GM; a steadily DRIFTING value means the
+	 * sender's media clock is not locked to ours (e.g. a freewheeling VAD) and
+	 * playback will garble when the margin crosses the ring. 0 when not
+	 * receiving. */
+	int32_t sink_receive_offset;
 } TRTP_stream_status;
 
 #pragma pack(pop)
