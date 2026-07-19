@@ -67,6 +67,7 @@ void tic_engine_init(TTicEngine* self, struct TClock_PTP_s* pServo)
      * (2026-06-11 review fix) — before the engine can report locked */
     self->m_usTICLockCounter = 0;
     self->m_bTimelineBreak = false;  /* W17 */
+    self->m_bSaturated = false;      /* W17b */
 
     self->m_uiTIC_DropCounter = 0;
     self->m_uiTIC_LastDropCounter = 0;
@@ -102,6 +103,7 @@ void tic_engine_reset(TTicEngine* self)
     self->m_dTIC_IGR = 0;
     self->m_usTICLockCounter = TIC_LOCK_HYSTERESIS;
     self->m_bTimelineBreak = false;  /* W17 */
+    self->m_bSaturated = false;      /* W17b */
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -239,6 +241,20 @@ void tic_engine_steer(TTicEngine* self, uint64_t ui64T1)
          * is: locked = TIC_LOCK_HYSTERESIS clean syncs while not saturated.
          * Saturation (W16) is the one real "cannot track" signal; PTP loss
          * re-arms the counter via ResetPTPLock. */
+        /* W17b: maintain the saturation latch (enter 500ppm / exit 250ppm
+         * around the GM-rate estimate). The raw threshold flapped at freewheel
+         * onset while the GM's crystal wandered through the band — each flip
+         * released the count clamp and re-anchored the timeline needlessly. */
+        {
+            int64_t ppb = pServo->m_i64GMRateOffsetPPB;
+            if (!self->m_bSaturated &&
+                (ppb > GM_SATURATION_PPB || ppb < -GM_SATURATION_PPB))
+                self->m_bSaturated = true;
+            else if (self->m_bSaturated &&
+                     ppb < GM_SATURATION_EXIT_PPB && ppb > -GM_SATURATION_EXIT_PPB)
+                self->m_bSaturated = false;
+        }
+
         if (tic_engine_is_saturated(self))
         {
             if (self->m_usTICLockCounter == 0)
@@ -300,8 +316,22 @@ void tic_engine_phase_init_from_locked(TTicEngine* self)
      * middle-band first tick (the 100us-grid sawtooth guarantees some at
      * 44.1k) free-runs from the true count, not from 0 — otherwise the
      * engine publishes a near-zero SAC until an edge-window tick snaps it
-     * by ~1e14 samples. */
-    self->m_ui64LastTIC_Count = ui64Samples / self->m_ui32FrameSize;
+     * by ~1e14 samples.
+     * W17b (bench 2026-07-19): this reseed IS a re-anchor — it used to
+     * overwrite the count silently, bypassing tick_advance's break detector
+     * entirely, so a relock-path timeline jump never xrun'd the clients.
+     * Latch the break here when the seed moves the count materially. */
+    {
+        uint64_t ui64NewCount = ui64Samples / self->m_ui32FrameSize;
+        if (self->m_ui64LastTIC_Count != 0)
+        {
+            int64_t step = (int64_t)ui64NewCount - (int64_t)self->m_ui64LastTIC_Count;
+            if (step < -(int64_t)TIMELINE_BREAK_FRAMES ||
+                step > (int64_t)TIMELINE_BREAK_FRAMES)
+                self->m_bTimelineBreak = true;
+        }
+        self->m_ui64LastTIC_Count = ui64NewCount;
+    }
 
     /* +5 periods of margin, multiply BEFORE the [ps -> 100us] divide
      * exactly like the prelock branch (2026-06-11 review fix: the
@@ -535,11 +565,9 @@ EPTPLockStatus tic_engine_lock_status(TTicEngine* self)
 bool tic_engine_is_saturated(TTicEngine* self)
 {
     struct TClock_PTP_s* pServo = self->m_pServo;
-    int64_t ppb;
     if (pServo->m_usPTPLockCounter != 0)
         return false;
-    ppb = pServo->m_i64GMRateOffsetPPB;
-    return ppb > GM_SATURATION_PPB || ppb < -GM_SATURATION_PPB;
+    return self->m_bSaturated;  /* W17b: hysteresis latch, maintained in steer */
 }
 
 ///////////////////////////////////////////////////////////////////////////////
