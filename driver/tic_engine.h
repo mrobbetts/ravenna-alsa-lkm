@@ -55,6 +55,12 @@
  * broken ones >±10,000ppm). The estimate's EMA is the hysteresis: onset crosses
  * the threshold within a sync; recovery decays it over ~4 s. */
 #define GM_SATURATION_PPB 500000LL
+/* W17b (bench 2026-07-19): exit threshold for the saturation LATCH. The raw
+ * |estimate| > threshold predicate flapped at freewheel onset while the GM's
+ * crystal settled through the band (saturated -> "locked" -> saturated within
+ * 15 min, each flip re-anchoring the count); enter/exit hysteresis makes the
+ * state sticky across the wander. */
+#define GM_SATURATION_EXIT_PPB 250000LL
 /* W17: a per-tick count step (deviation from a normal +1 frame advance) larger
  * than this is a media-clock RE-ANCHOR, not scheduling jitter — the GM returning
  * after an outage, or the saturation clamp releasing on freewheel recovery. ~64
@@ -97,6 +103,11 @@ typedef struct TTicEngine_s
 
     /* TIC frame */
     uint16_t m_usTICLockCounter; /* == 0 means that TIC frame PLL reached the lock state */
+    /* W17b: the saturation latch — set/cleared in tic_engine_steer (under the
+     * servo lock) with GM_SATURATION_PPB / _EXIT_PPB hysteresis around the
+     * servo's GM-rate estimate. Survives a PTP flap on purpose: the clamp
+     * re-engages the instant the servo relocks onto the same freewheeler. */
+    bool m_bSaturated;
     /* W17: latched when the tick count re-anchors by more than TIMELINE_BREAK_
      * FRAMES (a GM returning after an outage, or the saturation clamp releasing).
      * The manager consumes it and xruns the open substreams so clients re-prepare

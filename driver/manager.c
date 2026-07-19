@@ -2774,9 +2774,14 @@ static void service_entry_alsa_chips(struct TManager* self, struct tic_timer_ent
             frontend->pcm_interrupt(chip, 0);
         /* W17: the media clock re-anchored this tick — xrun the open substreams
          * so the client re-prepares onto the new timeline (re-derives its ring
-         * alignment from the new SAC) instead of playing garbled audio. */
+         * alignment from the new SAC) instead of playing garbled audio. The
+         * printk makes delivery auditable — its ABSENCE around a re-anchor in
+         * the journal is what exposed the W17 delivery holes. */
         if (xrun && frontend->pcm_xrun)
+        {
+            printk(KERN_INFO "pcm %u: media clock re-anchored — forcing xrun so clients re-align\n", i);
             frontend->pcm_xrun(chip);
+        }
     }
 }
 
@@ -2920,8 +2925,13 @@ static void manager_audio_frame_tic(struct TManager* self, struct tic_timer_entr
          * (that lockstep is exactly what prevents garbled audio when the clock
          * relocks). Capture reads the mute-scrubbed live-in buffer, i.e. silence,
          * from the PrepareBufferLives pass above. Without this the pointer freezes
-         * and a held-open client (CamillaDSP) stalls until a manual restart. */
-        service_entry_alsa_chips(self, entry, false);
+         * and a held-open client (CamillaDSP) stalls until a manual restart.
+         * W17b (bench 2026-07-19): deliver the timeline-break xrun HERE TOO —
+         * re-anchors happen precisely while not locked (recovery is still
+         * ACQUIRING for the lock hysteresis), so discarding the latch in this
+         * branch ate every real break: an 11-hour freewheel snapped back ~48M
+         * samples with no xrun and Camilla played garble off the old cursor. */
+        service_entry_alsa_chips(self, entry, timeline_break);
     }
 }
 
