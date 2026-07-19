@@ -66,7 +66,6 @@ void tic_engine_init(TTicEngine* self, struct TClock_PTP_s* pServo)
      * path, explicitly by tic_entry_start on the no-reset AddPCM path
      * (2026-06-11 review fix) — before the engine can report locked */
     self->m_usTICLockCounter = 0;
-    self->m_usSaturatedCounter = 0;  /* W16 */
     self->m_bTimelineBreak = false;  /* W17 */
 
     self->m_uiTIC_DropCounter = 0;
@@ -102,7 +101,6 @@ void tic_engine_reset(TTicEngine* self)
 {
     self->m_dTIC_IGR = 0;
     self->m_usTICLockCounter = TIC_LOCK_HYSTERESIS;
-    self->m_usSaturatedCounter = 0;  /* W16 */
     self->m_bTimelineBreak = false;  /* W17 */
 }
 
@@ -220,21 +218,12 @@ void tic_engine_steer(TTicEngine* self, uint64_t ui64T1)
         self->m_dTIC_IGR = ((self->m_dTIC_IGR + dProportional) * 95) / 100; // [ps]
         self->m_dTIC_IGR = max(min(self->m_dTIC_IGR, 4000000LL), -4000000LL); // integral part is bound to +/- 4us which corresponds to +/- 400ns in the formula below
 
-        /* W16: the integrator pinned at its bound == the servo is railed: the GM
-         * is beyond our steering range and we cannot track it. This is the real
-         * "can't track" signal — dPhaseAdj below is IGR/10, capped well under the
-         * lock thresholds, so it can never reflect a railed servo (which is why
-         * the engine used to claim lock to a freewheeling GM). Track it with
-         * hysteresis; the integrator's leak un-winds a transient quickly. */
-        if (self->m_dTIC_IGR >= 4000000LL || self->m_dTIC_IGR <= -4000000LL)
-        {
-            if (self->m_usSaturatedCounter < SATURATION_HYSTERESIS)
-                self->m_usSaturatedCounter++;
-        }
-        else if (self->m_usSaturatedCounter > 0)
-        {
-            self->m_usSaturatedCounter--;
-        }
+        /* W16 (revised on bench): saturation is NOT detected here. The phase
+         * error above is folded modulo the TIC frame, so an untrackable GM
+         * (e.g. a −25,000ppm freewheel) aliases into bounded sign-flipping
+         * samples — the integrator random-walks and never sustains its rail.
+         * The honest untrackability signal is the PTP servo's measured GM rate
+         * offset vs the steering authority: tic_engine_is_saturated(). */
 
         // Proportional + integral part
         dPhaseAdj = /*dProportional + */self->m_dTIC_IGR / 10; // the leaky integral is the whole output: +/- 400ns period nudge per sync (~+/-370ppm at the 1ms tick) — the IGR bound above IS the steering-range limitor
@@ -250,10 +239,10 @@ void tic_engine_steer(TTicEngine* self, uint64_t ui64T1)
          * is: locked = TIC_LOCK_HYSTERESIS clean syncs while not saturated.
          * Saturation (W16) is the one real "cannot track" signal; PTP loss
          * re-arms the counter via ResetPTPLock. */
-        if (self->m_usSaturatedCounter >= SATURATION_HYSTERESIS)
+        if (tic_engine_is_saturated(self))
         {
             if (self->m_usTICLockCounter == 0)
-                printk("[nic %u dom %u] TIC saturated (rate %u) — GM beyond steering range, not locked\n", pServo->m_pEth_netfilter->nic_id, pServo->m_PTPConfig.ui8Domain, self->m_ui32SamplingRate);
+                printk("[nic %u dom %u] TIC saturated (rate %u) — GM %lld ppb beyond steering range, not locked\n", pServo->m_pEth_netfilter->nic_id, pServo->m_PTPConfig.ui8Domain, self->m_ui32SamplingRate, pServo->m_i64GMRateOffsetPPB);
             self->m_usTICLockCounter = TIC_LOCK_HYSTERESIS;
         }
         else if (self->m_usTICLockCounter > 0)
@@ -302,7 +291,6 @@ void tic_engine_phase_init_from_locked(TTicEngine* self)
     self->m_dTIC_CurrentPeriod = self->m_dTIC_BasePeriod;
     self->m_dTIC_IGR = 0;
     self->m_usTICLockCounter = TIC_LOCK_HYSTERESIS;
-    self->m_usSaturatedCounter = 0;  /* W16 */
     self->m_bTimelineBreak = false;  /* W17 */
 
     self->m_ui64TIC_LastRTXClockTime = ui64Now;
@@ -402,18 +390,20 @@ void tic_engine_tick_advance(TTicEngine* self, TTicEngineTickCtx* pCtx)
          * per tick and steps within it, so a held/flat SAC would make it re-emit
          * the same range -> a backward step at the tick boundary).
          *
-         * CRUCIAL: gate this on the rail (m_usSaturatedCounter > 0). Once the GM
-         * is trackable AGAIN, do NOT clamp — follow the GM directly (ui64Q),
-         * re-anchoring even if that steps the count back. The clamp is a forward
-         * ratchet; left ungated it NEVER re-syncs, so the forward drift it
-         * accumulates during a freewheel becomes a PERMANENT timestamp offset that
-         * outlives the freewheel (receiver: a huge fixed offset / "out of bound"
-         * long after the GM recovered). The re-anchor is a one-time re-sync at
-         * recovery, which receivers expect; a stuck offset is forever. The gate
-         * counter increments on the first railed Sync (immediate protection — no
-         * onset leak) and decays over SATURATION_HYSTERESIS clean Syncs (no flap
-         * at the rail boundary), releasing the clamp shortly after recovery. */
-        if (self->m_usSaturatedCounter > 0 &&
+         * CRUCIAL: gate this on saturation. Once the GM is trackable AGAIN, do
+         * NOT clamp — follow the GM directly (ui64Q), re-anchoring even if that
+         * steps the count back. The clamp is a forward ratchet; left ungated it
+         * NEVER re-syncs, so the forward drift it accumulates during a freewheel
+         * becomes a PERMANENT timestamp offset that outlives the freewheel
+         * (receiver: a huge fixed offset / "out of bound" long after the GM
+         * recovered). The re-anchor is a one-time re-sync at recovery, which
+         * receivers expect; a stuck offset is forever. Saturation is the
+         * |measured GM rate| > authority predicate (bench-revised: the aliased
+         * phase error can't rail the IGR): its EMA crosses the threshold within
+         * one Sync of freewheel onset (near-immediate protection) and decays
+         * over ~4 s after recovery, releasing the clamp for the re-anchor.
+         * Reads the servo's estimate under m_csPTPTime — held here. */
+        if (tic_engine_is_saturated(self) &&
             ui64CurrentTICCount <= self->m_ui64LastTIC_Count)
             ui64CurrentTICCount = self->m_ui64LastTIC_Count + 1;
 
@@ -535,21 +525,30 @@ EPTPLockStatus tic_engine_lock_status(TTicEngine* self)
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-/* W16: the media servo is railed — the GM is beyond our steering range and
- * untrackable. Combined with lock_status, lets a consumer distinguish
- * "saturated (GM too far off)" from "acquiring (converging)". */
+/* W16 (revised on bench): the GM is UNTRACKABLE — its measured rate offset is
+ * beyond the media servo's steering authority. Judged from the PTP servo's
+ * T2−T1-slope estimate, NOT the integrator: the frame-folded phase error
+ * aliases under a fast freewheel, so the IGR never sustains its rail (a
+ * −25,810ppm Digiface freewheel read "locked" on the bench). Requires
+ * PTP-locked — without Syncs the estimate is stale and NO_SIGNAL is the truth.
+ * A servo-level fact: every engine on the domain agrees by construction. */
 bool tic_engine_is_saturated(TTicEngine* self)
 {
-    return self->m_usSaturatedCounter >= SATURATION_HYSTERESIS;
+    struct TClock_PTP_s* pServo = self->m_pServo;
+    int64_t ppb;
+    if (pServo->m_usPTPLockCounter != 0)
+        return false;
+    ppb = pServo->m_i64GMRateOffsetPPB;
+    return ppb > GM_SATURATION_PPB || ppb < -GM_SATURATION_PPB;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 /* W16 slice 3: THE canonical media-clock state — the one derivation of "is this
  * clock usable, and if not, why". Ordering is deliberate: a stopped engine says
- * nothing about clocks; without PTP the saturation counter is stale (no Syncs
+ * nothing about clocks; without PTP the GM-rate estimate is stale (no Syncs
  * feed the servo) so NO_SIGNAL outranks SATURATED; saturation then outranks
- * ACQUIRING because a railed servo holds the lock counter re-armed forever —
- * "converging" would be a lie. Reads are unlocked (u16/bool snapshots) — status
+ * ACQUIRING because a saturated servo holds the lock counter re-armed forever —
+ * "converging" would be a lie. Reads are unlocked (word snapshots) — status
  * reporting, same discipline as tic_engine_lock_status. */
 EClockState tic_engine_clock_state(TTicEngine* self)
 {
@@ -557,7 +556,7 @@ EClockState tic_engine_clock_state(TTicEngine* self)
         return CLK_STOPPED;
     if (self->m_pServo->m_usPTPLockCounter != 0)
         return CLK_NO_SIGNAL;
-    if (self->m_usSaturatedCounter >= SATURATION_HYSTERESIS)
+    if (tic_engine_is_saturated(self))
         return CLK_SATURATED;
     if (self->m_usTICLockCounter != 0)
         return CLK_ACQUIRING;

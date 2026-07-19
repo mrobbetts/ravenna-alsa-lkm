@@ -43,9 +43,18 @@
 #define NS_2_REF_UNIT 100000    /* ns is the linux time unit */
 
 #define TIC_LOCK_HYSTERESIS 5
-/* W16: consecutive railed-integrator observations before the servo is declared
- * SATURATED (and de-saturated). Hysteresis so a transient rail doesn't flap it. */
-#define SATURATION_HYSTERESIS 5
+/* W16 (revised on bench): a GM whose measured rate offset exceeds this is
+ * UNTRACKABLE — beyond the media servo's steering authority (the IGR bound
+ * allows ~±370-400ppm of period nudge) — so the engine is SATURATED. Detected
+ * from the PTP servo's GM-rate ESTIMATE (the T2−T1 slope), NOT from the
+ * integrator railing: the phase error feeding the IGR is folded modulo the TIC
+ * frame, so a fast freewheel (~25,000ppm) aliases into bounded sign-flipping
+ * samples that random-walk the integrator — it never sustains the rail (bench:
+ * a −25,810ppm Digiface freewheel read "locked"). 500ppm sits above the
+ * steering authority and far below any real freewheel (healthy GMs are <±50ppm,
+ * broken ones >±10,000ppm). The estimate's EMA is the hysteresis: onset crosses
+ * the threshold within a sync; recovery decays it over ~4 s. */
+#define GM_SATURATION_PPB 500000LL
 /* W17: a per-tick count step (deviation from a normal +1 frame advance) larger
  * than this is a media-clock RE-ANCHOR, not scheduling jitter — the GM returning
  * after an outage, or the saturation clamp releasing on freewheel recovery. ~64
@@ -88,10 +97,6 @@ typedef struct TTicEngine_s
 
     /* TIC frame */
     uint16_t m_usTICLockCounter; /* == 0 means that TIC frame PLL reached the lock state */
-    /* W16: hysteresis counter for the railed-integrator (saturated) state. At
-     * SATURATION_HYSTERESIS the servo is railed — the GM is beyond our steering
-     * range and we cannot track it (so we must not claim lock). */
-    uint16_t m_usSaturatedCounter;
     /* W17: latched when the tick count re-anchors by more than TIMELINE_BREAK_
      * FRAMES (a GM returning after an outage, or the saturation clamp releasing).
      * The manager consumes it and xruns the open substreams so clients re-prepare
@@ -195,9 +200,9 @@ void tic_engine_set_next_abs_time(TTicEngine* self, uint64_t ui64NextAbsoluteTim
  * TIC lock. With one engine per servo this is exactly the old
  * GetLockStatus(). */
 EPTPLockStatus tic_engine_lock_status(TTicEngine* self);
-/* W16: true when the media servo is railed (the GM is beyond our steering range
- * and untrackable). Distinguishes a "saturated, not locked" engine from one that
- * is merely "acquiring" — both report PTPLS_LOCKING via lock_status. */
+/* W16 (revised): the GM is beyond the servo's steering authority — PTP-locked
+ * with |measured GM rate offset| > GM_SATURATION_PPB. A servo-level fact (all
+ * of a domain's engines agree), read via the engine for call-site convenience. */
 bool tic_engine_is_saturated(TTicEngine* self);
 /* W16 slice 3: the canonical media-clock state (EClockState) — lock status WITH
  * the reason for unlockedness. Single derivation site for the whole stack. */
