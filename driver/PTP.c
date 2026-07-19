@@ -525,6 +525,12 @@ void ResetPTPMaster(TClock_PTP* self)
     self->m_ui64PTPMaster_AnnounceTime = 0;
     self->m_ui64PTPMaster_ClockIdentity = 0;
     self->m_ui64PTPMaster_GMID = 0;
+    /* W16 (revised): a NEW grandmaster's rate has nothing to do with the old
+     * one's — zero the estimator so saturation (|estimate| > authority) is
+     * judged fresh, not carried over from a departed freewheeler. */
+    self->m_i64GMRateOffsetPPB = 0;
+    self->m_i64PrevOffset = 0;
+    self->m_ui64PrevOffsetT2 = 0;
 }
 //######################################################
 
@@ -559,6 +565,12 @@ void ProcessT1(TClock_PTP* self, uint64_t ui64T1)
 					for (e = 0; e < self->m_uNumEngines; e++)
 						if (self->m_apEngines[e])
 							tic_engine_prelock_phase_init(self->m_apEngines[e], ui64T1, ui64DeltaT1);
+					/* W16 (revised): the offset re-anchors across a relock, so
+					 * the previous slope sample is meaningless (its d_offset
+					 * spans the outage) — drop it. The EMA itself is kept: its
+					 * decay is the saturation hysteresis. */
+					self->m_i64PrevOffset = 0;
+					self->m_ui64PrevOffsetT2 = 0;
 				}
 			}
 		}
