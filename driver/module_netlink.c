@@ -34,6 +34,8 @@
 #include <linux/netlink.h>
 #include <linux/string.h>
 #include <linux/version.h>
+#include <linux/mutex.h>     /* K6: k2u transaction serialization */
+#include <linux/spinlock.h>  /* K6: slot/flag consistency vs the reply path */
 
 #include "module_main.h"
 #include "module_netlink.h"
@@ -141,18 +143,34 @@ int send_reply_to_user_land(struct MT_ALSA_msg* msg)
     return 0;
 }
 
+/* K6 (2026-06 audit): the K2U request/response slot used to be a bare global —
+ * concurrent senders (netlink handler, pcm_open's volume query, pcm_close's
+ * rate-applied notify, kcontrol .put — all process context) overwrote each
+ * other's slot and stole each other's wakeups, and a LATE reply (after a
+ * sender's timeout) scribbled into the dead sender's stack rx_msg and then
+ * satisfied the NEXT waiter with the wrong payload. Two locks close it:
+ *  - k2u_transaction_mutex serializes whole transactions (arm -> send -> wait
+ *    -> disarm), so exactly one request is ever in flight;
+ *  - k2u_slot_lock makes slot+flag updates atomic against the receiver (which
+ *    runs in the daemon's sendmsg context): a reply finding the slot DISARMED
+ *    (sender gone: timeout/interrupt/send-failure) is dropped, not written
+ *    through a stale pointer, and cannot wake a future waiter. */
+static DEFINE_MUTEX(k2u_transaction_mutex);
+static DEFINE_SPINLOCK(k2u_slot_lock);
 struct MT_ALSA_msg* response_from_user_land;
 void recv_reply_from_user_land(struct sk_buff *skb)
 {
     struct nlmsghdr *nlh;
     struct MT_ALSA_msg* msg;
+    bool delivered = false;
 
     nlh = (struct nlmsghdr*)skb->data;
 	msg = (struct MT_ALSA_msg*)nlmsg_data(nlh);
+	spin_lock(&k2u_slot_lock);
 	if (response_from_user_land)
 	{
-		//we do not overwrite the pointer of the data, since we use it to copy the replied data 
-		memcpy(response_from_user_land, msg, sizeof(struct MT_ALSA_msg) - sizeof(((struct MT_ALSA_msg*)0)->data)); 
+		//we do not overwrite the pointer of the data, since we use it to copy the replied data
+		memcpy(response_from_user_land, msg, sizeof(struct MT_ALSA_msg) - sizeof(((struct MT_ALSA_msg*)0)->data));
 		if (msg->dataSize && msg->errCode < 0)
 		{
 			// check if the given size if sufficient to copy the answered data
@@ -174,14 +192,20 @@ void recv_reply_from_user_land(struct sk_buff *skb)
 				response_from_user_land->errCode = -302;
 			}
 		}
+		have_response = 1;
+		delivered = true;
 	}
+	spin_unlock(&k2u_slot_lock);
+
+	if (!delivered)
+		printk(KERN_WARNING "Dropping late/unsolicited netlink reply (fct %s)\n", __FUNCTION__);
     if (msg->errCode < 0)
     {
         printk(KERN_ERR "Received reply message with error code %d in fct %s\n", msg->errCode, __FUNCTION__);
     }
 
-    have_response = 1;
-    wake_up_all(&response_waitqueue);
+    if (delivered)
+        wake_up_all(&response_waitqueue);
 }
 
 int send_msg_to_user_land(struct MT_ALSA_msg* tx_msg, struct MT_ALSA_msg* rx_msg)
@@ -214,32 +238,47 @@ int send_msg_to_user_land(struct MT_ALSA_msg* tx_msg, struct MT_ALSA_msg* rx_msg
         memcpy((char*)nlmsg_data(nlh) + msg_header_size, tx_msg->data, tx_msg->dataSize);
     }
 
-	response_from_user_land = rx_msg;
+    /* K6: one transaction at a time; arm the slot under the slot lock, disarm
+     * it before returning on EVERY path so a late reply can never write
+     * through a stale pointer or wake a future waiter. */
+    mutex_lock(&k2u_transaction_mutex);
+    spin_lock(&k2u_slot_lock);
+    have_response = 0;
+    response_from_user_land = rx_msg;
+    spin_unlock(&k2u_slot_lock);
+
     res = nlmsg_unicast(nl_k2u_sk, skb_out, daemon_pid_);
     if (res < 0)
     {
         printk(KERN_INFO "Error (%d) while sending to user in fct %s\n", res, __FUNCTION__);
-        return res;
     }
     else
     {
         res = wait_event_interruptible_timeout(response_waitqueue, have_response, usecs_to_jiffies(1000000)); //wait until response is received
-        have_response = 0;
         if (res == 0)
         {
             printk(KERN_INFO "Netlink message response timeout\n");
+            res = -1;
         }
         else if (res > 0)
         {
-            // condition meet
-            return 0;
+            // condition met
+            res = 0;
         }
         else
         {
             printk(KERN_INFO "Netlink message response interrupted\n");
+            res = -1;
         }
     }
-    return -1;
+
+    spin_lock(&k2u_slot_lock);
+    response_from_user_land = NULL;
+    have_response = 0;
+    spin_unlock(&k2u_slot_lock);
+    mutex_unlock(&k2u_transaction_mutex);
+
+    return res < 0 ? -1 : 0;
 }
 
 int setup_netlink(void)
