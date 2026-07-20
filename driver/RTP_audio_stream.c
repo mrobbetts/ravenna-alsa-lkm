@@ -1193,14 +1193,19 @@ void PrepareBufferLives(TRTP_audio_stream* self)
 		 * local playout SAC, i.e. the live buffering margin in samples. Steady
 		 * ≈ the link offset when the sender shares our GM; a steady DRIFT means
 		 * the sender's media clock is not locked to ours (the VAD-freewheel
-		 * class) — surfaced so that condition is visible at a glance instead of
-		 * costing an evening of blind debugging. Same computation as the mute
-		 * path's delta above; 0 when nothing is arriving (a stale margin would
-		 * just be noise). */
-		self->m_StreamStatus.sink_receive_offset = bSinkIsReceiving
-			? (int32_t)(int64_t)(self->m_tRTPStream.m_ui64LastAudioSampleReceivedSAC -
-				pManager->get_global_SAC_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId))
-			: 0;
+		 * class). Update ONLY on ticks that actually saw a packet and HOLD it
+		 * otherwise: bSinkIsReceiving is a per-TICK arrival test, and at packet
+		 * cadences near the tick rate (a 44.1k/48spp sender = 919 pkt/s vs the
+		 * 919 Hz tick) it aliases ~50/50 — zeroing on empty ticks made the
+		 * reported margin flap 0<->real and poisoned drift baselines downstream
+		 * (bench 2026-07-19: VAD sink read "+398.8 ppm" = 528 smp / 30 s of
+		 * baseline error; the 3000 pkt/s Digiface sink was rock solid). A held
+		 * value while the stream dies is inert: consumers gate on the
+		 * accumulated receiving flag, which goes false over a full window. */
+		if (bSinkIsReceiving)
+			self->m_StreamStatus.sink_receive_offset =
+				(int32_t)(int64_t)(self->m_tRTPStream.m_ui64LastAudioSampleReceivedSAC -
+					pManager->get_global_SAC_for_pcm(pManager->user, pRTP_stream_info->m_uiPCMId));
 		bool bWrontRTPSSRC = self->m_ui32WrongRTPSSRCCounter != self->m_ui32WrongRTPSSRCLastCounter;
 		bool bWrongRTPPayloadType = self->m_ui32WrongRTPPayloadTypeCounter != self->m_ui32WrongRTPPayloadTypeLastCounter;
 		bool bWrongRTPSAC = self->m_ui32WrongRTPSACCounter != self->m_ui32WrongRTPSACLastCounter;
