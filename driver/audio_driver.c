@@ -255,8 +255,13 @@ struct mr_alsa_audio_chip
      * rate. While armed the chip keeps running at its live rate; close() applies
      * the re-key (re-rate to pending_rate) once the chip goes idle. The PCM Rate
      * kcontrol reports pending_rate (the target) while armed so a follower
-     * reopens at it. Written in netlink/process context only (never softirq). */
+     * reopens at it. Written in netlink/process context only (never softirq).
+     * §4.3: every transition goes through mr_alsa_audio_pcm_rate_latch — the
+     * single owner; read with READ_ONCE (mixed NL/APP readers). */
     uint32_t pending_rate;
+    /* §4.3: one-shot claim for the close-path apply, so exactly one closer
+     * fires the latch even if ALSA's open_mutex serialization ever changes. */
+    unsigned long rate_latch_firing;
 
     /* W9 #14: per-PCM advisory ALSA latency (frames), latched into
      * runtime->delay at prepare() so snd_pcm_delay() reports this chip's own
@@ -1040,6 +1045,55 @@ static bool mr_alsa_audio_get_io_state(void *mr_alsa_audio_chip, bool is_playbac
  * by tearing down the timer for the old rate before publishing the new
  * one).
  */
+/* §4.3 (audit rec 3): the W15 armed re-rate latch — ONE transition owner.
+ * States: DISARMED (pending_rate == 0) / ARMED (== target). The four write
+ * sites the audit found (arm, cancel, already-at-target, satisfied-disarm)
+ * now funnel here, with the kcontrol-notify rule explicit: the control
+ * reports (pending ? pending : live), so ARM/CANCEL change the reported
+ * value and notify; SATISFIED swaps an armed target for an equal live rate —
+ * value unchanged, no event (the live-rate change itself is notified by the
+ * rate-publish chokepoint). Process/netlink context only. */
+enum pcm_rate_latch_event {
+    PCM_LATCH_ARM,       /* busy chip: arm the target (SetPCMRate -EBUSY path) */
+    PCM_LATCH_CANCEL,    /* retract: CancelPCMRate / already-at-target */
+    PCM_LATCH_SATISFIED  /* rate publish: the live rate reached the target */
+};
+
+static void mr_alsa_audio_pcm_rate_latch(struct mr_alsa_audio_chip *chip,
+                                         enum pcm_rate_latch_event ev,
+                                         uint32_t rate)
+{
+    uint32_t old_pending = READ_ONCE(chip->pending_rate);
+    uint32_t new_pending = old_pending;
+    bool notify = false;
+
+    switch (ev) {
+    case PCM_LATCH_ARM:
+        new_pending = rate;
+        notify = true;
+        break;
+    case PCM_LATCH_CANCEL:
+        new_pending = 0;
+        notify = true;
+        break;
+    case PCM_LATCH_SATISFIED:
+        if (old_pending == rate)
+            new_pending = 0;
+        break;
+    }
+    if (new_pending == old_pending)
+        return;  /* no transition — never emit a spurious control event */
+
+    WRITE_ONCE(chip->pending_rate, new_pending);
+    printk(KERN_DEBUG "pcm %d: rate latch %u -> %u (%s)\n",
+           chip->global_pcm_id, old_pending, new_pending,
+           ev == PCM_LATCH_ARM ? "armed"
+           : ev == PCM_LATCH_CANCEL ? "cancelled" : "satisfied");
+    if (notify && chip->current_rate_control)
+        snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
+                       &chip->current_rate_control->id);
+}
+
 static void mr_alsa_audio_set_pcm_sample_rate(void *mr_alsa_audio_chip, uint32_t rate, uint32_t frame_size)
 {
     struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip *)mr_alsa_audio_chip;
@@ -1085,10 +1139,10 @@ static void mr_alsa_audio_set_pcm_sample_rate(void *mr_alsa_audio_chip, uint32_t
 
     /* W15: this is the single rate-publish chokepoint (attach, re-key, legacy
      * chip-0 path). If the live rate just reached a pending target, the latch
-     * is satisfied — disarm. And whenever the live rate actually changed, tell
-     * listeners of the PCM Rate control to re-read it (VOLATILE, no cache). */
-    if (chip->pending_rate == rate)
-        chip->pending_rate = 0;
+     * is satisfied — disarm (§4.3: via the latch's single transition owner).
+     * And whenever the live rate actually changed, tell listeners of the PCM
+     * Rate control to re-read it (VOLATILE, no cache). */
+    mr_alsa_audio_pcm_rate_latch(chip, PCM_LATCH_SATISFIED, rate);
     if (chip->current_rate_control && old_rate != rate)
         snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
                        &chip->current_rate_control->id);
@@ -1139,9 +1193,11 @@ static int mr_alsa_audio_current_rate_get(struct snd_kcontrol *kcontrol,
         return -EINVAL;
     /* W15: while armed for an in-place re-rate, report the TARGET so a follower
      * reopens at the rate it's about to become; otherwise the live rate. */
-    ucontrol->value.integer.value[0] =
-        chip->pending_rate ? chip->pending_rate
-                           : mr_alsa_audio_get_pcm_sample_rate(chip);
+    {
+        uint32_t pending = READ_ONCE(chip->pending_rate);
+        ucontrol->value.integer.value[0] =
+            pending ? pending : mr_alsa_audio_get_pcm_sample_rate(chip);
+    }
     return 0;
 }
 
@@ -1174,12 +1230,9 @@ static void mr_alsa_audio_arm_pcm_rate(void *mr_alsa_audio_chip, uint32_t target
     struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip *)mr_alsa_audio_chip;
     if (!chip)
         return;
-    if (chip->pending_rate == target_rate)
-        return;  /* no change — don't emit a spurious control event */
-    chip->pending_rate = target_rate;
-    if (chip->current_rate_control)
-        snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
-                       &chip->current_rate_control->id);
+    /* §4.3: target 0 = retract; both routes through the single owner. */
+    mr_alsa_audio_pcm_rate_latch(
+        chip, target_rate ? PCM_LATCH_ARM : PCM_LATCH_CANCEL, target_rate);
 }
 
 /* W28: the chip's ARMED pending re-rate target (0 = not armed). Plain read of
@@ -1187,7 +1240,7 @@ static void mr_alsa_audio_arm_pcm_rate(void *mr_alsa_audio_chip, uint32_t target
 static uint32_t mr_alsa_audio_get_pcm_pending_rate(void *mr_alsa_audio_chip)
 {
     struct mr_alsa_audio_chip *chip = (struct mr_alsa_audio_chip *)mr_alsa_audio_chip;
-    return chip ? chip->pending_rate : 0;
+    return chip ? READ_ONCE(chip->pending_rate) : 0;
 }
 
 /* W11: a chip's PTP clock domain is its owning card's (set at add_card). Derived
@@ -2581,11 +2634,18 @@ static int mr_alsa_audio_pcm_close(struct snd_pcm_substream *substream)
      * + notifies the PCM Rate control. Done outside the chip spinlocks: the
      * re-key may sleep (hrtimer_cancel of a freed old entry). A racing reopen is
      * handled by registry_barrier in pcm_open. */
-    if (chip->pending_rate &&
+    if (READ_ONCE(chip->pending_rate) &&
         chip->capture_substream == NULL && chip->playback_substream == NULL &&
-        chip->mr_alsa_audio_ops && chip->mr_alsa_audio_ops->set_pcm_rate)
+        chip->mr_alsa_audio_ops && chip->mr_alsa_audio_ops->set_pcm_rate &&
+        /* §4.3: one-shot claim. Concurrent playback+capture last-closes are
+         * serialized by ALSA's pcm->open_mutex today, but that is a core
+         * convention outside this file — the claim makes single-fire (and a
+         * single PCMRateApplied K2U notify) structural. Released after the
+         * apply attempt: a FAILED apply stays armed and the next close
+         * retries, exactly as before. */
+        !test_and_set_bit(0, &chip->rate_latch_firing))
     {
-        uint32_t target = chip->pending_rate;
+        uint32_t target = READ_ONCE(chip->pending_rate);
         int err = chip->mr_alsa_audio_ops->set_pcm_rate(chip->ravenna_peer,
                                                         chip->global_pcm_id, target);
         if (err < 0)
@@ -2601,6 +2661,7 @@ static int mr_alsa_audio_pcm_close(struct snd_pcm_substream *substream)
                 chip->mr_alsa_audio_ops->notify_pcm_rate_applied(
                     chip->ravenna_peer, chip->global_pcm_id, target);
         }
+        clear_bit(0, &chip->rate_latch_firing);
     }
     return 0;
 }
@@ -2874,6 +2935,7 @@ static int mr_alsa_audio_create_alsa_devices(   struct snd_card *card,
     chip->playback_switch_control = NULL;
     chip->current_rate_control = NULL;
     chip->pending_rate = 0;
+    chip->rate_latch_firing = 0;
     chip->current_playback_volume = 0;
     chip->current_playback_switch = 1;
 
