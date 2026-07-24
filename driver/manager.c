@@ -754,7 +754,7 @@ bool SetDSDSamplingRate(struct TManager* self, uint32_t samplingRate)
          * shared cadence is W10 SetPCMRate's job. */
         if (entry0 && entry0->chip_refcount > 1 && entry0->tick_rate != new_tick_rate)
         {
-            MTAL_DP_ERR("CManager::SetSamplingRate(%u): refused — chip 0's (domain, rate) entry is shared by %u chips\n",
+            MTAL_DP_ERR("CManager::SetDSDSamplingRate(%u): refused — chip 0's (domain, rate) entry is shared by %u chips\n",
                         samplingRate, entry0->chip_refcount);
             return false;
         }
@@ -763,7 +763,7 @@ bool SetDSDSamplingRate(struct TManager* self, uint32_t samplingRate)
             struct tic_timer_entry* e = &self->m_TicTimers[t];
             if (e->active && e != entry0 && e->domain == 0 && e->tick_rate == new_tick_rate)
             {
-                MTAL_DP_ERR("CManager::SetSamplingRate(%u): tick rate %u already owned by another PCM group's entry\n", samplingRate, new_tick_rate);
+                MTAL_DP_ERR("CManager::SetDSDSamplingRate(%u): tick rate %u already owned by another PCM group's entry\n", samplingRate, new_tick_rate);
                 return false;
             }
         }
@@ -786,7 +786,7 @@ bool SetDSDSamplingRate(struct TManager* self, uint32_t samplingRate)
             CW_msleep_interruptible(1);
             if(++nbloop >= 4000)
             {
-                MTAL_DP("CManager::SetSamplingRate PTP lock timed out\n");
+                MTAL_DP("CManager::SetDSDSamplingRate PTP lock timed out\n");
                 return false;
             }
         }
@@ -1198,8 +1198,11 @@ static TTicEngine* get_engine_for_pcm(struct TManager* self, uint32_t pcm_id)
     struct tic_timer_entry* entry = NULL;
     if (pcm_id < MAX_PCMS)
         entry = smp_load_acquire(&self->m_apChipEntry[pcm_id]);
-    if (!entry)
-        entry = smp_load_acquire(&self->m_apChipEntry[0]);
+    /* Audit K14: no chip-0 fallback — an unmapped pcm silently riding chip
+     * 0's clock is a cross-domain corruption alias (the last-writer-wins
+     * family), not a safe default. NULL -> the SAC getter returns 0, which
+     * every consumer of a stale stream already guards (frame_size 0 skips
+     * the mute bookkeeping; tick_rate 0 keeps it out of every pump). */
     if (!entry)
         return NULL;
     return active_engine_of(entry);
@@ -1275,14 +1278,20 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             }
             else
             {
+                /* Zeroed: on a failed lookup the reply still carries the
+                 * buffer — uninitialized stack must never reach userland
+                 * (and post-#32/D8 the daemon ACTS on these flags). */
                 TRTP_stream_status stream_status;
+                memset(&stream_status, 0, sizeof(stream_status));
                 uint64_t* rtp_stream_handle_ptr = (uint64_t*)msg_rcv->data;
                 if (!get_RTPStream_status_(&self->m_RTP_streams_manager, *rtp_stream_handle_ptr, &stream_status))
-                    msg_reply.errCode = -401;
+                    msg_reply.errCode = -401;  /* stale/unknown handle — audit K14(d):
+                                                * an unconditional errCode = 0 below
+                                                * used to clobber this, reporting
+                                                * SUCCESS with garbage status */
                 else
                     msg_reply.errCode = 0;
-                
-                msg_reply.errCode = 0;
+
                 msg_reply.dataSize = sizeof(TRTP_stream_status);
                 msg_reply.data = &stream_status;
 
@@ -2301,8 +2310,8 @@ uint64_t get_global_SAC(void* user)
  * 352.8k tick clock domain, so there is no x8 scaling (the W2
  * stopgap's DSD bug, fixed by construction).
  *
- * Safe-fail: an unmapped pcm_id resolves to chip 0's entry (the legacy
- * manager-wide clock), 0 if no entry exists at all.
+ * Safe-fail: an unmapped pcm_id yields SAC 0 (audit K14: it used to fall
+ * back to chip 0's clock — a silent cross-domain alias).
  */
 uint64_t get_global_SAC_for_pcm(void* user, uint32_t pcm_id)
 {

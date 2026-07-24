@@ -1592,8 +1592,13 @@ static struct snd_pcm_hardware mr_alsa_audio_pcm_hardware_playback =
                     SNDRV_PCM_INFO_BLOCK_TRANSFER | /* hardware transfer block of samples */
                     SNDRV_PCM_INFO_JOINT_DUPLEX |
                     SNDRV_PCM_INFO_PAUSE | /* pause ioctl is supported */
-                    SNDRV_PCM_INFO_MMAP_VALID /*| period data are valid during transfer */
-                    //SNDRV_PCM_INFO_BATCH /* double buffering */
+                    SNDRV_PCM_INFO_MMAP_VALID | /*  period data are valid during transfer */
+                    /* audit K10: hw_ptr only advances once per TIC by a full
+                     * frame (period-granular) — without BATCH declared,
+                     * PulseAudio/PipeWire timer scheduling assumes a
+                     * sample-accurate pointer and mis-schedules. CamillaDSP
+                     * (period-driven) is unaffected either way. */
+                    SNDRV_PCM_INFO_BATCH
                      /*| SNDRV_PCM_INFO_JOINT_DUPLEX*/ /*| SNDRV_PCM_INFO_PAUSE*/ /*| SNDRV_PCM_INFO_RESUME*/),
     .formats = (
     #ifdef SNDRV_PCM_FMTBIT_DSD_U8
@@ -1629,8 +1634,13 @@ static struct snd_pcm_hardware mr_alsa_audio_pcm_hardware_capture =
                     SNDRV_PCM_INFO_BLOCK_TRANSFER | /* hardware transfer block of samples */
                     SNDRV_PCM_INFO_JOINT_DUPLEX |
                     SNDRV_PCM_INFO_PAUSE | /* pause ioctl is supported */
-                    SNDRV_PCM_INFO_MMAP_VALID /*|  period data are valid during transfer */
-                    //SNDRV_PCM_INFO_BATCH /* double buffering */
+                    SNDRV_PCM_INFO_MMAP_VALID | /*  period data are valid during transfer */
+                    /* audit K10: hw_ptr only advances once per TIC by a full
+                     * frame (period-granular) — without BATCH declared,
+                     * PulseAudio/PipeWire timer scheduling assumes a
+                     * sample-accurate pointer and mis-schedules. CamillaDSP
+                     * (period-driven) is unaffected either way. */
+                    SNDRV_PCM_INFO_BATCH
                      /*| SNDRV_PCM_INFO_JOINT_DUPLEX*/ /*| SNDRV_PCM_INFO_PAUSE*/ /*| SNDRV_PCM_INFO_RESUME*/), // TODO (mmap, pause/resume, duplex)
     //.formats =  (SNDRV_PCM_FMTBIT_S32_LE/* | SNDRV_PCM_FMTBIT_S24_3LE*//* | SNDRV_PCM_FMTBIT_FLOAT_LE*/), // TODO (float?)
     .formats = (
