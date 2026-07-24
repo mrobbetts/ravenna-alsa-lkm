@@ -280,6 +280,17 @@ EDispatchResult process_PTP_packet(TClock_PTP* self, TUDPPacketBase* pUDPPacketB
 				return DR_PACKET_NOT_USED;
 			}
 
+			/* Audit §4.5: the election fields (m_ui64PTPMaster_*, the announce
+			 * copy, the announce seq id) were the only servo state mutated
+			 * OUTSIDE m_csPTPTime while read by the tick (NIC selection via
+			 * GetPTPPriority) and by concurrent announce packets (RSS can run
+			 * two same-NIC packets on two CPUs). Serialize the whole election
+			 * under the servo lock; the inner ResetPTPLock calls switch to the
+			 * caller-holds-the-lock form. Status readers (GetPTPStatus) stay
+			 * deliberately unlocked — single-announce consistency is now
+			 * guaranteed by serialized writers, and a transiently stale field
+			 * in a status reply is by-design (W16 slice 3). */
+			spin_lock((spinlock_t*)self->m_csPTPTime);
 			{
 				uint16_t wDeltaSeq = MTAL_SWAP16(pPTPV2MsgAnnouncePacket->V2MsgHeader.wSequenceId) - self->m_wLastAnnounceSequenceId;
 				if (wDeltaSeq > 1)
@@ -301,7 +312,7 @@ EDispatchResult process_PTP_packet(TClock_PTP* self, TUDPPacketBase* pUDPPacketB
                     
                     MTAL_DP("[%u] PTPConfig has changed -> restart election\n", self->m_pEth_netfilter->nic_id);
                     
-                    ResetPTPLock(self, true);
+                    ResetPTPLock(self, false);  /* §4.5: election lock held */
                     ResetPTPMaster(self);
                 }
                 
@@ -310,7 +321,7 @@ EDispatchResult process_PTP_packet(TClock_PTP* self, TUDPPacketBase* pUDPPacketB
                     && pPTPV2MsgAnnouncePacket->V2MsgHeader.byDomainNumber != self->m_PTPConfig.ui8Domain)
                 { // restart election
                      MTAL_DP("[%u] PTP Master domain no longer matches wanted domain -> restart election\n", self->m_pEth_netfilter->nic_id);
-                    ResetPTPLock(self, true);
+                    ResetPTPLock(self, false);  /* §4.5: election lock held */
                     ResetPTPMaster(self);
                 }
                 
@@ -338,7 +349,7 @@ EDispatchResult process_PTP_packet(TClock_PTP* self, TUDPPacketBase* pUDPPacketB
                     if(bElectThisPTPMaster)
                     { // use this PTP Master
                         printk("[nic %u dom %u] Use this PTP Master\n", self->m_pEth_netfilter->nic_id, self->m_PTPConfig.ui8Domain);
-                        ResetPTPLock(self, true);
+                        ResetPTPLock(self, false);  /* §4.5: election lock held */
                         ResetPTPMaster(self);
                         
                         self->m_ui64PTPMaster_ClockIdentity = ui64_CurrentClockIdentity;
@@ -369,7 +380,8 @@ EDispatchResult process_PTP_packet(TClock_PTP* self, TUDPPacketBase* pUDPPacketB
 
             }
             //######################################################
-            
+            spin_unlock((spinlock_t*)self->m_csPTPTime);
+
 			break;
 		}
 		case PTP_SYNC_MESSAGE:
@@ -600,10 +612,12 @@ void ProcessT1(TClock_PTP* self, uint64_t ui64T1)
 				if (self->m_apEngines[e])
 					tic_engine_steer(self->m_apEngines[e], ui64T1);
 		}
+		/* Audit §4.5: record T1 inside the lock — it was written after the
+		 * unlock while the next sync's delta computation reads it (narrows,
+		 * not fully closes, the Q6 concurrent-dispatch exposure). */
+		self->m_ui64T1 = ui64T1;
 		spin_unlock((spinlock_t*)self->m_csPTPTime);
 	}
-
-	self->m_ui64T1 = ui64T1;
 }
 
 ////////////////////////////////////////////////////////////////////
