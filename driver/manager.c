@@ -412,8 +412,7 @@ bool SetInterfaceName(struct TManager* self, const char* cInterfaceName, const i
     }
 
     //MTAL_DP("SetInterfaceName(%s)\n", cInterfaceName);
-    strncpy(self->m_cInterfaceName, cInterfaceName, MAX_INTERFACE_NAME - 1);
-    self->m_cInterfaceName[MAX_INTERFACE_NAME - 1] = '\0';
+    strscpy(self->m_cInterfaceName, cInterfaceName, MAX_INTERFACE_NAME);
     if(strlen(self->m_cInterfaceName) != strlen(cInterfaceName))
     {
         MTAL_DP("SetInterfaceName: Interface name too long\n");

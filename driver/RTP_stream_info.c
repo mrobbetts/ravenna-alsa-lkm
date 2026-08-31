@@ -216,7 +216,7 @@ int is_valid(TRTP_stream_info* rtp_stream_info)
 ////////////////////////////////////////////////////////////////////
 void set_stream_name(TRTP_stream_info* rtp_stream_info, const char* cName)
 {
-	strncpy(rtp_stream_info->m_cName, cName, MAX_STREAM_NAME_SIZE - 1);
+	strscpy(rtp_stream_info->m_cName, cName, MAX_STREAM_NAME_SIZE);
 }
 
 ////////////////////////////////////////////////////////////////////
@@ -250,7 +250,7 @@ int set_codec(TRTP_stream_info* rtp_stream_info, const char* cCodec)
 		MTAL_DP("CRTP_stream_info::SetCodec error Codec = %s\n", cCodec);
 		return 0;
 	}
-	strncpy(rtp_stream_info->m_cCodec, cCodec, MAX_CODEC_NAME_SIZE - 1);
+	strscpy(rtp_stream_info->m_cCodec, cCodec, MAX_CODEC_NAME_SIZE);
 	return 1;
 }
 

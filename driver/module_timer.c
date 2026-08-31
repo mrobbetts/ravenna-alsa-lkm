@@ -241,9 +241,9 @@ int start_clock_timer(void)
     smp_wmb(); /* ensure stop_=0 visible before timer fires */
 
     expiry = ktime_add(ktime_get(), ns_to_ktime(period));
-    
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6,15,0)
-    tasklet_hrtimer_start(&my_hrtimer_, period, HRTIMER_MODE_ABS);
+    tasklet_hrtimer_start(&my_hrtimer_, expiry, HRTIMER_MODE_ABS);
 #else
     if (audio_cpu_affinity != -1)
     {
