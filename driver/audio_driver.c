@@ -52,6 +52,14 @@
 #include "MTConvert.h"
 #include "audio_driver.h"
 #include "module_timer.h"
+#include "c_wrapper_lib.h"   /* CW_ll_modulo (portable u64 modulo) */
+
+/* Absolute capture cursor: the most frames one tick service will catch up
+ * when the media clock stepped more than a single frame. Beyond this the
+ * step is a re-anchor, not a late tick — equals TIMELINE_BREAK_FRAMES in
+ * tic_engine.h, the threshold at which the manager xruns the substream (W17)
+ * so the client re-prepares (which re-seeds the watermark). */
+#define MR_ALSA_CAPTURE_CATCHUP_MAX_FRAMES 64
 
 
 #define SND_MR_ALSA_AUDIO_DRIVER    "snd_merging_rav"
@@ -173,7 +181,13 @@ struct mr_alsa_audio_chip
     void* capture_buffer_channels_map[MR_ALSA_NB_CHANNELS_MAX]; // array of pointer to each channels of capture_buffer
     unsigned char *playback_buffer;  /// non interleaved Ravenna Ring Buffer
     uint32_t playback_buffer_pos;    /// in ravenna samples
-    uint32_t capture_buffer_pos;    /// in ravenna samples
+    /* Capture's ONLY cursor state: the absolute SAC up to which frames have
+     * been delivered into the ALSA DMA area (exclusive end). Seeded at
+     * prepare; each tick delivers (watermark, sac] and every ring position is
+     * derived as watermark mod ring — nothing that can drift from the RTP
+     * receiver's absolute-SAC placement. Replaces the old incremental
+     * per-tick cursor (2026-09 overnight-garble fix). */
+    uint64_t capture_delivered_sac;
     uint64_t playback_buffer_alsa_sac;   /// in alsa frames
     uint64_t playback_buffer_rav_sac;    /// in alsa frames
     u64 current_alsa_playback_format; /// init with Ravenna Manager then retrieved from hw params
@@ -747,7 +761,7 @@ static void mr_alsa_audio_pcm_open_unwind(struct mr_alsa_audio_chip *chip,
                                           struct snd_pcm_substream *substream);
 
 /// Driven by PTP Timer's interrupts
-static int mr_alsa_audio_pcm_interrupt(void *rawchip, int direction)
+static int mr_alsa_audio_pcm_interrupt(void *rawchip, int direction, uint64_t sac)
 {
     if(rawchip)
     {
@@ -786,36 +800,77 @@ static int mr_alsa_audio_pcm_interrupt(void *rawchip, int direction)
 
             bytes_to_frame_factor = runtime->channels * chip->current_alsa_capture_stride;
 
-            if (chip->capture_interleave_fn) {
-                chip->capture_interleave_fn(
-                    chip->capture_buffer_channels_map,
-                    chip->capture_buffer_pos,
-                    chip->dma_capture_buffer + (uint32_t)atomic_read(&chip->dma_capture_offset),
-                    runtime->channels,
-                    ptp_frame_size);
-            } else {
-                mr_alsa_audio_pcm_capture_copy_internal(
-                    sub, runtime->channels,
-                    chip->capture_buffer_pos,
-                    chip->dma_capture_buffer + (uint32_t)atomic_read(&chip->dma_capture_offset),
-                    ptp_frame_size);
-            }
-
+            /* Absolute capture cursor (2026-09 overnight-garble fix). The RTP
+             * receiver places samples at the ABSOLUTE SAC (mod ring). The cursor
+             * used to be anchored once at prepare and then advanced one frame
+             * per service — an approximation that silently skewed by (k-1)
+             * frames on every tick whose TIC count stepped k != 1 (late/early
+             * hrtimer, servo nudge, sub-64-frame relock reseed), permanently,
+             * until the next prepare. Capture tolerates a cursor AHEAD of the
+             * SAC only up to the receive margin (~11 frames at 12 ms), so one
+             * small reseed garbled a held-open client until it restarted.
+             * Now the only state is the delivered-SAC watermark: a tick delivers
+             * exactly the frames the media clock advanced, (watermark, sac], at
+             * ring positions derived from the watermark. k = 1 is the unchanged
+             * fast path; k > 1 catches up; k <= 0 holds. */
             {
-                uint32_t new_offset = (uint32_t)atomic_read(&chip->dma_capture_offset)
-                                    + ptp_frame_size * bytes_to_frame_factor;
-                if (new_offset >= chip->pcm_capture_buffer_size)
-                    new_offset -= chip->pcm_capture_buffer_size;
-                atomic_set(&chip->dma_capture_offset, (int)new_offset);
-            }
+                int64_t pending, frames;
 
-            chip->capture_buffer_pos += ptp_frame_size;
-            if (chip->capture_buffer_pos >= ring_buffer_size)
-                chip->capture_buffer_pos -= ring_buffer_size;
+                if (unlikely(ptp_frame_size == 0)) {
+                    spin_unlock_bh(&chip->capture_lock);
+                    return 0;
+                }
+                pending = (int64_t)(sac - chip->capture_delivered_sac);
+                if (unlikely(pending % (int64_t)ptp_frame_size != 0)) {
+                    /* SAC steps by whole frames of this rate — fail loud and
+                     * resync rather than drift. */
+                    printk_ratelimited(KERN_WARNING "pcm %d: capture SAC %llu not frame-aligned to watermark %llu (frame %u) — resyncing\n",
+                                       chip->global_pcm_id, sac, chip->capture_delivered_sac, ptp_frame_size);
+                    chip->capture_delivered_sac = sac;
+                    pending = 0;
+                }
+                frames = pending / (int64_t)ptp_frame_size;
 
-            if (++chip->current_capture_interrupt_idx >= chip->nb_capture_interrupts_per_period) {
-                chip->current_capture_interrupt_idx = 0;
-                do_period_elapsed = 1;
+                if (frames > (int64_t)MR_ALSA_CAPTURE_CATCHUP_MAX_FRAMES) {
+                    /* A re-anchor, not a late tick: the manager xruns this
+                     * substream right after the service (W17) and prepare()
+                     * re-seeds the watermark. Resync here so there is no copy
+                     * storm in between. */
+                    printk_ratelimited(KERN_INFO "pcm %d: capture cursor %lld frames behind the media clock — resync (xrun follows)\n",
+                                       chip->global_pcm_id, (long long)frames);
+                    chip->capture_delivered_sac = sac;
+                    frames = 0;
+                }
+                else if (frames != 1)
+                    printk_ratelimited(KERN_DEBUG "pcm %d: media clock stepped %lld frames this tick — capture cursor %s\n",
+                                       chip->global_pcm_id, (long long)frames,
+                                       frames > 1 ? "catching up" : "holding");
+
+                for (; frames > 0; --frames) {
+                    uint32_t pos = (uint32_t)CW_ll_modulo(chip->capture_delivered_sac, ring_buffer_size);
+                    unsigned char *dst = chip->dma_capture_buffer + (uint32_t)atomic_read(&chip->dma_capture_offset);
+                    uint32_t new_offset;
+
+                    if (chip->capture_interleave_fn)
+                        chip->capture_interleave_fn(chip->capture_buffer_channels_map, pos, dst,
+                                                    runtime->channels, ptp_frame_size);
+                    else
+                        mr_alsa_audio_pcm_capture_copy_internal(sub, runtime->channels, pos, dst,
+                                                                ptp_frame_size);
+
+                    new_offset = (uint32_t)atomic_read(&chip->dma_capture_offset)
+                               + ptp_frame_size * bytes_to_frame_factor;
+                    if (new_offset >= chip->pcm_capture_buffer_size)
+                        new_offset -= chip->pcm_capture_buffer_size;
+                    atomic_set(&chip->dma_capture_offset, (int)new_offset);
+
+                    chip->capture_delivered_sac += ptp_frame_size;
+
+                    if (++chip->current_capture_interrupt_idx >= chip->nb_capture_interrupts_per_period) {
+                        chip->current_capture_interrupt_idx = 0;
+                        do_period_elapsed = 1;
+                    }
+                }
             }
 
             spin_unlock_bh(&chip->capture_lock);
@@ -1450,12 +1505,12 @@ static int mr_alsa_audio_pcm_prepare(struct snd_pcm_substream *substream)
         }
         else if(substream->stream == SNDRV_PCM_STREAM_CAPTURE)
         {
-            uint32_t offset = 0;
-            /* 2026-06-09 review fix: per-PCM offset — this chip's ring and SAC,
-             * not chip 0's. W10: key on the manager's GLOBAL pcm_id
-             * (chip->global_pcm_id), not the per-card ALSA device index — they
-             * coincide under single-card but diverge under multi-card. */
-            chip->mr_alsa_audio_ops->get_input_jitter_buffer_offset_for_pcm(chip->ravenna_peer, (uint32_t)chip->global_pcm_id, &offset);
+            uint64_t sac = 0;
+            /* Seed the delivered-SAC watermark from THIS chip's media clock
+             * (W10: keyed on the manager's GLOBAL pcm_id, not the per-card ALSA
+             * device index). The first service delivers (sac, sac + k*frame];
+             * ring positions are derived from the watermark, never stored. */
+            chip->mr_alsa_audio_ops->get_pcm_sac(chip->ravenna_peer, (uint32_t)chip->global_pcm_id, &sac);
             
             printk(KERN_DEBUG "mr_alsa_audio_pcm_prepare for capture stream\n");
             if(chip->ravenna_peer)
@@ -1471,11 +1526,11 @@ static int mr_alsa_audio_pcm_prepare(struct snd_pcm_substream *substream)
             }
             chip->current_alsa_capture_format = runtime->format;
             chip->current_alsa_capture_stride = snd_pcm_format_physical_width(runtime->format) >> 3;
-            chip->capture_buffer_pos = offset;
+            chip->capture_delivered_sac = sac;
             chip->current_capture_interrupt_idx = 0;
             /* W9 #14: per-PCM advisory capture latency. Advisory only — the real
-             * receive buffering is the per-sink link offset (capture_buffer_pos
-             * above), not this. Previously dead (get_capture_delay had no
+             * receive buffering is the per-sink link offset (the RTP placement
+             * ahead of the watermark above), not this. Previously dead (get_capture_delay had no
              * caller); now reported via runtime->delay for snd_pcm_delay(). */
             runtime->delay = chip->capture_delay;
             chip->nb_capture_interrupts_per_period = ((runtime_dsd_mode != 0)? (MR_ALSA_PTP_FRAME_RATE_FOR_DSD / runtime->rate) : 1);
