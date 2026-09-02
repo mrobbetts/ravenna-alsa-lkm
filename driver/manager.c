@@ -513,7 +513,7 @@ bool SetDSDSamplingRate(struct TManager* self, uint32_t samplingRate)
             CW_msleep_interruptible(1);
             if(++nbloop >= 4000)
             {
-                MTAL_DP("CManager::SetSamplingRate PTP lock timed out\n");
+                MTAL_DP("CManager::SetDSDSamplingRate PTP lock timed out\n");
                 return false;
             }
         }
