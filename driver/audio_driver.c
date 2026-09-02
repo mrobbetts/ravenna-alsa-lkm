@@ -1893,6 +1893,31 @@ static int mr_alsa_audio_hw_rule_period_nb_by_rate_and_format(  struct snd_pcm_h
 /// You can allocate a private data in this callback.
 /// If the hardware configuration needs more constraints, set the hardware constraints here, too.
 
+/* pcm_open publishes the substream pointer before applying the hw
+ * constraints, which can still fail, and ALSA does not call .close after a
+ * failed .open. Without an unwind the chip keeps a dangling substream whose
+ * runtime ALSA frees: the buffer-size getters walk freed memory on the next
+ * tick and the chip looks busy forever. Mirror close's clear-under-lock
+ * discipline. */
+static void mr_alsa_audio_pcm_open_unwind(struct mr_alsa_audio_chip *chip,
+                                          struct snd_pcm_substream *substream)
+{
+    if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+    {
+        spin_lock_irq(&chip->playback_lock);
+        chip->playback_pid = -1;
+        chip->playback_substream = NULL;
+        spin_unlock_irq(&chip->playback_lock);
+    }
+    else if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+    {
+        spin_lock_irq(&chip->capture_lock);
+        chip->capture_pid = -1;
+        chip->capture_substream = NULL;
+        spin_unlock_irq(&chip->capture_lock);
+    }
+}
+
 static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
 {
     int ret = 0;
@@ -2045,6 +2070,7 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
     {
         printk("mr_alsa_audio_pcm_open: Unsupported sample rate (%u Hz)\n", runtime->rate);
         printk("unsuccessfully leaving mr_alsa_audio_pcm_open...\n");
+        mr_alsa_audio_pcm_open_unwind(chip, substream);  /* ALSA will not close a failed open */
         return ret;
     }
     /// Sample rate constraint by format
@@ -2100,6 +2126,7 @@ static int mr_alsa_audio_pcm_open(struct snd_pcm_substream *substream)
     {
         printk("mr_alsa_audio_pcm_open: Unsupported period size (%lu smp)\n", runtime->period_size);
         printk("unsuccessfully leaving mr_alsa_audio_pcm_open...\n");
+        mr_alsa_audio_pcm_open_unwind(chip, substream);  /* ALSA will not close a failed open */
         return ret;
     }
 
