@@ -1230,8 +1230,11 @@ static struct snd_pcm_hardware mr_alsa_audio_pcm_hardware_playback =
                     SNDRV_PCM_INFO_BLOCK_TRANSFER | /* hardware transfer block of samples */
                     SNDRV_PCM_INFO_JOINT_DUPLEX |
                     SNDRV_PCM_INFO_PAUSE | /* pause ioctl is supported */
-                    SNDRV_PCM_INFO_MMAP_VALID /*| period data are valid during transfer */
-                    //SNDRV_PCM_INFO_BATCH /* double buffering */
+                    SNDRV_PCM_INFO_MMAP_VALID | /* period data are valid during transfer */
+                    /* hw_ptr advances once per tick by a whole frame (period granularity):
+                     * declare BATCH so timer-scheduled clients do not assume a
+                     * sample-accurate pointer. */
+                    SNDRV_PCM_INFO_BATCH
                      /*| SNDRV_PCM_INFO_JOINT_DUPLEX*/ /*| SNDRV_PCM_INFO_PAUSE*/ /*| SNDRV_PCM_INFO_RESUME*/),
     .formats = (
     #ifdef SNDRV_PCM_FMTBIT_DSD_U8
@@ -1267,8 +1270,11 @@ static struct snd_pcm_hardware mr_alsa_audio_pcm_hardware_capture =
                     SNDRV_PCM_INFO_BLOCK_TRANSFER | /* hardware transfer block of samples */
                     SNDRV_PCM_INFO_JOINT_DUPLEX |
                     SNDRV_PCM_INFO_PAUSE | /* pause ioctl is supported */
-                    SNDRV_PCM_INFO_MMAP_VALID /*|  period data are valid during transfer */
-                    //SNDRV_PCM_INFO_BATCH /* double buffering */
+                    SNDRV_PCM_INFO_MMAP_VALID | /* period data are valid during transfer */
+                    /* hw_ptr advances once per tick by a whole frame (period granularity):
+                     * declare BATCH so timer-scheduled clients do not assume a
+                     * sample-accurate pointer. */
+                    SNDRV_PCM_INFO_BATCH
                      /*| SNDRV_PCM_INFO_JOINT_DUPLEX*/ /*| SNDRV_PCM_INFO_PAUSE*/ /*| SNDRV_PCM_INFO_RESUME*/), // TODO (mmap, pause/resume, duplex)
     //.formats =  (SNDRV_PCM_FMTBIT_S32_LE/* | SNDRV_PCM_FMTBIT_S24_3LE*//* | SNDRV_PCM_FMTBIT_FLOAT_LE*/), // TODO (float?)
     .formats = (
