@@ -50,7 +50,11 @@ struct ravenna_mgr_ops
     void (*unlock_playback_buffer)(void *mr_alsa_audio_chip);
     void (*lock_capture_buffer)(void *mr_alsa_audio_chip);
     void (*unlock_capture_buffer)(void *mr_alsa_audio_chip);
-    int (*pcm_interrupt)(void *mr_alsa_audio_chip, int direction);/// direction: 0 for playback, 1 for capture. One interrupt per Ravenna TIC
+    /* direction: 0 for playback, 1 for capture. One call per Ravenna TIC.
+     * sac: this tick's media clock for the chip's (domain, rate) entry — the
+     * capture ring cursor is DERIVED from it (absolute), so the service
+     * delivers exactly the frames the clock advanced (playback ignores it). */
+    int (*pcm_interrupt)(void *mr_alsa_audio_chip, int direction, uint64_t sac);
     void (*pcm_xrun)(void *mr_alsa_audio_chip);/// W17: force an xrun on the chip's open substreams after a media-clock re-anchor, so clients re-prepare onto the new timeline
     //uint32_t (*get_capture_buffer_offset)(void *mr_alsa_audio_chip);/// returns current offset in samples (channel independent) for Ravenna Ring Buffer
     uint32_t (*get_playback_buffer_offset)(void *mr_alsa_audio_chip);/// returns current offset (channel independent) in samples for Ravenna Ring Buffer
@@ -103,10 +107,11 @@ struct alsa_ops
      * pointer. Stage 3 will also call this from a future RemovePCM path. */
     void (*unregister_alsa_driver)(void* ravenna_peer, void *alsa_chip_pointer);
     int (*get_input_jitter_buffer_offset)(void* ravenna_peer, uint32_t *offset);
-    /* 2026-06-09 review fix: per-PCM variant — capture prepare on chip N
-     * must align to chip N's ring length and SAC, not chip 0's. pcm_id is
-     * the per-card device index (chip->pcm->device). */
-    int (*get_input_jitter_buffer_offset_for_pcm)(void* ravenna_peer, uint32_t pcm_id, uint32_t *offset);
+    /* This pcm's absolute media clock (its entry's SAC, in samples at the
+     * pcm's rate). Capture prepare seeds its delivered-SAC watermark from it;
+     * ring positions are derived per frame, never stored. pcm_id is the
+     * manager's GLOBAL id. */
+    int (*get_pcm_sac)(void* ravenna_peer, uint32_t pcm_id, uint64_t *sac);
     int (*get_output_jitter_buffer_offset)(void* ravenna_peer, uint32_t *offset);
     int (*get_min_interrupts_frame_size)(void* ravenna_peer, uint32_t *framesize); /// returns min Ravenna Frame Size in samples (channel independent)
     int (*get_max_interrupts_frame_size)(void* ravenna_peer, uint32_t *framesize); /// returns max Ravenna Frame Size (hardware dependent) in samples (channel independent)

@@ -2767,6 +2767,12 @@ static void service_entry_alsa_chips(struct TManager* self, struct tic_timer_ent
     if (!frontend)
         return;
 
+    /* This tick's media clock for the entry, pushed into the service: the
+     * capture cursor is derived from it (absolute), so a tick delivers exactly
+     * the frames the clock advanced — a late tick catches up, an early one
+     * holds — instead of a fixed one frame per call that skews on any k != 1. */
+    const uint64_t sac = tic_engine_get_sac(active_engine_of(entry));
+
     count = smp_load_acquire(&self->m_uPCMCount);
     for (i = 0; i < count; ++i)
     {
@@ -2778,9 +2784,9 @@ static void service_entry_alsa_chips(struct TManager* self, struct tic_timer_ent
         if (smp_load_acquire(&self->m_apChipEntry[i]) != entry)
             continue;
         if (frontend->get_io_state(chip, false))
-            frontend->pcm_interrupt(chip, 1);
+            frontend->pcm_interrupt(chip, 1, sac);
         if (frontend->get_io_state(chip, true))
-            frontend->pcm_interrupt(chip, 0);
+            frontend->pcm_interrupt(chip, 0, sac);
         /* W17: the media clock re-anchored this tick — xrun the open substreams
          * so the client re-prepares onto the new timeline (re-derives its ring
          * alignment from the new SAC) instead of playing garbled audio. The
@@ -3286,15 +3292,13 @@ int get_input_jitter_buffer_offset(void* user, uint32_t *offset)
  * substream open/closed state differs from chip N's). Identity for
  * pcm_id 0: same SAC, same ring as the legacy path.
  */
-int get_input_jitter_buffer_offset_for_pcm(void* user, uint32_t pcm_id, uint32_t *offset)
+int get_pcm_sac(void* user, uint32_t pcm_id, uint64_t *sac)
 {
     struct TManager* self = (struct TManager*)user;
-    if (offset)
-    {
-        *offset = get_live_in_jitter_buffer_offset_for_pcm(self, pcm_id, get_global_SAC_for_pcm(self, pcm_id));
-        return 0;
-    }
-    return -EINVAL;
+    if (!sac)
+        return -EINVAL;
+    *sac = get_global_SAC_for_pcm(self, pcm_id);
+    return 0;
 }
 
 int get_min_interrupts_frame_size(void* user, uint32_t *framesize)
@@ -3514,7 +3518,7 @@ void init_alsa_callbacks(struct TManager* self)
     self->m_alsa_callbacks.register_alsa_driver = &attach_alsa_driver;
     self->m_alsa_callbacks.unregister_alsa_driver = &detach_alsa_driver;
     self->m_alsa_callbacks.get_input_jitter_buffer_offset = &get_input_jitter_buffer_offset;
-    self->m_alsa_callbacks.get_input_jitter_buffer_offset_for_pcm = &get_input_jitter_buffer_offset_for_pcm;
+    self->m_alsa_callbacks.get_pcm_sac = &get_pcm_sac;
     self->m_alsa_callbacks.get_output_jitter_buffer_offset = &get_output_jitter_buffer_offset;
     self->m_alsa_callbacks.get_min_interrupts_frame_size = &get_min_interrupts_frame_size;
     self->m_alsa_callbacks.get_max_interrupts_frame_size = &get_max_interrupts_frame_size;

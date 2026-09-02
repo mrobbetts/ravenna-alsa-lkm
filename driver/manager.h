@@ -342,7 +342,9 @@ int get_input_jitter_buffer_offset(void* user, uint32_t *offset);
 /* 2026-06-09 review fix (chip-N capture misalignment): per-PCM variant —
  * chip N's capture prepare must align to ITS ring length and ITS SAC,
  * not chip 0's. */
-int get_input_jitter_buffer_offset_for_pcm(void* user, uint32_t pcm_id, uint32_t *offset);
+/* The pcm's absolute media clock (its entry's SAC) — capture prepare seeds
+ * its delivered-SAC watermark from it (absolute cursor, 2026-09). */
+int get_pcm_sac(void* user, uint32_t pcm_id, uint64_t *sac);
 int get_output_jitter_buffer_offset(void* user, uint32_t *offset);
 int get_min_interrupts_frame_size(void* user, uint32_t *framesize);
 int get_max_interrupts_frame_size(void* user, uint32_t *framesize);
