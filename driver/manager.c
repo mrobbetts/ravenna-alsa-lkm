@@ -693,14 +693,16 @@ void OnNewMessage(struct TManager* self, struct MT_ALSA_msg* msg_rcv)
             }
             else
             {
+                /* Zeroed: on a failed lookup the reply still carries the
+                 * buffer, and uninitialized stack must never reach user space. */
                 TRTP_stream_status stream_status;
                 uint64_t* rtp_stream_handle_ptr = (uint64_t*)msg_rcv->data;
+                memset(&stream_status, 0, sizeof(stream_status));
                 if (!get_RTPStream_status_(&self->m_RTP_streams_manager, *rtp_stream_handle_ptr, &stream_status))
-                    msg_reply.errCode = -401;
+                    msg_reply.errCode = -401;  /* unknown or stale handle */
                 else
                     msg_reply.errCode = 0;
-                
-                msg_reply.errCode = 0;
+
                 msg_reply.dataSize = sizeof(TRTP_stream_status);
                 msg_reply.data = &stream_status;
 
