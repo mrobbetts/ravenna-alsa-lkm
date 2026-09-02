@@ -3223,8 +3223,7 @@ int mr_alsa_audio_add_pcm_to_card(int card_handle, int global_pcm_id,
     chip->pcm_rate_and_frame = ((uint64_t)sample_rate << 32);
     if (name)
     {
-        strncpy(chip->pcm_name, name, sizeof(chip->pcm_name) - 1);
-        chip->pcm_name[sizeof(chip->pcm_name) - 1] = '\0';
+        strscpy(chip->pcm_name, name, sizeof(chip->pcm_name));
     }
     err = mr_alsa_audio_chip_create(mc->card, chip, g_ravenna_peer,
                                     g_mr_alsa_audio_ops, device_idx, global_pcm_id);
