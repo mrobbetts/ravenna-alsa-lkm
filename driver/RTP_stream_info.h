@@ -170,7 +170,8 @@ public:
 	CRTP_stream_update_name(uint64_t hRTPStreamHandle, const char* cName)
 	{
 		m_hRTPStreamHandle = hRTPStreamHandle;
-		strscpy(m_cName, cName, MAX_STREAM_NAME_SIZE);
+		strncpy(m_cName, cName, MAX_STREAM_NAME_SIZE - 1);
+		m_cName[MAX_STREAM_NAME_SIZE - 1] = 0;
 		m_cName[MAX_STREAM_NAME_SIZE - 1] = '\0';
 	}
 
