@@ -50,7 +50,11 @@ struct ravenna_mgr_ops
     void (*unlock_playback_buffer)(void *mr_alsa_audio_chip);
     void (*lock_capture_buffer)(void *mr_alsa_audio_chip);
     void (*unlock_capture_buffer)(void *mr_alsa_audio_chip);
-    int (*pcm_interrupt)(void *mr_alsa_audio_chip, int direction);/// direction: 0 for playback, 1 for capture. One interrupt per Ravenna TIC
+    /* direction: 0 for playback, 1 for capture. One call per Ravenna TIC.
+     * sac: this tick's media clock (the global sample address). The capture
+     * ring cursor is derived from it, so the service delivers exactly the
+     * frames the clock advanced; playback ignores it. */
+    int (*pcm_interrupt)(void *mr_alsa_audio_chip, int direction, uint64_t sac);
     //uint32_t (*get_capture_buffer_offset)(void *mr_alsa_audio_chip);/// returns current offset in samples (channel independent) for Ravenna Ring Buffer
     uint32_t (*get_playback_buffer_offset)(void *mr_alsa_audio_chip);/// returns current offset (channel independent) in samples for Ravenna Ring Buffer
     int (*notify_master_volume_change)(void* mr_alsa_audio_chip, int direction, int32_t value); /// direction: 0 for playback, 1 for capture. value: from -99 to 0
@@ -61,7 +65,10 @@ struct ravenna_mgr_ops
 struct alsa_ops
 {
     int (*register_alsa_driver)(void* ravenna_peer, const struct ravenna_mgr_ops *ops, void *alsa_chip_pointer);/// to be called at driver init to allow communication between driver and Ravenna context
-    int (*get_input_jitter_buffer_offset)(void* ravenna_peer, uint32_t *offset);
+    /* The absolute media clock (global sample address). Capture prepare
+     * seeds its delivered-sample watermark from it; ring positions are
+     * derived per frame, never stored. */
+    int (*get_sac)(void* ravenna_peer, uint64_t *sac);
     int (*get_output_jitter_buffer_offset)(void* ravenna_peer, uint32_t *offset);
     int (*get_min_interrupts_frame_size)(void* ravenna_peer, uint32_t *framesize); /// returns min Ravenna Frame Size in samples (channel independent)
     int (*get_max_interrupts_frame_size)(void* ravenna_peer, uint32_t *framesize); /// returns max Ravenna Frame Size (hardware dependent) in samples (channel independent)

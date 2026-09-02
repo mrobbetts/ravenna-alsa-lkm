@@ -1579,10 +1579,14 @@ void AudioFrameTIC(void* user)
             frame_process_begin(&self->m_RTP_streams_manager);
             if(self->m_pALSAChip && self->m_alsa_driver_frontend)
             {
+                /* This tick's media clock, pushed into the service: the
+                 * capture cursor is derived from it, so a tick delivers
+                 * exactly the frames the clock advanced. */
+                const uint64_t sac = get_global_SAC(self);
                 if (self->m_bIsRecordingIO)
-                  self->m_alsa_driver_frontend->pcm_interrupt(self->m_pALSAChip, 1);
+                  self->m_alsa_driver_frontend->pcm_interrupt(self->m_pALSAChip, 1, sac);
                 if (self->m_bIsPlaybackIO)
-                  self->m_alsa_driver_frontend->pcm_interrupt(self->m_pALSAChip, 0);
+                  self->m_alsa_driver_frontend->pcm_interrupt(self->m_pALSAChip, 0, sac);
             }
             frame_process_end(&self->m_RTP_streams_manager);
         #endif
@@ -1750,14 +1754,13 @@ int get_output_jitter_buffer_offset(void* user, uint32_t *offset)
     return -EINVAL;
 }
 
-int get_input_jitter_buffer_offset(void* user, uint32_t *offset)
+int get_sac(void* user, uint64_t *sac)
 {
     struct TManager* self = (struct TManager*)user;
-    if (offset)
-    {
-        *offset = get_live_in_jitter_buffer_offset(self, get_global_SAC(self));
-    }
-    return -EINVAL;
+    if (!sac)
+        return -EINVAL;
+    *sac = get_global_SAC(self);
+    return 0;
 }
 
 int get_min_interrupts_frame_size(void* user, uint32_t *framesize)
@@ -1953,7 +1956,7 @@ enum eAudioMode GetAudioModeFromRate(uint32_t sample_rate)
 void init_alsa_callbacks(struct TManager* self)
 {
     self->m_alsa_callbacks.register_alsa_driver = &attach_alsa_driver;
-    self->m_alsa_callbacks.get_input_jitter_buffer_offset = &get_input_jitter_buffer_offset;
+    self->m_alsa_callbacks.get_sac = &get_sac;
     self->m_alsa_callbacks.get_output_jitter_buffer_offset = &get_output_jitter_buffer_offset;
     self->m_alsa_callbacks.get_min_interrupts_frame_size = &get_min_interrupts_frame_size;
     self->m_alsa_callbacks.get_max_interrupts_frame_size = &get_max_interrupts_frame_size;

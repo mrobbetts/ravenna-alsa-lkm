@@ -188,7 +188,7 @@ rtp_audio_stream_ops* Get_C_Callbacks(struct TManager* self);
 
 int attach_alsa_driver(void* user, const struct ravenna_mgr_ops *ops, void *alsa_chip_pointer);
 void init_alsa_callbacks(struct TManager* self);
-int get_input_jitter_buffer_offset(void* user, uint32_t *offset);
+int get_sac(void* user, uint64_t *sac);
 int get_output_jitter_buffer_offset(void* user, uint32_t *offset);
 int get_min_interrupts_frame_size(void* user, uint32_t *framesize);
 int get_max_interrupts_frame_size(void* user, uint32_t *framesize);
