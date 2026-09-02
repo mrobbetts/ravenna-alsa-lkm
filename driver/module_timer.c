@@ -278,8 +278,24 @@ void get_clock_time(uint64_t* clock_time)
 
 }
 
+/* Hard bounds on the tick period so a degenerate frame size or sample rate,
+ * from a buggy or mismatched daemon, can never produce a sub-100us
+ * fire-immediately-forever timer that storms a CPU. 100us sits below the
+ * smallest valid tick (48 frames at 384 kHz is 125us), so no legitimate
+ * cadence is clamped; the 5s ceiling matches the existing arm-time guard.
+ * update_base_period rejects degenerate inputs up front; set_base_period
+ * floors as a backstop so the derived min/max window can never be poisoned. */
+#define MR_TIC_MIN_PERIOD_NS   100000ULL       /* 100 us */
+#define MR_TIC_MAX_PERIOD_NS   5000000000ULL   /* 5 s    */
+#define MR_TIC_MAX_SANE_RATE   1000000U        /* 1 MHz; valid tick rates top out at 384k */
+#define MR_TIC_MAX_SANE_FRAME  8192U           /* generous; the real maximum is 1024 */
+
 void set_base_period(uint64_t base_period)
 {
+    if (base_period < MR_TIC_MIN_PERIOD_NS)
+        base_period = MR_TIC_MIN_PERIOD_NS;
+    else if (base_period > MR_TIC_MAX_PERIOD_NS)
+        base_period = MR_TIC_MAX_PERIOD_NS;
     WRITE_ONCE(base_period_, base_period);
     WRITE_ONCE(min_period_allowed, base_period / 7);
     WRITE_ONCE(max_period_allowed, (base_period * 10) / 6);
@@ -290,8 +306,13 @@ void set_base_period(uint64_t base_period)
 void update_base_period(uint32_t tic_frame_size, uint32_t sample_rate)
 {
     uint64_t period_ns;
-    if (sample_rate == 0)
+    if (sample_rate == 0 || sample_rate > MR_TIC_MAX_SANE_RATE ||
+        tic_frame_size == 0 || tic_frame_size > MR_TIC_MAX_SANE_FRAME)
+    {
+        printk(KERN_WARNING "update_base_period: refusing degenerate frame=%u rate=%u (period unchanged)\n",
+               tic_frame_size, sample_rate);
         return;
+    }
     period_ns = ((uint64_t)tic_frame_size * 1000000000ULL) / sample_rate;
     set_base_period(period_ns);
 }
